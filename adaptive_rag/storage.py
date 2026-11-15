@@ -1,0 +1,565 @@
+"""Local persistence adapters: immutable revisions, CAS publication, and live ACLs.
+
+SQLite connections belong to one operation, not one application or HTTP thread.
+Snapshots retain their manifest forever; access is deliberately *not* snapshotted.
+"""
+
+from contextlib import contextmanager
+from dataclasses import asdict
+from datetime import datetime, timezone
+from hashlib import sha256
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+import tempfile
+from typing import Any, Iterator, Sequence
+from uuid import uuid4
+
+from .domain import (
+    AccessContext, ChildChunk, ConflictError, ForbiddenError, IngestResult,
+    NotFoundError, ParentChunk, PreparedDocument, Snapshot, ValidationError,
+    identifier, nonempty, stable_id,
+)
+
+
+def _json(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                          separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError("value must be finite JSON data") from exc
+
+
+def _digest(content: bytes) -> str:
+    return sha256(content).hexdigest()
+
+
+def _hash(value: str, name: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise ValidationError(f"{name} must be a lowercase SHA-256 digest")
+    return value
+
+
+class FileObjectStore:
+    """Content-addressed bytes with atomic replacement and integrity checks."""
+
+    def __init__(self, data_dir: Path):
+        data_dir = Path(data_dir).resolve()
+        data_dir.mkdir(parents=True, exist_ok=True)
+        self.root = data_dir / "objects"
+        if self.root.is_symlink():
+            raise ValidationError("object directory must not be a symlink")
+        self.root.mkdir(exist_ok=True)
+        self._resolved_root = self.root.resolve()
+        if self._resolved_root != self.root:
+            raise ValidationError("object directory must not be a linked directory")
+
+    def _path(self, key: str, create: bool = False) -> Path:
+        _hash(key, "object key")
+        bucket = self.root / key[:2]
+        if (self.root.is_symlink() or bucket.is_symlink()
+                or self.root.resolve() != self._resolved_root
+                or bucket.resolve().parent != self._resolved_root):
+            raise ValidationError("object path must not contain symlinks")
+        if create:
+            bucket.mkdir(exist_ok=True)
+        path = bucket / key
+        if path.is_symlink() or not path.resolve().is_relative_to(self._resolved_root):
+            raise ValidationError("object path escapes its storage directory")
+        return path
+
+    def put(self, content: bytes) -> str:
+        if not isinstance(content, bytes):
+            raise ValidationError("object content must be bytes")
+        key = _digest(content)
+        path = self._path(key, create=True)
+        if path.exists():
+            if self.get(key) != content:
+                raise ConflictError("existing object does not match its content hash")
+            return key
+        fd, temporary = tempfile.mkstemp(prefix=".pending-", dir=path.parent)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            # Recheck after writing; never follow an existing symlink target.
+            self._path(key)
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        self.get(key)
+        return key
+
+    def get(self, key: str) -> bytes:
+        path = self._path(key)
+        try:
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            with os.fdopen(os.open(path, flags), "rb") as handle:
+                content = handle.read()
+        except FileNotFoundError as exc:
+            raise NotFoundError("object not found") from exc
+        if _digest(content) != key:
+            raise ConflictError("stored object failed SHA-256 integrity verification")
+        return content
+
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS schema_metadata (
+    id INTEGER PRIMARY KEY CHECK (id=1), version INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO schema_metadata VALUES (1, 1);
+CREATE TABLE IF NOT EXISTS documents (
+    tenant_id TEXT NOT NULL, document_id TEXT NOT NULL,
+    allowed_subjects TEXT NOT NULL, revoked INTEGER NOT NULL CHECK (revoked IN (0,1)),
+    PRIMARY KEY (tenant_id, document_id)
+);
+CREATE TABLE IF NOT EXISTS revisions (
+    tenant_id TEXT NOT NULL, document_id TEXT NOT NULL, revision_id TEXT NOT NULL,
+    version TEXT NOT NULL, processing_fingerprint TEXT NOT NULL, content_hash TEXT NOT NULL,
+    raw_key TEXT NOT NULL, metadata_json TEXT NOT NULL, payload_hash TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, document_id, revision_id),
+    FOREIGN KEY (tenant_id, document_id) REFERENCES documents (tenant_id, document_id)
+);
+CREATE TABLE IF NOT EXISTS parents (
+    tenant_id TEXT NOT NULL, document_id TEXT NOT NULL, revision_id TEXT NOT NULL,
+    parent_id TEXT NOT NULL, value_json TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, document_id, revision_id, parent_id),
+    UNIQUE (tenant_id, parent_id),
+    FOREIGN KEY (tenant_id, document_id, revision_id)
+        REFERENCES revisions (tenant_id, document_id, revision_id)
+);
+CREATE TABLE IF NOT EXISTS children (
+    tenant_id TEXT NOT NULL, document_id TEXT NOT NULL, revision_id TEXT NOT NULL,
+    chunk_id TEXT NOT NULL, parent_id TEXT NOT NULL, value_json TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, document_id, revision_id, chunk_id),
+    UNIQUE (tenant_id, chunk_id),
+    FOREIGN KEY (tenant_id, document_id, revision_id, parent_id)
+        REFERENCES parents (tenant_id, document_id, revision_id, parent_id)
+);
+CREATE TABLE IF NOT EXISTS jobs (
+    tenant_id TEXT NOT NULL, job_id TEXT NOT NULL, document_id TEXT NOT NULL,
+    revision_id TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('staged','published')),
+    parent_count INTEGER NOT NULL, child_count INTEGER NOT NULL,
+    PRIMARY KEY (tenant_id, job_id),
+    FOREIGN KEY (tenant_id, document_id, revision_id)
+        REFERENCES revisions (tenant_id, document_id, revision_id)
+);
+CREATE TABLE IF NOT EXISTS snapshots (
+    tenant_id TEXT NOT NULL, generation TEXT NOT NULL, created_at TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, generation)
+);
+CREATE TABLE IF NOT EXISTS snapshot_revisions (
+    tenant_id TEXT NOT NULL, generation TEXT NOT NULL, document_id TEXT NOT NULL,
+    revision_id TEXT NOT NULL, PRIMARY KEY (tenant_id, generation, document_id),
+    FOREIGN KEY (tenant_id, generation) REFERENCES snapshots (tenant_id, generation),
+    FOREIGN KEY (tenant_id, document_id, revision_id)
+        REFERENCES revisions (tenant_id, document_id, revision_id)
+);
+CREATE TABLE IF NOT EXISTS current_snapshots (
+    tenant_id TEXT PRIMARY KEY, generation TEXT NOT NULL,
+    FOREIGN KEY (tenant_id, generation) REFERENCES snapshots (tenant_id, generation)
+);
+CREATE TABLE IF NOT EXISTS traces (
+    tenant_id TEXT NOT NULL, trace_id TEXT NOT NULL, value_json TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, trace_id)
+);
+"""
+
+
+class _Database:
+    def __init__(self, data_dir: Path):
+        data_dir = Path(data_dir).resolve()
+        data_dir.mkdir(parents=True, exist_ok=True)
+        self.path = data_dir / "knowledge.sqlite3"
+        if self.path.is_symlink():
+            raise ValidationError("database must not be a symlink")
+        connection = sqlite3.connect(self.path, timeout=10, isolation_level=None)
+        try:
+            connection.execute("PRAGMA busy_timeout=10000")
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.executescript(_SCHEMA)
+            version = connection.execute("SELECT version FROM schema_metadata WHERE id=1").fetchone()[0]
+            if version != 1:
+                raise ConflictError("unsupported storage schema version")
+        finally:
+            connection.close()
+
+    @contextmanager
+    def _connection(self, write: bool = False) -> Iterator[sqlite3.Connection]:
+        if self.path.is_symlink():
+            raise ValidationError("database must not be a symlink")
+        connection = sqlite3.connect(self.path, timeout=10, isolation_level=None)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA busy_timeout=10000")
+        try:
+            connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+            yield connection
+            if connection.in_transaction:
+                connection.commit()
+        except BaseException:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+
+class SQLiteKnowledgeStore(_Database):
+    """Revision manifests and current access policy in one transactional store."""
+
+    @staticmethod
+    def _validate(document: PreparedDocument) -> None:
+        if not isinstance(document, PreparedDocument):
+            raise ValidationError("document must be a PreparedDocument")
+        request = document.request
+        request.__post_init__()
+        identifier(document.revision_id, "revision_id")
+        nonempty(document.processing_fingerprint, "processing_fingerprint", 1000)
+        _hash(document.content_hash, "content_hash")
+        if document.content_hash != _digest(request.content.encode("utf-8")):
+            raise ValidationError("source content hash mismatch")
+        if document.raw_key != document.content_hash:
+            raise ValidationError("raw object key must match the source content hash")
+        if not document.parents or not document.children:
+            raise ValidationError("prepared document requires parent and child chunks")
+        identity = (request.tenant_id, request.document_id, request.version, document.revision_id)
+        parents = {}
+        children = set()
+        referenced = set()
+        for parent in document.parents:
+            if (parent.tenant_id, parent.document_id, parent.version, parent.revision_id) != identity:
+                raise ValidationError("parent identity does not match prepared document")
+            identifier(parent.parent_id, "parent_id")
+            nonempty(parent.text, "parent text", 2_000_000)
+            nonempty(parent.locator, "parent locator", 10000)
+            if not isinstance(parent.heading_path, tuple):
+                raise ValidationError("heading_path must be a tuple")
+            for heading in parent.heading_path:
+                nonempty(heading, "heading", 10000)
+            if parent.parent_id in parents:
+                raise ValidationError("duplicate parent_id")
+            if parent.content_hash != _digest(parent.text.encode("utf-8")):
+                raise ValidationError("parent content hash mismatch")
+            parents[parent.parent_id] = parent
+        for child in document.children:
+            if (child.tenant_id, child.document_id, child.version, child.revision_id) != identity:
+                raise ValidationError("child identity does not match prepared document")
+            identifier(child.chunk_id, "chunk_id")
+            if child.chunk_id in children:
+                raise ValidationError("duplicate chunk_id")
+            children.add(child.chunk_id)
+            if child.parent_id not in parents:
+                raise ValidationError("child references an unknown parent")
+            referenced.add(child.parent_id)
+            nonempty(child.text, "child text", 2_000_000)
+            nonempty(child.retrieval_text, "retrieval_text", 2_100_000)
+            if child.text not in child.retrieval_text:
+                raise ValidationError("retrieval_text must contain the citable child text")
+            nonempty(child.locator, "child locator", 10000)
+            if child.text not in parents[child.parent_id].text:
+                raise ValidationError("child text is not present in its parent")
+            if (child.scope, child.sku_ids, child.language) != (request.scope, request.sku_ids, request.language):
+                raise ValidationError("child metadata does not match source metadata")
+        if referenced != set(parents):
+            raise ValidationError("every parent must have a child chunk")
+
+    def stage(self, document: PreparedDocument) -> IngestResult:
+        self._validate(document)
+        request = document.request
+        tenant, doc, revision = request.tenant_id, request.document_id, document.revision_id
+        job_id = stable_id("ingest", tenant, doc, revision)
+        canonical = asdict(document)
+        canonical["request"]["sku_ids"] = sorted(set(request.sku_ids))
+        canonical["request"]["allowed_subjects"] = sorted(set(request.allowed_subjects))
+        canonical["parents"] = sorted(canonical["parents"], key=lambda parent: parent["parent_id"])
+        canonical["children"] = sorted(canonical["children"], key=lambda child: child["chunk_id"])
+        for child in canonical["children"]:
+            child["sku_ids"] = sorted(set(child["sku_ids"]))
+        payload_hash = _digest(_json(canonical).encode("utf-8"))
+        metadata = asdict(request)
+        metadata.pop("content")
+        try:
+            with self._connection(write=True) as connection:
+                existing = connection.execute(
+                    "SELECT payload_hash FROM revisions WHERE tenant_id=? AND document_id=? AND revision_id=?",
+                    (tenant, doc, revision),
+                ).fetchone()
+                if existing is not None:
+                    if existing["payload_hash"] != payload_hash:
+                        raise ConflictError("revision_id already belongs to different prepared content")
+                    row = self._job(connection, tenant, job_id)
+                    return self._ingest_result(row, request.version, duplicate=True)
+                connection.execute(
+                    "INSERT OR IGNORE INTO documents VALUES (?,?,?,0)",
+                    (tenant, doc, _json(request.allowed_subjects)),
+                )
+                connection.execute(
+                    "INSERT INTO revisions VALUES (?,?,?,?,?,?,?,?,?)",
+                    (tenant, doc, revision, request.version, document.processing_fingerprint,
+                     document.content_hash, document.raw_key, _json(metadata), payload_hash),
+                )
+                connection.executemany(
+                    "INSERT INTO parents VALUES (?,?,?,?,?)",
+                    [(tenant, doc, revision, parent.parent_id, _json(asdict(parent))) for parent in document.parents],
+                )
+                connection.executemany(
+                    "INSERT INTO children VALUES (?,?,?,?,?,?)",
+                    [(tenant, doc, revision, child.chunk_id, child.parent_id, _json(asdict(child))) for child in document.children],
+                )
+                connection.execute(
+                    "INSERT INTO jobs VALUES (?,?,?,?,'staged',?,?)",
+                    (tenant, job_id, doc, revision, len(document.parents), len(document.children)),
+                )
+                return IngestResult(job_id, revision, doc, request.version, "staged",
+                                    len(document.parents), len(document.children))
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("prepared chunk identity conflicts with an existing revision") from exc
+
+    @staticmethod
+    def _job(connection: sqlite3.Connection, tenant: str, job_id: str) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT j.*, r.version FROM jobs j JOIN revisions r USING(tenant_id,document_id,revision_id) "
+            "WHERE j.tenant_id=? AND j.job_id=?", (tenant, job_id),
+        ).fetchone()
+        if row is None:
+            raise NotFoundError("ingestion job not found")
+        return row
+
+    @staticmethod
+    def _ingest_result(row: sqlite3.Row, version: str, duplicate: bool = False) -> IngestResult:
+        return IngestResult(row["job_id"], row["revision_id"], row["document_id"], version,
+                            row["state"], row["parent_count"], row["child_count"], duplicate)
+
+    def get_job(self, tenant_id: str, job_id: str) -> dict[str, Any]:
+        identifier(tenant_id, "tenant_id")
+        identifier(job_id, "job_id")
+        with self._connection() as connection:
+            return dict(self._job(connection, tenant_id, job_id))
+
+    @staticmethod
+    def _current(connection: sqlite3.Connection, tenant: str) -> str | None:
+        row = connection.execute("SELECT generation FROM current_snapshots WHERE tenant_id=?", (tenant,)).fetchone()
+        return row[0] if row else None
+
+    @staticmethod
+    def _snapshot(connection: sqlite3.Connection, tenant: str, generation: str) -> Snapshot:
+        row = connection.execute(
+            "SELECT created_at FROM snapshots WHERE tenant_id=? AND generation=?", (tenant, generation),
+        ).fetchone()
+        if row is None:
+            raise NotFoundError("snapshot not found")
+        revisions = connection.execute(
+            "SELECT document_id,revision_id FROM snapshot_revisions "
+            "WHERE tenant_id=? AND generation=? ORDER BY document_id", (tenant, generation),
+        ).fetchall()
+        return Snapshot(tenant, generation, tuple((r[0], r[1]) for r in revisions), row[0])
+
+    @staticmethod
+    def _compare_generation(connection: sqlite3.Connection, tenant: str, expected: str | None) -> str | None:
+        if expected is not None:
+            identifier(expected, "expected_generation")
+        current = SQLiteKnowledgeStore._current(connection, tenant)
+        if current != expected:
+            raise ConflictError("current generation changed; reopen snapshot before retrying")
+        return current
+
+    @staticmethod
+    def _create_snapshot(connection: sqlite3.Connection, tenant: str, revisions: dict[str, str]) -> Snapshot:
+        generation = uuid4().hex
+        created_at = datetime.now(timezone.utc).isoformat()
+        connection.execute("INSERT INTO snapshots VALUES (?,?,?)", (tenant, generation, created_at))
+        connection.executemany(
+            "INSERT INTO snapshot_revisions VALUES (?,?,?,?)",
+            [(tenant, generation, doc, revision) for doc, revision in sorted(revisions.items())],
+        )
+        connection.execute(
+            "INSERT INTO current_snapshots VALUES (?,?) ON CONFLICT(tenant_id) "
+            "DO UPDATE SET generation=excluded.generation", (tenant, generation),
+        )
+        return Snapshot(tenant, generation, tuple(sorted(revisions.items())), created_at)
+
+    def publish(self, tenant_id: str, job_id: str, expected_generation: str | None) -> Snapshot:
+        identifier(tenant_id, "tenant_id")
+        identifier(job_id, "job_id")
+        with self._connection(write=True) as connection:
+            current = self._compare_generation(connection, tenant_id, expected_generation)
+            job = self._job(connection, tenant_id, job_id)
+            previous = self._snapshot(connection, tenant_id, current) if current else None
+            revisions = dict(previous.revisions) if previous else {}
+            if previous and revisions.get(job["document_id"]) == job["revision_id"]:
+                snapshot = previous
+            else:
+                revisions[job["document_id"]] = job["revision_id"]
+                snapshot = self._create_snapshot(connection, tenant_id, revisions)
+            connection.execute(
+                "UPDATE jobs SET state='published' WHERE tenant_id=? AND job_id=?", (tenant_id, job_id),
+            )
+            return snapshot
+
+    def open_snapshot(self, tenant_id: str, generation: str | None = None) -> Snapshot | None:
+        identifier(tenant_id, "tenant_id")
+        if generation is not None:
+            identifier(generation, "generation")
+        with self._connection() as connection:
+            generation = generation if generation is not None else self._current(connection, tenant_id)
+            return self._snapshot(connection, tenant_id, generation) if generation else None
+
+    @staticmethod
+    def _trusted_snapshot(connection: sqlite3.Connection, snapshot: Snapshot, access: AccessContext) -> Snapshot:
+        if not isinstance(snapshot, Snapshot) or not isinstance(access, AccessContext):
+            raise ValidationError("snapshot and access context are required")
+        identifier(snapshot.tenant_id, "tenant_id")
+        identifier(snapshot.generation, "generation")
+        access.__post_init__()
+        if snapshot.tenant_id != access.tenant_id:
+            raise ForbiddenError("snapshot belongs to a different tenant")
+        actual = SQLiteKnowledgeStore._snapshot(connection, access.tenant_id, snapshot.generation)
+        if actual != snapshot:
+            raise ForbiddenError("snapshot manifest does not match the published snapshot")
+        return actual
+
+    @staticmethod
+    def _allowed(row: sqlite3.Row, access: AccessContext) -> bool:
+        subjects = json.loads(row["allowed_subjects"])
+        return not row["revoked"] and (not subjects or bool(access.subjects.intersection(subjects)))
+
+    def list_chunks(self, snapshot: Snapshot, access: AccessContext, sku: str | None = None) -> tuple[ChildChunk, ...]:
+        if sku is not None:
+            identifier(sku, "sku")
+        with self._connection() as connection:
+            actual = self._trusted_snapshot(connection, snapshot, access)
+            rows = connection.execute(
+                "SELECT c.value_json,d.allowed_subjects,d.revoked FROM children c "
+                "JOIN snapshot_revisions s USING(tenant_id,document_id,revision_id) "
+                "JOIN documents d USING(tenant_id,document_id) "
+                "WHERE s.tenant_id=? AND s.generation=? ORDER BY c.document_id,c.chunk_id",
+                (actual.tenant_id, actual.generation),
+            ).fetchall()
+            chunks = []
+            for row in rows:
+                if not self._allowed(row, access):
+                    continue
+                value = json.loads(row["value_json"])
+                value["sku_ids"] = tuple(value["sku_ids"])
+                child = ChildChunk(**value)
+                if child.scope == "store" or (sku is not None and sku in child.sku_ids):
+                    chunks.append(child)
+            return tuple(chunks)
+
+    def get_parents(self, snapshot: Snapshot, parent_ids: Sequence[str], access: AccessContext) -> tuple[ParentChunk, ...]:
+        if isinstance(parent_ids, (str, bytes)):
+            raise ValidationError("parent_ids must be a sequence of identifiers")
+        wanted = tuple(dict.fromkeys(identifier(value, "parent_id") for value in parent_ids))
+        with self._connection() as connection:
+            actual = self._trusted_snapshot(connection, snapshot, access)
+            # No dynamic SQL/variable-count limit: read only the true snapshot.
+            rows = connection.execute(
+                "SELECT p.value_json,p.parent_id,d.allowed_subjects,d.revoked FROM parents p "
+                "JOIN snapshot_revisions s USING(tenant_id,document_id,revision_id) "
+                "JOIN documents d USING(tenant_id,document_id) "
+                "WHERE s.tenant_id=? AND s.generation=?", (actual.tenant_id, actual.generation),
+            ).fetchall()
+            wanted_set = set(wanted)
+            found = {}
+            for row in rows:
+                if row["parent_id"] in wanted_set and self._allowed(row, access):
+                    value = json.loads(row["value_json"])
+                    value["heading_path"] = tuple(value["heading_path"])
+                    found[row["parent_id"]] = ParentChunk(**value)
+            return tuple(found[parent_id] for parent_id in wanted if parent_id in found)
+
+    def delete_document(self, tenant_id: str, document_id: str, expected_generation: str | None) -> Snapshot:
+        identifier(tenant_id, "tenant_id")
+        identifier(document_id, "document_id")
+        with self._connection(write=True) as connection:
+            current = self._compare_generation(connection, tenant_id, expected_generation)
+            previous = self._snapshot(connection, tenant_id, current) if current else None
+            revisions = dict(previous.revisions) if previous else {}
+            if document_id not in revisions:
+                raise NotFoundError("document is not in the current snapshot")
+            del revisions[document_id]
+            connection.execute(
+                "UPDATE documents SET revoked=1 WHERE tenant_id=? AND document_id=?", (tenant_id, document_id),
+            )
+            return self._create_snapshot(connection, tenant_id, revisions)
+
+    def rollback(self, tenant_id: str, generation: str, expected_generation: str | None) -> Snapshot:
+        identifier(tenant_id, "tenant_id")
+        identifier(generation, "generation")
+        with self._connection(write=True) as connection:
+            self._compare_generation(connection, tenant_id, expected_generation)
+            target = self._snapshot(connection, tenant_id, generation)
+            return self._create_snapshot(connection, tenant_id, dict(target.revisions))
+
+    def set_access(self, tenant_id: str, document_id: str, allowed_subjects: tuple[str, ...], revoked: bool = False) -> None:
+        identifier(tenant_id, "tenant_id")
+        identifier(document_id, "document_id")
+        if not isinstance(allowed_subjects, tuple) or not isinstance(revoked, bool):
+            raise ValidationError("allowed_subjects must be a tuple and revoked a boolean")
+        for subject in allowed_subjects:
+            identifier(subject, "allowed_subject")
+        with self._connection(write=True) as connection:
+            result = connection.execute(
+                "UPDATE documents SET allowed_subjects=?,revoked=? WHERE tenant_id=? AND document_id=?",
+                (_json(allowed_subjects), int(revoked), tenant_id, document_id),
+            )
+            if result.rowcount != 1:
+                raise NotFoundError("document not found")
+
+
+class SQLiteTraceSink(_Database):
+    """Tenant-isolated immutable JSON traces; credentials are never accepted."""
+
+    _SECRET_KEYS = frozenset({
+        "apikey", "credential", "credentials", "authorization", "token",
+        "accesstoken", "refreshtoken", "password", "secret", "clientsecret",
+    })
+
+    @classmethod
+    def _reject_secrets(cls, value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise ValidationError("trace keys must be strings")
+                normalized = re.sub(r"[^a-z0-9]", "", key.lower())
+                if (normalized in cls._SECRET_KEYS
+                        or normalized.endswith(("apikey", "accesstoken", "refreshtoken",
+                                                "password", "clientsecret"))):
+                    raise ValidationError("trace contains a credential-bearing field")
+                cls._reject_secrets(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                cls._reject_secrets(item)
+
+    def save(self, trace: dict[str, Any]) -> None:
+        if not isinstance(trace, dict):
+            raise ValidationError("trace must be a dictionary")
+        tenant = identifier(trace.get("tenant_id"), "tenant_id")
+        trace_id = identifier(trace.get("trace_id"), "trace_id")
+        self._reject_secrets(trace)
+        value = _json(trace)
+        with self._connection(write=True) as connection:
+            existing = connection.execute(
+                "SELECT value_json FROM traces WHERE tenant_id=? AND trace_id=?", (tenant, trace_id),
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != value:
+                    raise ConflictError("trace_id already belongs to a different trace")
+                return
+            connection.execute("INSERT INTO traces VALUES (?,?,?)", (tenant, trace_id, value))
+
+    def get(self, tenant_id: str, trace_id: str) -> dict[str, Any]:
+        identifier(tenant_id, "tenant_id")
+        identifier(trace_id, "trace_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT value_json FROM traces WHERE tenant_id=? AND trace_id=?", (tenant_id, trace_id),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("trace not found")
+            return json.loads(row[0])

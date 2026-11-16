@@ -119,6 +119,55 @@ function notice(message = "", type = "") {
   node.className = `run-notice ${type}`;
   node.hidden = !message;
 }
+const failedStatuses = ["error", "timeout", "cancelled"];
+function failureDetails(stage, trace = state.trace) {
+  if (stage?.error?.message) return stage.error;
+  const call = trace?.usage?.calls?.findLast((item) =>
+    ["network_error", "timeout", "http_error", "invalid_response"].includes(
+      item.status,
+    ),
+  );
+  if (call?.error?.message) return call.error;
+  if (call?.status === "network_error")
+    return {
+      code: "cloud_network_error",
+      message:
+        "云模型连接中断，本次请求未获得完整响应。已保留此前完成的步骤，可手动重试。",
+    };
+  if (call?.status === "timeout" || stage?.status === "timeout")
+    return {
+      code: "request_timeout",
+      message: "此步骤已超时，未获得有效返回。请稍后手动重试。",
+    };
+  if (call?.status === "http_error")
+    return {
+      code: "cloud_http_error",
+      message: `云平台返回请求错误${call.http_status ? `（HTTP ${call.http_status}）` : ""}，请检查模型服务状态与配置。`,
+    };
+  if (call?.status === "invalid_response")
+    return {
+      code: "cloud_invalid_response",
+      message: "云平台未返回符合协议的数据，本步骤没有有效返回。",
+    };
+  if (stage?.status === "cancelled")
+    return { code: "query_cancelled", message: "查询已停止，此步骤没有完成。" };
+  if (stage?.reason === "output_validation_failed")
+    return {
+      code: "output_validation_failed",
+      message: "插件返回未通过数据校验，已停止后续执行。",
+    };
+  return {
+    code: "step_failed",
+    message: "此步骤执行失败，没有产生有效返回。已完成步骤可在执行链路中查看。",
+  };
+}
+function failureMessage(trace = state.trace) {
+  const stage = trace?.stages?.findLast((item) =>
+    failedStatuses.includes(item.status),
+  );
+  const detail = failureDetails(stage, trace);
+  return `${stage ? `${nameFor(stage.name)}：` : ""}${detail.message}`;
+}
 let toastTimer;
 function toast(message) {
   $("#toast").textContent = message;
@@ -329,7 +378,7 @@ function resetCurrent() {
   $("#inspector-heading").textContent = "步骤详情";
   $("#inspector-subtitle").textContent = "细节，比一个答案更多。";
   $("#raw-data").textContent = "等待服务器返回实际运行数据…";
-  $("#trace-label").textContent = "TRACE / 正在建立连接";
+  $("#trace-label").textContent = "正在建立连接，等待服务器生成编号";
   $("#trace-copy").disabled = true;
   $("#export-button").disabled = true;
   $("#metric-duration").replaceChildren(
@@ -372,7 +421,7 @@ function clearData() {
   $("#char-count").textContent = "0 / 4000";
   $("#run-status").textContent = "待运行";
   $("#timeline-heading").textContent = "准备就绪，等待一个好问题";
-  $("#trace-label").textContent = "TRACE / 尚未开始";
+  $("#trace-label").textContent = "尚未开始，提交问题后自动生成";
   $("#timeline").replaceChildren(
     el("div", "plain-empty", "输入问题，开始追踪一次真实检索。"),
   );
@@ -447,7 +496,7 @@ $("#query-form").addEventListener("submit", async (event) => {
       if (!current()) return;
       if (type === "trace") {
         state.traceId = data.trace_id;
-        $("#trace-label").textContent = `TRACE / ${state.traceId}`;
+        $("#trace-label").textContent = state.traceId;
         $("#trace-copy").disabled = false;
       } else if (type === "stage") {
         acceptStage(data);
@@ -459,8 +508,12 @@ $("#query-form").addEventListener("submit", async (event) => {
         terminal = true;
         if (data.trace_id) {
           state.traceId = data.trace_id;
-          $("#trace-label").textContent = `TRACE / ${state.traceId}`;
+          $("#trace-label").textContent = state.traceId;
           $("#trace-copy").disabled = false;
+        }
+        if (data.trace) {
+          applyRun(data.trace.final_result || null, data.trace);
+          saveRun(question);
         }
         throw new Error(data.message || "查询执行失败。");
       }
@@ -471,13 +524,43 @@ $("#query-form").addEventListener("submit", async (event) => {
       );
   } catch (error) {
     if (!current()) return;
-    const aborted = error.name === "AbortError";
+    let aborted = error.name === "AbortError" || controller.signal.aborted;
+    let diagnosticLoadError = "";
+    // Read-only recovery also supports older servers and an interrupted SSE
+    // connection. It never repeats the paid query.
+    if (!aborted && state.traceId && !state.trace) {
+      try {
+        const trace = await (
+          await api(`/traces/${encodeURIComponent(state.traceId)}`, {
+            signal: controller.signal,
+          })
+        ).json();
+        if (!current()) return;
+        applyRun(trace.final_result || null, trace);
+        saveRun(question);
+      } catch (loadError) {
+        if (!current()) return;
+        aborted = loadError.name === "AbortError" || controller.signal.aborted;
+        if (!aborted)
+          diagnosticLoadError = ` 执行记录暂不可读取：${loadError.message}`;
+      }
+    }
+    if (!current()) return;
+    if (state.trace) {
+      const failed = failedStatuses.includes(state.trace.status);
+      if (failed) notice(`${failureMessage()}${diagnosticLoadError}`, "error");
+      else
+        notice(
+          "实时连接中断后，已按当前权限恢复完整执行记录。请查看实际结果。",
+        );
+      return;
+    }
     $("#run-status").textContent = aborted ? "已停止" : "执行失败";
     $("#timeline-heading").textContent = aborted ? "查询已停止" : "执行未完成";
     notice(
       aborted
         ? "已停止等待并取消查询。已完成的步骤保留在时间线中。"
-        : error.message,
+        : `${error.message}${state.traceId ? ` 本次 Trace ID：${state.traceId}。` : ""}${diagnosticLoadError}`,
       aborted ? "" : "error",
     );
     for (const stage of state.stages) {
@@ -485,6 +568,24 @@ $("#query-form").addEventListener("submit", async (event) => {
         stage.status = aborted ? "cancelled" : "error";
     }
     renderTimeline();
+    state.selected = state.stages.findLastIndex((stage) =>
+      failedStatuses.includes(stage.status),
+    );
+    renderInspector(state.selected);
+    empty(
+      $("#panel-answer"),
+      aborted
+        ? "查询已停止，未获得核验完成的回答。"
+        : "查询执行失败，未返回最终回答。请查看失败步骤。",
+    );
+    empty(
+      $("#panel-evidence"),
+      "本次未获得最终授权证据。已完成步骤的记录可通过 Trace 查看。",
+    );
+    empty(
+      $("#panel-models"),
+      "未能读取完整调用记录。可按本次 Trace ID 重新加载。",
+    );
     $("#duration-caption").textContent = "页面等待耗时";
   } finally {
     if (state.controller === controller) {
@@ -675,7 +776,7 @@ function applyRun(result, trace) {
   state.trace = trace || null;
   state.stages = trace?.stages || state.stages;
   state.traceId = result?.trace_id || trace?.trace_id || state.traceId;
-  $("#trace-label").textContent = `TRACE / ${state.traceId || "未提供"}`;
+  $("#trace-label").textContent = state.traceId || "未提供";
   $("#trace-copy").disabled = !state.traceId;
   $("#export-button").disabled = false;
   const status = result?.status || trace?.status || "ok";
@@ -685,6 +786,10 @@ function applyRun(result, trace) {
   state.selected = state.stages.findLastIndex(
     (stage) => !["disabled", "skipped"].includes(stage.status),
   );
+  const failedIndex = state.stages.findLastIndex((stage) =>
+    failedStatuses.includes(stage.status),
+  );
+  if (failedIndex >= 0) state.selected = failedIndex;
   renderTimeline();
   renderMetrics();
   renderInspector(state.selected);
@@ -706,6 +811,8 @@ function applyRun(result, trace) {
     ].includes(status)
   )
     notice(result?.message || `本次结果：${statuses[status]}`);
+  else if (failedStatuses.includes(status))
+    notice(failureMessage(trace), "error");
   else notice();
 }
 
@@ -734,8 +841,19 @@ function renderInspector(index) {
   target.append(meta);
   if (stage.error_type)
     target.append(el("p", "output-summary", `异常类型：${stage.error_type}`));
+  if (failedStatuses.includes(stage.status)) {
+    const detail = failureDetails(stage);
+    target.append(el("p", "run-notice error", detail.message));
+    target.append(el("p", "stage-code", `诊断代码：${detail.code}`));
+  }
   if (stage.reason)
-    target.append(el("p", "output-summary", `跳过原因：${stage.reason}`));
+    target.append(
+      el(
+        "p",
+        "output-summary",
+        `${["disabled", "skipped"].includes(stage.status) ? "跳过原因" : "处理原因"}：${stage.reason}`,
+      ),
+    );
   const section = el("div", "inspector-section");
   section.append(el("h3", "", "结构化返回结果"));
   if (stage.output !== undefined) {
@@ -747,11 +865,13 @@ function renderInspector(index) {
         "output-summary",
         stage.status === "running"
           ? "步骤正在执行，服务端计时中。"
-          : ["disabled", "skipped"].includes(stage.status)
-            ? "本次没有调用此步骤。"
-            : state.trace
-              ? "此 Trace 未记录该步骤的返回内容。"
-              : "查询完成并通过权限复核后，展示返回内容。",
+          : failedStatuses.includes(stage.status)
+            ? "本步骤未正常完成，没有有效返回。此前已完成步骤的返回内容保留在执行链路中。"
+            : ["disabled", "skipped"].includes(stage.status)
+              ? "本次没有调用此步骤。"
+              : state.trace
+                ? "此 Trace 未记录该步骤的返回内容。"
+                : "查询完成并通过权限复核后，展示返回内容。",
       ),
     );
   target.append(section);
@@ -808,7 +928,12 @@ function renderAnswer() {
   target.replaceChildren();
   const result = state.result;
   if (!result) {
-    empty(target, "此历史 Trace 未记录最终回答，详情请查看步骤和证据。");
+    empty(
+      target,
+      failedStatuses.includes(state.trace?.status)
+        ? "本次执行未完成，没有生成核验通过的最终回答。请查看失败步骤；此前完成的检索结果仍可逐步查看。"
+        : "此历史 Trace 未记录最终回答，详情请查看步骤和证据。",
+    );
     return;
   }
   target.append(
@@ -1010,6 +1135,14 @@ function renderModels() {
       ),
       el("td", "", ms(call.duration_ms)),
     );
+    if (call.error_code || call.error_type)
+      row.children[2].append(
+        el(
+          "div",
+          "output-summary",
+          [call.error_code, call.error_type].filter(Boolean).join(" / "),
+        ),
+      );
     body.append(row);
   }
   table.append(head, body);
@@ -1050,6 +1183,7 @@ $$("[data-tab]").forEach((button) => {
 });
 function saveRun(question) {
   if (!state.traceId) return;
+  state.runs = state.runs.filter((run) => run.id !== state.traceId);
   state.runs.unshift({
     id: state.traceId,
     question,
@@ -1123,7 +1257,7 @@ $("#trace-copy").addEventListener("click", async () => {
     await navigator.clipboard.writeText(state.traceId);
     toast("Trace ID 已复制。");
   } catch {
-    toast("无法访问剪贴板，可从页面底部手动复制。");
+    toast("无法访问剪贴板，可从「本次 Trace ID」区域手动复制。");
   }
 });
 $("#export-button").addEventListener("click", () => {

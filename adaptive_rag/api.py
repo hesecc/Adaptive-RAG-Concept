@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .app import RagApplication
 from .config import Principal, Settings, load_settings
-from .domain import IngestRequest, QueryRequest, RagError, ValidationError
+from .domain import IngestRequest, QueryRequest, RagError, ValidationError, safe_error
 
 
 class Input(BaseModel):
@@ -196,9 +196,19 @@ def create_api(settings: Settings | None = None) -> FastAPI:
                     # text. Only a stable public code and generic text cross
                     # this streaming transport.
                     code = exc.code if isinstance(exc, RagError) else "internal_error"
-                    queue.put_nowait(("error", {"code": code,
-                        "message": "查询未完成，请使用 Trace ID 查看执行记录或稍后重试。",
-                        "trace_id": trace_id}))
+                    diagnostic = safe_error(exc)
+                    value = {"code": code, "message": diagnostic["message"],
+                             "error": diagnostic, "trace_id": trace_id}
+                    # A failed query can still have useful validated outputs.
+                    # Recheck every source against current permissions before
+                    # returning them, exactly as for a successful terminal.
+                    if trace_id:
+                        try:
+                            value["trace"] = await asyncio.to_thread(
+                                application.get_accessible_trace, principal.access, trace_id)
+                        except Exception:
+                            pass
+                    queue.put_nowait(("error", value))
 
             task = asyncio.create_task(run_query())
             try:

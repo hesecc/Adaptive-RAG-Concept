@@ -98,6 +98,54 @@ class CloudConfigurationTests(unittest.TestCase):
 
 
 class CloudTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_network_failure_keeps_safe_diagnosis_without_repeating_request(self):
+        calls = []
+        def handler(request):
+            calls.append(request)
+            raise httpx.RemoteProtocolError("fixture-key-private private upstream detail", request=request)
+        token = start_usage()
+        try:
+            with self.assertRaises(CapabilityError) as caught:
+                await transport(handler).post("chat/completions", {"model": "llm-v1"})
+            record = usage_snapshot()["calls"][-1]
+            self.assertEqual(record.get("error_code"), "cloud_network_error")
+            self.assertEqual(record.get("error_type"), "RemoteProtocolError")
+            self.assertEqual(len(calls), 1)
+            self.assertNotIn("fixture-key-private", json.dumps(record) + str(caught.exception))
+            self.assertNotIn("upstream detail", json.dumps(record) + str(caught.exception))
+        finally:
+            reset_usage(token)
+
+    async def test_timeout_keeps_distinct_diagnosis_without_repeating_request(self):
+        calls = []
+        def handler(request):
+            calls.append(request)
+            raise httpx.ReadTimeout("fixture-key-private timeout detail", request=request)
+        token = start_usage()
+        try:
+            with self.assertRaises(CapabilityError):
+                await transport(handler).post("chat/completions", {"model": "llm-v1"})
+            record = usage_snapshot()["calls"][-1]
+            self.assertEqual(record.get("error_code"), "cloud_timeout")
+            self.assertEqual(record.get("error_type"), "ReadTimeout")
+            self.assertEqual(len(calls), 1)
+            self.assertNotIn("fixture-key-private", json.dumps(record))
+        finally:
+            reset_usage(token)
+
+    async def test_http_failure_keeps_status_and_safe_diagnosis(self):
+        token = start_usage()
+        try:
+            with self.assertRaises(CapabilityError):
+                await transport(lambda request: httpx.Response(401,
+                    json={"error": "fixture-key-private"})).post("chat/completions", {})
+            record = usage_snapshot()["calls"][-1]
+            self.assertEqual(record.get("error_code"), "cloud_http_error")
+            self.assertEqual(record["http_status"], 401)
+            self.assertNotIn("fixture-key-private", json.dumps(record))
+        finally:
+            reset_usage(token)
+
     async def test_429_retries_once_with_metered_attempts_and_tokens(self):
         calls = []
         def handler(request):

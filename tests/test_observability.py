@@ -8,12 +8,15 @@ import tempfile
 import unittest
 
 from fastapi.testclient import TestClient
+import httpx
 
 from adaptive_rag.api import create_api
 from adaptive_rag.app import RagApplication
 from adaptive_rag.config import Principal, Settings
 from adaptive_rag.domain import AccessContext, CapabilityError, Hit, IngestRequest, NotFoundError, QueryRequest, ValidationError
 from adaptive_rag.pipeline import RulePlanner
+from adaptive_rag.cloud import CloudSettings, CloudTransport
+from adaptive_rag.quality import CloudEvidenceJudge
 
 
 ADMIN = "console-admin-test-0000000000000000"
@@ -132,6 +135,67 @@ class WorkbenchHTTPTests(unittest.TestCase):
         self.assertEqual(trace["status"], "error")
         self.assertEqual(trace["stages"][-1]["error_type"], "RuntimeError")
 
+    def test_failed_stream_returns_authorized_completed_outputs_and_safe_diagnosis(self):
+        self.publish()
+        def handler(request):
+            raise httpx.RemoteProtocolError("provider-secret text", request=request)
+        config = CloudSettings("https://models.example.test/v1", "fixture-private-key", "llm", "embed", "rank")
+        transport = CloudTransport(config, lambda **kwargs: httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), **kwargs))
+        self.app.components["judge"] = CloudEvidenceJudge(transport)
+        response = self.query()
+        events = parse_events(response.text)
+        self.assertEqual(events[-1][0], "error")
+        final = events[-1][1]
+        self.assertIn("trace", final)
+        trace = final["trace"]
+        self.assertEqual(final["error"]["code"], "cloud_network_error")
+        self.assertEqual(trace["error"], final["error"])
+        self.assertEqual(trace["stages"][-1]["error"], final["error"])
+        self.assertTrue(any(row.get("output", {}).get("hits") for row in trace["stages"]))
+        self.assertEqual(trace["usage"]["calls"][-1]["error_type"], "RemoteProtocolError")
+        self.assertFalse(any(kind == "result" for kind, _ in events))
+        self.assertNotIn("provider-secret", response.text)
+        self.assertNotIn("fixture-private-key", response.text)
+        self.assertEqual(self.client.get("/traces/" + final["trace_id"], headers=self.headers()).json(), trace)
+
+    def test_failed_stream_withdraws_completed_outputs_when_sources_are_revoked(self):
+        self.publish()
+        def handler(request):
+            self.app.set_access("alpha", "policy", (), True)
+            raise httpx.ConnectError("fixture-private-key provider detail", request=request)
+        config = CloudSettings("https://models.example.test/v1", "fixture-private-key", "llm", "embed", "rank")
+        self.app.components["judge"] = CloudEvidenceJudge(CloudTransport(config,
+            lambda **kwargs: httpx.AsyncClient(transport=httpx.MockTransport(handler), **kwargs)))
+        events = parse_events(self.query().text)
+        kind, final = events[-1]
+        self.assertEqual(kind, "error")
+        self.assertTrue(final["trace_id"])
+        self.assertNotIn("trace", final)
+        self.assertNotIn("Amber warranty", json.dumps(events))
+        self.assertNotIn("fixture-private-key", json.dumps(events))
+        self.assertEqual(self.client.get("/traces/" + final["trace_id"], headers=self.headers()).status_code, 404)
+
+    def test_transient_final_trace_read_returns_persisted_result_in_recovery_trace(self):
+        self.publish()
+        original = self.app.get_accessible_trace
+        reads = []
+        def transient(access, trace_id):
+            reads.append(trace_id)
+            if len(reads) == 1:
+                raise RuntimeError("private storage failure")
+            return original(access, trace_id)
+        self.app.get_accessible_trace = transient
+        events = parse_events(self.query().text)
+        kind, final = events[-1]
+        self.assertEqual(kind, "error")
+        self.assertEqual(reads, [final["trace_id"], final["trace_id"]])
+        self.assertEqual(final["trace"]["status"], "evidence_preview")
+        result = final["trace"]["final_result"]
+        self.assertEqual(result["status"], "evidence_preview")
+        self.assertTrue(result["evidence"])
+        self.assertNotIn("private storage failure", json.dumps(events))
+
     def test_sink_failure_cannot_emit_a_success_result(self):
         def fail(_trace):
             raise RuntimeError("secret-trace-store")
@@ -247,6 +311,9 @@ class PipelineObservationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(trace["status"], "cancelled")
         self.assertEqual(trace["stages"][-1]["status"], "cancelled")
         self.assertEqual(observed[-1][1]["status"], "cancelled")
+        self.assertEqual(trace["error"]["code"], "query_cancelled")
+        self.assertEqual(trace["stages"][-1]["error"], trace["error"])
+        self.assertIn("已取消", trace["error"]["message"])
         self.assertNotIn("final_result", trace)
 
     async def test_timeout_has_a_terminal_trace(self):
@@ -261,6 +328,8 @@ class PipelineObservationTests(unittest.IsolatedAsyncioTestCase):
         trace = app.get_trace("alpha", observed[0][1]["trace_id"])
         self.assertEqual(trace["status"], "timeout")
         self.assertEqual(trace["stages"][-1]["status"], "timeout")
+        self.assertEqual(trace.get("error", {}).get("code"), "query_timeout")
+        self.assertEqual(trace["stages"][-1].get("error", {}).get("code"), "query_timeout")
 
     async def test_whole_query_deadline_is_timeout_including_its_interrupted_stage(self):
         class SlowPlanner:

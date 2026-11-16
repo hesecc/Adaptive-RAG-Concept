@@ -4,6 +4,7 @@ Tenant/subject fields are trusted caller context, never model outputs. HTTP
 adapters must derive them from authentication rather than request bodies.
 """
 
+from asyncio import CancelledError
 from dataclasses import asdict, dataclass, field
 from hashlib import sha256
 import json
@@ -39,6 +40,30 @@ class ForbiddenError(RagError):
 class CapabilityError(RagError):
     code = "capability_unavailable"
     status_code = 503
+
+    def __init__(self, message, *, diagnostic_code="capability_unavailable"):
+        super().__init__(message)
+        self.diagnostic_code = diagnostic_code
+
+
+_SAFE_ERRORS = {
+    "capability_unavailable": "当前能力调用失败；本次未生成核验完成的回答。",
+    "cloud_network_error": "与云模型的连接中断，本次调用未取得完整返回。可检查网络后手动重试。",
+    "cloud_timeout": "等待云模型返回超时；为避免重复计费，本次没有自动重试。",
+    "cloud_http_error": "云平台返回 HTTP 错误，请查看模型调用中的状态码并检查平台配置或服务状态。",
+    "query_timeout": "本次查询或步骤超过时间限制，已停止等待；已完成的步骤仍可查看。",
+    "query_cancelled": "查询已取消，此步骤没有完成；已完成的步骤仍可查看。",
+}
+
+
+def safe_error(exc: BaseException) -> dict[str, str]:
+    """Return fixed diagnostics, never provider or plugin exception text."""
+    code = (exc.diagnostic_code if isinstance(exc, CapabilityError) else
+            "query_timeout" if isinstance(exc, TimeoutError) else
+            "query_cancelled" if isinstance(exc, CancelledError) else "capability_unavailable")
+    if not isinstance(code, str) or code not in _SAFE_ERRORS:
+        code = "capability_unavailable"
+    return {"code": code, "message": _SAFE_ERRORS[code]}
 
 
 def identifier(value: str, name: str = "id") -> str:

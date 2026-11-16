@@ -15,7 +15,7 @@ from uuid import uuid4
 
 from .domain import (
     CapabilityError, Coverage, Draft, Evidence, Hit, NotFoundError, Plan,
-    QueryRequest, QueryResult, RagError, SubQuery, ValidationError, Verification,
+    QueryRequest, QueryResult, RagError, SubQuery, ValidationError, Verification, safe_error,
 )
 from .retrieval import tokenize
 from .cloud import start_usage, usage_snapshot, reset_usage
@@ -175,6 +175,7 @@ class QueryPipeline:
                 record["status"] = ("cancelled" if isinstance(exc, asyncio.CancelledError) else
                                     "timeout" if isinstance(exc, TimeoutError) else "error")
                 record["error_type"] = type(exc).__name__
+                record["error"] = safe_error(exc)
                 raise
             finally:
                 owner = getattr(function, "__self__", None)
@@ -491,17 +492,20 @@ class QueryPipeline:
         except TimeoutError as exc:
             failed = True
             trace["status"] = "timeout"
+            trace["error"] = safe_error(exc)
             # The outer query deadline cancels its active stage before the
             # timeout context translates that cancellation into TimeoutError.
             if trace["stages"] and trace["stages"][-1]["status"] == "cancelled":
                 record = trace["stages"][-1]
-                record.update(status="timeout", error_type="TimeoutError")
+                record.update(status="timeout", error_type="TimeoutError", error=safe_error(exc))
                 stage_event(record)
-            raise CapabilityError(f"query timed out; trace_id={trace['trace_id']}") from exc
+            raise CapabilityError(f"query timed out; trace_id={trace['trace_id']}",
+                                  diagnostic_code="query_timeout") from exc
         except BaseException as exc:
             failed = True
             trace["status"] = "cancelled" if isinstance(exc, asyncio.CancelledError) else "error"
             trace["error_type"] = type(exc).__name__
+            trace["error"] = safe_error(exc)
             if isinstance(exc, (RagError, asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
                 raise
             raise CapabilityError(f"query plugin failed; trace_id={trace['trace_id']}") from exc

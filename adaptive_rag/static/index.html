@@ -188,6 +188,23 @@
                 ↓
               </button>
             </div>
+            <div class="trace-summary" aria-label="本次运行追踪编号">
+              <div class="trace-summary-main">
+                <span class="trace-summary-title">本次 Trace ID</span>
+                <code id="trace-label" aria-live="polite"
+                  >尚未开始，提交问题后自动生成</code
+                >
+              </div>
+              <button
+                type="button"
+                id="trace-copy"
+                class="trace-copy-button"
+                disabled
+              >
+                复制 Trace ID
+              </button>
+              <p>用于回放本次执行与定位异常；查询失败后也可复制保存。</p>
+            </div>
             <div class="result-tabs" role="tablist" aria-label="运行结果视图">
               <button
                 id="tab-flow"
@@ -279,17 +296,6 @@
                     ><span>证据回源</span>
                   </div>
                 </div>
-              </div>
-              <div class="trace-footer">
-                <span id="trace-label">TRACE / 尚未开始</span
-                ><button
-                  type="button"
-                  id="trace-copy"
-                  class="text-button"
-                  disabled
-                >
-                  复制 ID ↗
-                </button>
               </div>
             </div>
             <div

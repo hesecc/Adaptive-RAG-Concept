@@ -205,10 +205,14 @@ class CloudTransport:
                                 record["status"] = "retry"
                             else:
                                 record["status"] = "http_error"
-                                raise CapabilityError(f"cloud request failed (HTTP {status})")
+                                record["error_code"] = "cloud_http_error"
+                                raise CapabilityError(f"cloud request failed (HTTP {status})",
+                                                      diagnostic_code="cloud_http_error")
                         elif not 200 <= status <= 299:
                             record["status"] = "http_error"
-                            raise CapabilityError(f"cloud request failed (HTTP {status})")
+                            record["error_code"] = "cloud_http_error"
+                            raise CapabilityError(f"cloud request failed (HTTP {status})",
+                                                  diagnostic_code="cloud_http_error")
                         else:
                             body = bytearray()
                             async for block in response.aiter_bytes():
@@ -227,12 +231,24 @@ class CloudTransport:
                             self._tokens(value.get("usage"), meter)
                             record["status"] = "ok"
                             return value
-                except httpx.TimeoutException:
+                except httpx.TimeoutException as exc:
                     record["status"] = "timeout"
-                    raise CapabilityError("cloud request timed out") from None
-                except httpx.HTTPError:
+                    record["error_code"] = "cloud_timeout"
+                    record["error_type"] = next((kind.__name__ for kind in (
+                        httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
+                    ) if isinstance(exc, kind)), "TimeoutException")
+                    raise CapabilityError("cloud request timed out", diagnostic_code="cloud_timeout") from None
+                except httpx.HTTPError as exc:
                     record["status"] = "network_error"
-                    raise CapabilityError("cloud request could not be completed") from None
+                    record["error_code"] = "cloud_network_error"
+                    # Do not expose arbitrary subclass names or exception text.
+                    record["error_type"] = next((kind.__name__ for kind in (
+                        httpx.RemoteProtocolError, httpx.LocalProtocolError,
+                        httpx.ConnectError, httpx.ReadError, httpx.WriteError,
+                        httpx.CloseError, httpx.ProxyError, httpx.UnsupportedProtocol,
+                    ) if isinstance(exc, kind)), "HTTPError")
+                    raise CapabilityError("cloud request could not be completed",
+                                          diagnostic_code="cloud_network_error") from None
                 except asyncio.CancelledError:
                     record["status"] = "cancelled"
                     raise

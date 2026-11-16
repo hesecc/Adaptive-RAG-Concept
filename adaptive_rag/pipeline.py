@@ -100,7 +100,7 @@ class QueryPipeline:
     def __init__(self, settings, components, descriptions):
         self.settings, self.c, self.descriptions = settings, components, descriptions
 
-    async def run(self, request: QueryRequest, capabilities: dict) -> QueryResult:
+    async def run(self, request: QueryRequest, capabilities: dict, observer=None) -> QueryResult:
         usage_token = start_usage()
         started = monotonic()
         deadline = started + self.settings.timeout_seconds
@@ -109,18 +109,50 @@ class QueryPipeline:
         trace = {
             "trace_id": uuid4().hex, "tenant_id": request.access.tenant_id,
             "subject_id": request.access.subject_id, "started_at": datetime.now(timezone.utc).isoformat(),
-            "question": request.question, "history_turns": len(request.history),
+            "question": request.question, "sku": request.sku, "history_turns": len(request.history),
             "history_used": False, "generation": None, "stages": [],
             "plugins": self.descriptions, "model_calls": 0, "network_calls": 0,
             "retrieved_chunk_ids": [], "retry_count": 0,
-            "decisions": [], "retrieval_lanes": [], "rankings": [],
+            "decisions": [], "retrieval_lanes": [], "rankings": [], "source_parent_ids": [],
         }
 
-        async def stage(name, function, *args):
+        def emit(event, value):
+            # The observer is trusted transport code. Only timing metadata is
+            # published before the result's final permission checks complete.
+            if observer is not None:
+                observer(event, value)
+
+        emit("trace", {"trace_id": trace["trace_id"]})
+
+        def stage_event(record):
+            emit("stage", {key: record[key] for key in (
+                "index", "name", "status", "started_ms", "duration_ms", "error_type", "reason"
+            ) if key in record})
+
+        def output(name, value):
+            record = next(row for row in reversed(trace["stages"]) if row["name"] == name)
+            record["output"] = value
+
+        def sources(parent_ids):
+            trace["source_parent_ids"] = list(dict.fromkeys((*trace["source_parent_ids"], *parent_ids)))
+
+        def hit_output(hits):
+            sources(hit.chunk.parent_id for hit in hits)
+            return {"hit_count": len(hits), "hits": [
+                {"chunk_id": hit.chunk.chunk_id, "parent_id": hit.chunk.parent_id,
+                 "document_id": hit.chunk.document_id, "rank": hit.rank, "score": hit.score,
+                 "text_preview": hit.chunk.text[:320], "text_chars": len(hit.chunk.text),
+                 "preview_truncated": len(hit.chunk.text) > 320}
+                for hit in hits
+            ]}
+
+        async def stage(name, function, *args, validate=None):
             begin = monotonic()
             before_calls = usage_snapshot()["model_calls"]
-            record = {"name": name, "status": "running"}
+            record = {"index": len(trace["stages"]), "name": name, "status": "running",
+                      "started_ms": round((begin - started) * 1000, 3)}
             trace["stages"].append(record)
+            stage_event(record)
             try:
                 async with asyncio.timeout(self.settings.stage_timeout_seconds):
                     if inspect.iscoroutinefunction(function):
@@ -129,10 +161,19 @@ class QueryPipeline:
                         value = await asyncio.to_thread(function, *args)
                         if inspect.isawaitable(value):
                             value = await value
+                    if validate is not None:
+                        try:
+                            value = validate(value)
+                            if inspect.isawaitable(value):
+                                value = await value
+                        except Exception:
+                            record["reason"] = "output_validation_failed"
+                            raise
                 record["status"] = "ok"
                 return value
             except BaseException as exc:
-                record["status"] = "timeout" if isinstance(exc, (TimeoutError, asyncio.CancelledError)) else "error"
+                record["status"] = ("cancelled" if isinstance(exc, asyncio.CancelledError) else
+                                    "timeout" if isinstance(exc, TimeoutError) else "error")
                 record["error_type"] = type(exc).__name__
                 raise
             finally:
@@ -141,37 +182,55 @@ class QueryPipeline:
                         getattr(owner, "uses_history", False) and usage_snapshot()["model_calls"] > before_calls):
                     trace["history_used"] = True
                 record["duration_ms"] = round((monotonic() - begin) * 1000, 3)
+                stage_event(record)
 
-        def disabled(role):
-            trace["stages"].append({"name": role, "status": "disabled", "duration_ms": 0})
+        def disabled(role, *, reason=None):
+            record = {"index": len(trace["stages"]), "name": role,
+                      "status": "skipped" if reason else "disabled", "duration_ms": 0,
+                      "started_ms": round((monotonic() - started) * 1000, 3),
+                      "output": {"executed": False}}
+            if reason:
+                record["reason"] = reason
+            trace["stages"].append(record)
+            stage_event(record)
 
         def result(status, message, evidence=(), missing=(), draft=None):
             trace["status"] = status
             trace["evidence"] = [asdict(item) for item in evidence]
-            return QueryResult(trace["trace_id"], status, message, trace["generation"],
+            value = QueryResult(trace["trace_id"], status, message, trace["generation"],
                                tuple(evidence), draft.answer if draft else None, draft.claims if draft else (),
                                tuple(missing), capabilities | {"usage": usage_snapshot()})
+            trace["final_result"] = asdict(value)
+            return value
 
         async def decision(checkpoint, missing=()):
+            def checked(value):
+                if not isinstance(value, dict) or value.get("action") not in {"continue", "retry", "stop"}:
+                    raise ValidationError("decision plugin returned an invalid action")
+                return value
             value = await stage(f"decision.{checkpoint}", self.c["decision"].decide, {
                 "checkpoint": checkpoint, "missing_query_ids": tuple(missing),
                 "gap_enabled": self.descriptions["gap"]["enabled"],
                 "retry_count": trace["retry_count"],
-            })
-            if not isinstance(value, dict) or value.get("action") not in {"continue", "retry", "stop"}:
-                raise ValidationError("decision plugin returned an invalid action")
+            }, validate=checked)
             trace["decisions"].append({"checkpoint": checkpoint, "action": value["action"]})
+            output(f"decision.{checkpoint}", {"checkpoint": checkpoint, "action": value["action"],
+                   "missing_query_ids": list(missing), "retry_count": trace["retry_count"]})
             return value["action"]
 
         async def execute():
             if await decision("preflight") == "stop":
                 return result("policy_stopped", "规则策略停止本次查询。")
-            plan = await stage("planner", self.c["planner"].plan, request)
-            if not isinstance(plan, Plan) or plan.sku != request.sku or plan.action not in {"retrieve", "clarify", "capability_unavailable"}:
-                raise ValidationError("planner returned an invalid plan or changed trusted SKU")
+            def checked_plan(value):
+                if not isinstance(value, Plan) or value.sku != request.sku or value.action not in {"retrieve", "clarify", "capability_unavailable"}:
+                    raise ValidationError("planner returned an invalid plan or changed trusted SKU")
+                return replace(value, queries=self._queries(value.queries)) if value.action == "retrieve" else value
+            plan = await stage("planner", self.c["planner"].plan, request, validate=checked_plan)
             if plan.action != "retrieve":
+                output("planner", {"action": plan.action, "queries": []})
                 return result(plan.action, plan.message)
-            queries = self._queries(plan.queries)
+            queries = plan.queries
+            output("planner", {"action": plan.action, "queries": [asdict(q) for q in queries]})
             original = {q.query_id: q for q in queries}
             trace["subqueries"] = [asdict(q) for q in queries]
             variants = queries
@@ -187,21 +246,24 @@ class QueryPipeline:
             for role in ("rewrite", "multi_query", "hyde"):
                 if self.descriptions[role]["enabled"]:
                     if variant_budget <= len(variants):
-                        trace["stages"].append({"name": role, "status": "skipped",
-                                                "reason": "retrieval_lane_budget", "duration_ms": 0})
+                        disabled(role, reason="retrieval_lane_budget")
                         continue
-                    variants = self._variants(await stage(role, self.c[role].transform, variants, request), original)
+                    variants = await stage(role, self.c[role].transform, variants, request,
+                                           validate=lambda value: self._variants(value, original))
                     variants = self._budget_variants(variants, queries, variant_budget)
+                    output(role, {"queries": [asdict(q) for q in variants], "variant_budget": variant_budget})
                 else:
                     disabled(role)
             trace["query_variants"] = [asdict(q) for q in variants]
             snapshot = await stage("snapshot", self.c["store"].open_snapshot, request.access.tenant_id, request.generation)
+            output("snapshot", {"generation": snapshot.generation if snapshot else None})
             if snapshot is None:
                 return result("no_index", "当前租户尚无已发布知识版本。")
             trace["generation"] = snapshot.generation
             chunks = await stage("authorized_chunks", self.c["store"].list_chunks, snapshot, request.access, request.sku)
             allowed = {chunk.chunk_id: chunk for chunk in chunks}
             trace["authorized_chunk_count"] = len(chunks)
+            output("authorized_chunks", {"authorized_chunk_count": len(chunks), "sku": request.sku})
             for role in ("dense",):
                 if not self.descriptions[role]["enabled"]:
                     disabled(role)
@@ -217,8 +279,11 @@ class QueryPipeline:
                         if lane_count >= self.settings.max_lanes:
                             raise ValidationError("retrieval exceeds configured lane budget")
                         lane_count += 1
-                        hits = await stage(f"{role}.{variant.query_id}.{lane_count}", self.c[role].search, variant, chunks, self.settings.candidate_limit)
-                        checked = self._hits(hits, variant.query_id, allowed, self.settings.candidate_limit)
+                        checked = await stage(f"{role}.{variant.query_id}.{lane_count}", self.c[role].search,
+                                              variant, chunks, self.settings.candidate_limit,
+                                              validate=lambda value: self._hits(value, variant.query_id, allowed, self.settings.candidate_limit))
+                        output(f"{role}.{variant.query_id}.{lane_count}",
+                               {"query_id": variant.query_id, "query": variant.text, **hit_output(checked)})
                         lanes[variant.query_id].append(checked)
                         trace["retrieval_lanes"].append({"role": role, "query_id": variant.query_id,
                             "text": variant.text, "hits": [{"chunk_id": h.chunk.chunk_id, "score": h.score, "rank": h.rank} for h in checked]})
@@ -227,12 +292,14 @@ class QueryPipeline:
             async def assemble():
                 ranked = {}
                 for qid, query in original.items():
-                    fused = await stage(f"fusion.{qid}", self.c["fusion"].fuse, query, lanes[qid], self.settings.candidate_limit)
                     lane_candidates = {hit.chunk.chunk_id: hit.chunk for lane in lanes[qid] for hit in lane}
-                    fused = self._hits(fused, qid, lane_candidates, self.settings.candidate_limit)
-                    hits = await stage(f"reranker.{qid}", self.c["reranker"].rank, query, fused, self.settings.candidate_limit)
+                    fused = await stage(f"fusion.{qid}", self.c["fusion"].fuse, query, lanes[qid], self.settings.candidate_limit,
+                                        validate=lambda value: self._hits(value, qid, lane_candidates, self.settings.candidate_limit))
+                    output(f"fusion.{qid}", {"query_id": qid, **hit_output(fused)})
                     candidates = {hit.chunk.chunk_id: hit.chunk for hit in fused}
-                    ranked[qid] = self._hits(hits, qid, candidates, self.settings.candidate_limit)
+                    ranked[qid] = await stage(f"reranker.{qid}", self.c["reranker"].rank, query, fused, self.settings.candidate_limit,
+                                              validate=lambda value: self._hits(value, qid, candidates, self.settings.candidate_limit))
+                    output(f"reranker.{qid}", {"query_id": qid, **hit_output(ranked[qid])})
                     trace["rankings"].append({"query_id": qid, "retry": trace["retry_count"],
                         "fused_chunk_ids": [h.chunk.chunk_id for h in fused],
                         "ranked_chunk_ids": [h.chunk.chunk_id for h in ranked[qid]]})
@@ -246,28 +313,42 @@ class QueryPipeline:
                 for hit in ordered:
                     associations.setdefault(hit.chunk.parent_id, set()).add(hit.query_id)
                 selected = tuple(associations)[:request.top_k]
-                parents = await stage("parent_backfill", self.c["store"].get_parents, snapshot, selected, request.access)
+                def checked_parents(values):
+                    if {parent.parent_id for parent in values} != set(selected):
+                        # Revocation between retrieval and backfill is fail-closed.
+                        raise NotFoundError("evidence became unavailable; retry the query")
+                    for parent in values:
+                        if parent.tenant_id != request.access.tenant_id or digest(parent.text) != parent.content_hash:
+                            raise ValidationError("parent adapter returned invalid source integrity")
+                    return values
+                parents = await stage("parent_backfill", self.c["store"].get_parents, snapshot, selected, request.access,
+                                      validate=checked_parents)
                 by_id = {parent.parent_id: parent for parent in parents}
-                if set(by_id) != set(selected):
-                    # Revocation between retrieval and backfill is fail-closed.
-                    raise NotFoundError("evidence became unavailable; retry the query")
+                sources(selected)
                 budget = self.settings.evidence_chars
                 items = []
                 for index, parent_id in enumerate(selected):
                     parent = by_id[parent_id]
-                    if parent.tenant_id != request.access.tenant_id or digest(parent.text) != parent.content_hash:
-                        raise ValidationError("parent adapter returned invalid source integrity")
                     length = min(len(parent.text), max(1, budget // (len(selected) - index)))
                     items.append(make_evidence(parent, snapshot.generation, length, sorted(associations[parent_id])))
                     budget -= length
+                output("parent_backfill", {"parent_count": len(parents), "parents": [
+                    {"parent_id": parent.parent_id, "document_id": parent.document_id,
+                     "heading_path": list(parent.heading_path), "text_preview": parent.text[:600],
+                     "text_chars": len(parent.text), "preview_truncated": len(parent.text) > 600,
+                     "content_chars": len(parent.text)} for parent in parents
+                ], "evidence_chars": sum(len(item.text) for item in items)})
                 return tuple(items)
 
             async def finish(status, message, evidence, missing=(), draft=None):
                 # All exits exposing evidence or claims recheck current permissions.
+                def checked_access(values):
+                    if {p.parent_id for p in values} != {e.parent_id for e in evidence}:
+                        raise NotFoundError("evidence access changed during query; retry")
+                    return values
                 parents = await stage("final_access_check", self.c["store"].get_parents, snapshot,
-                                      tuple(e.parent_id for e in evidence), request.access)
-                if {p.parent_id for p in parents} != {e.parent_id for e in evidence}:
-                    raise NotFoundError("evidence access changed during query; retry")
+                                      tuple(e.parent_id for e in evidence), request.access, validate=checked_access)
+                output("final_access_check", {"authorized_parent_count": len(parents), "valid": True})
                 return result(status, message, evidence, missing, draft)
 
             async def recover(missing, evidence, label):
@@ -281,8 +362,9 @@ class QueryPipeline:
                     trace["repair_skipped"] = "retrieval_lane_budget"
                     return evidence, False
                 missing = self._missing_queries(missing, original)
-                gap = self._variants(await stage("gap." + label, self.c["gap"].transform, missing, request),
-                                     {q.query_id: q for q in missing})
+                gap = await stage("gap." + label, self.c["gap"].transform, missing, request,
+                                  validate=lambda value: self._variants(value, {q.query_id: q for q in missing}))
+                output("gap." + label, {"queries": [asdict(q) for q in gap], "checkpoint": label})
                 if lane_count + len(gap) * role_count > self.settings.max_lanes:
                     trace["repair_skipped"] = "retrieval_lane_budget"
                     return evidence, False
@@ -291,8 +373,9 @@ class QueryPipeline:
                 trace["repair_checkpoint"] = label
                 await retrieve(gap)
                 updated = await assemble()
-                coverage = await stage("judge.retry", self.c["judge"].assess, queries, updated)
-                self._coverage(coverage, original)
+                coverage = await stage("judge.retry", self.c["judge"].assess, queries, updated,
+                                       validate=lambda value: self._coverage(value, original))
+                output("judge.retry", asdict(coverage))
                 trace["coverage"] = asdict(coverage)
                 changed = any((item.parent_id, item.source_hash) not in before or
                               len(item.text) > len(before[item.parent_id, item.source_hash])
@@ -302,8 +385,9 @@ class QueryPipeline:
 
             await retrieve(variants)
             evidence = await assemble()
-            coverage = await stage("judge", self.c["judge"].assess, queries, evidence)
-            self._coverage(coverage, original)
+            coverage = await stage("judge", self.c["judge"].assess, queries, evidence,
+                                   validate=lambda value: self._coverage(value, original))
+            output("judge", asdict(coverage))
             action = await decision("gap", coverage.missing_query_ids)
             if action == "stop":
                 return result("policy_stopped", "策略在证据检查后停止查询。", missing=coverage.missing_query_ids)
@@ -321,11 +405,18 @@ class QueryPipeline:
                                     evidence, coverage.missing_query_ids)
             if await decision("generate", coverage.missing_query_ids) == "stop":
                 return result("policy_stopped", "策略停止生成阶段。", missing=coverage.missing_query_ids)
+            async def checked_draft(value, items):
+                if not isinstance(value, Draft):
+                    raise ValidationError("generator returned an invalid draft")
+                if not (await CitationVerifier().verify(value, items)).valid:
+                    raise ValidationError("citation verification failed")
+                return value
             if self.descriptions["generator"]["enabled"]:
                 generation_queries = tuple(q for q in queries if not semantic_coverage or q.query_id in coverage.covered_query_ids)
-                draft = await stage("generator", self.c["generator"].generate, replace(plan, queries=generation_queries), evidence)
-                if not isinstance(draft, Draft):
-                    raise ValidationError("generator returned an invalid draft")
+                draft = await stage("generator", self.c["generator"].generate, replace(plan, queries=generation_queries), evidence,
+                                    validate=lambda value: checked_draft(value, evidence))
+                output("generator", {"answer_present": draft.answer is not None,
+                       "claim_count": len(draft.claims), "verification_pending": True})
             else:
                 disabled("generator")
                 draft = Draft()
@@ -333,14 +424,18 @@ class QueryPipeline:
                 structural = await CitationVerifier().verify(current, items)
                 if not structural.valid:
                     raise ValidationError("citation verification failed")
+                def checked_verification(value):
+                    self._verification(value, current, original)
+                    if not value.valid and not value.support_checked:
+                        raise ValidationError("citation verification failed")
+                    return value
                 evaluator = getattr(self.c["verifier"], "evaluate", None)
                 if callable(evaluator):
-                    checked = await stage(label, evaluator, replace(plan, queries=queries), current, items)
+                    checked = await stage(label, evaluator, replace(plan, queries=queries), current, items,
+                                          validate=checked_verification)
                 else:
-                    checked = await stage(label, self.c["verifier"].verify, current, items)
-                self._verification(checked, current, original)
-                if not checked.valid and not checked.support_checked:
-                    raise ValidationError("citation verification failed")
+                    checked = await stage(label, self.c["verifier"].verify, current, items, validate=checked_verification)
+                output(label, asdict(checked))
                 return checked
 
             verification = await verify(draft, evidence, "verifier")
@@ -355,9 +450,10 @@ class QueryPipeline:
                 evidence, changed = await recover(gap_queries, evidence, "answer")
                 if changed and (coverage.basis != "cloud_semantic_sufficiency" or coverage.covered_query_ids):
                     generation_queries = tuple(q for q in queries if coverage.basis != "cloud_semantic_sufficiency" or q.query_id in coverage.covered_query_ids)
-                    draft = await stage("generator.retry", self.c["generator"].generate, replace(plan, queries=generation_queries), evidence)
-                    if not isinstance(draft, Draft):
-                        raise ValidationError("generator returned an invalid draft")
+                    draft = await stage("generator.retry", self.c["generator"].generate, replace(plan, queries=generation_queries), evidence,
+                                        validate=lambda value: checked_draft(value, evidence))
+                    output("generator.retry", {"answer_present": draft.answer is not None,
+                           "claim_count": len(draft.claims), "verification_pending": True})
                     verification = await verify(draft, evidence, "verifier.retry")
                 else:
                     # Retry may reorder/truncate parents. Keep only claims with exactly
@@ -395,6 +491,12 @@ class QueryPipeline:
         except TimeoutError as exc:
             failed = True
             trace["status"] = "timeout"
+            # The outer query deadline cancels its active stage before the
+            # timeout context translates that cancellation into TimeoutError.
+            if trace["stages"] and trace["stages"][-1]["status"] == "cancelled":
+                record = trace["stages"][-1]
+                record.update(status="timeout", error_type="TimeoutError")
+                stage_event(record)
             raise CapabilityError(f"query timed out; trace_id={trace['trace_id']}") from exc
         except BaseException as exc:
             failed = True
@@ -475,6 +577,7 @@ class QueryPipeline:
             raise ValidationError("judge coverage must not repeat subqueries")
         if coverage.missing_queries:
             QueryPipeline._missing_queries(coverage.missing_queries, {qid: originals[qid] for qid in missing})
+        return coverage
 
     @staticmethod
     def _missing_queries(queries, originals):

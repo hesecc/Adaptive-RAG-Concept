@@ -61,14 +61,43 @@ class RagApplication:
     def set_access(self, tenant_id, document_id, allowed_subjects, revoked=False):
         return self.store.set_access(tenant_id, document_id, allowed_subjects, revoked)
 
-    async def query(self, request):
-        return await self.pipeline.run(request, self.capabilities())
+    async def query(self, request, observer=None):
+        return await self.pipeline.run(request, self.capabilities(), observer)
 
     def get_job(self, tenant_id, job_id):
         return self.store.get_job(tenant_id, job_id)
 
     def get_trace(self, tenant_id, trace_id):
         return self.trace_sink.get(tenant_id, trace_id)
+
+    def get_accessible_trace(self, access: AccessContext, trace_id: str):
+        """Administrative diagnostics still obey current source permissions.
+
+        A trace can mention retrieval hits absent from the final evidence, and
+        can survive a failed query. Check all those references, not only the
+        final excerpts. The trusted local CLI retains its existing raw reader.
+        """
+        trace = self.get_trace(access.tenant_id, trace_id)
+        generation = trace.get("generation")
+        if generation is None:
+            return trace
+        snapshot = self.store.open_snapshot(access.tenant_id, generation)
+        if snapshot is None:
+            raise NotFoundError("trace sources are no longer accessible")
+        chunk_ids = set(trace.get("retrieved_chunk_ids", ()))
+        for lane in trace.get("retrieval_lanes", ()):
+            chunk_ids.update(hit["chunk_id"] for hit in lane.get("hits", ()))
+        if chunk_ids:
+            allowed = {chunk.chunk_id for chunk in self.store.list_chunks(snapshot, access, trace.get("sku"))}
+            if not chunk_ids <= allowed:
+                raise NotFoundError("trace sources are no longer accessible")
+        parent_ids = set(trace.get("source_parent_ids", ()))
+        parent_ids.update(item["parent_id"] for item in trace.get("evidence", ()))
+        if parent_ids:
+            parents = self.store.get_parents(snapshot, tuple(parent_ids), access)
+            if {parent.parent_id for parent in parents} != parent_ids:
+                raise NotFoundError("trace sources are no longer accessible")
+        return trace
 
     def get_evidence(self, access: AccessContext, generation: str, evidence_id: str):
         identifier(generation, "generation")

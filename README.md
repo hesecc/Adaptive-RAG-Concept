@@ -138,18 +138,29 @@ app = RagApplication(Settings(plugins={'lexical': 'my_local_search'}), registry)
 uv run adaptive-rag --config config.local.toml serve
 ```
 
-服务默认仅绑定 `127.0.0.1:8000`。除 `GET /health` 外，业务接口需 `Authorization: Bearer <本机配置中的令牌>`。身份来自 token 映射，请求正文禁止 `tenant_id`、`subject_id`、`groups`。写接口、job 与 trace 读取要求管理员；query 与 evidence 依实时 ACL。
+服务默认仅绑定 `127.0.0.1:8000`。页面与静态资源、`GET /health` 可公开加载；业务接口需 `Authorization: Bearer <本机配置中的令牌>`。身份来自 token 映射，请求正文禁止 `tenant_id`、`subject_id`、`groups`。写接口、job 与 trace 读取要求管理员；query 与 evidence 依实时 ACL。
 
 也可用 `--env-file .env serve` 读取 `RAG_HTTP_API_TOKEN`、`RAG_HTTP_TENANT`、`RAG_HTTP_SUBJECT`，创建一个显式管理员身份；多身份和普通用户权限继续用受控 TOML 映射。HTTP token 至少 24 个非空白字符，独立于 `RAG_CLOUD_API_KEY` 与 `MINERU_API_KEY`。
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
+| GET | `/`、`/static/*` | 同源检索工作台与静态资源 |
+| GET | `/console/session` | 管理员工作台连接验证与当前插件配置 |
 | GET | `/health`、`/capabilities` | 健康与插件状态 |
 | POST | `/documents`、`/publish` | 暂存与 CAS 发布 |
 | POST | `/query` | 规则编排、证据预览及显式启用的云查询/生成/质量检查 |
+| POST | `/query/stream` | 管理员实时阶段事件，完成后返回结果与授权 Trace |
 | GET | `/jobs/{id}`、`/traces/{id}` | 作业与链路诊断 |
 | GET | `/evidence/{generation}/{evidence_id}` | 按快照回源并复核实时 ACL |
 | POST | `/access`、`/documents/delete`、`/rollback` | 撤权、删除、回滚 |
+
+### 检索工作台
+
+启动同一个 HTTP 服务后，在浏览器打开 `http://127.0.0.1:8000/`。点击「连接工作台」，输入本项目的 `RAG_HTTP_API_TOKEN` 管理员令牌，再输入问题运行。服务器部署时使用该实例的 HTTPS 根地址。工作台只向当前页面的同源服务请求数据；令牌保留在页面内存中，刷新或断开连接后需要重新输入，不填写云模型 Key。
+
+页面显示真实执行时间线、各步状态与服务端耗时，并可查看结构化返回、最终回答、逐条引用、证据回源、模型调用及平台返回的 Token 用量。实时事件先展示阶段元数据，结果经最终权限检查与 Trace 持久化后再展示内容；未启用或因预算跳过的步骤会明确标记。按 Trace ID 可重新加载历史记录并复核当前权限，也可下载本次运行 JSON。会话列表仅保留在当前页面；下载文件包含问题与证据，应按知识库数据管理。
+
+当前页面用于已有知识库的检索与诊断，文档导入、发布、撤权和回滚仍使用现有 CLI 或 HTTP 接口。详细操作与事件契约见 [检索工作台说明](docs/workbench.md)。
 
 ## 不变量与当前边界
 

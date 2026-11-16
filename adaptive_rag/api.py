@@ -1,12 +1,18 @@
 """Authenticated local HTTP adapter over the shared application."""
 
 from dataclasses import asdict
+import asyncio
+from contextlib import suppress
 import hmac
+import json
+from pathlib import Path
 from typing import Annotated
 
+from anyio import CancelScope
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from .app import RagApplication
@@ -67,6 +73,26 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     api = FastAPI(title="Adaptive RAG Foundation", version="0.1.0")
     api.state.application = application
 
+    @api.middleware("http")
+    async def browser_headers(request: Request, call_next):
+        response = await call_next(request)
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "connect-src 'self'; img-src 'self' data:; object-src 'none'; "
+            "base-uri 'none'; frame-ancestors 'none'"
+        )
+        return response
+
+    static = Path(__file__).resolve().parent / "static"
+    api.mount("/static", StaticFiles(directory=static), name="static")
+
+    @api.get("/", include_in_schema=False)
+    def workbench():
+        return FileResponse(static / "index.html")
+
     def authenticate(request: Request) -> Principal:
         header = request.headers.get("authorization", "")
         scheme, separator, token = header.partition(" ")
@@ -117,6 +143,11 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     def capabilities(principal: User):
         return application.capabilities()
 
+    @api.get("/console/session")
+    def console_session(principal: Admin):
+        return {"tenant_id": principal.tenant_id, "subject_id": principal.subject_id,
+                "admin": True, "capabilities": application.capabilities()}
+
     @api.post("/documents", status_code=201)
     def ingest(body: DocumentInput, principal: Admin):
         values = body.model_dump()
@@ -133,6 +164,61 @@ def create_api(settings: Settings | None = None) -> FastAPI:
         values = body.model_dump()
         values["history"] = tuple(values["history"])
         return asdict(await application.query(QueryRequest(access=principal.access, **values)))
+
+    @api.post("/query/stream")
+    async def query_stream(body: QueryInput, principal: Admin):
+        values = body.model_dump()
+        values["history"] = tuple(values["history"])
+        query_request = QueryRequest(access=principal.access, **values)
+
+        async def events():
+            # One queue belongs to one request; no global run registry or
+            # pollable in-progress source data is created.
+            queue = asyncio.Queue(maxsize=256)
+            trace_id = None
+
+            def observe(event, value):
+                nonlocal trace_id
+                if event == "trace":
+                    trace_id = value["trace_id"]
+                queue.put_nowait((event, value))
+
+            async def run_query():
+                try:
+                    value = await application.query(query_request, observer=observe)
+                    trace = await asyncio.to_thread(application.get_accessible_trace,
+                                                    principal.access, value.trace_id)
+                    queue.put_nowait(("result", {"result": asdict(value), "trace": trace}))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # Plugins and transports may put credentials in exception
+                    # text. Only a stable public code and generic text cross
+                    # this streaming transport.
+                    code = exc.code if isinstance(exc, RagError) else "internal_error"
+                    queue.put_nowait(("error", {"code": code,
+                        "message": "查询未完成，请使用 Trace ID 查看执行记录或稍后重试。",
+                        "trace_id": trace_id}))
+
+            task = asyncio.create_task(run_query())
+            try:
+                while True:
+                    event, value = await queue.get()
+                    yield f"event: {event}\ndata: {json.dumps(value, ensure_ascii=False, allow_nan=False)}\n\n"
+                    if event in {"result", "error"}:
+                        break
+            finally:
+                if not task.done():
+                    task.cancel()
+                # Starlette cancels its stream task group on disconnect. Shield
+                # cleanup from repeated level cancellation while the pipeline
+                # writes its bounded cancellation trace.
+                with CancelScope(shield=True):
+                    with suppress(asyncio.CancelledError):
+                        await task
+
+        return StreamingResponse(events(), media_type="text/event-stream",
+                                 headers={"X-Accel-Buffering": "no"})
 
     @api.post("/documents/delete")
     def delete_document(body: DeleteInput, principal: Admin):
@@ -153,7 +239,7 @@ def create_api(settings: Settings | None = None) -> FastAPI:
 
     @api.get("/traces/{trace_id}")
     def trace(trace_id: str, principal: Admin):
-        return application.get_trace(principal.tenant_id, trace_id)
+        return application.get_accessible_trace(principal.access, trace_id)
 
     @api.get("/evidence/{generation}/{evidence_id}")
     def evidence(generation: str, evidence_id: str, principal: User):

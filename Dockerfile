@@ -7,7 +7,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 COPY adaptive_rag ./adaptive_rag
 COPY README.md ./
-RUN uv sync --frozen --no-dev && useradd --uid 10001 --create-home rag && mkdir /data && chown rag:rag /data
+RUN uv sync --frozen --no-dev && chmod -R a+rX /app/adaptive_rag && useradd --uid 10001 --create-home rag && mkdir /data && chown rag:rag /data
 ENV PATH="/app/.venv/bin:$PATH" RAG_DATA_DIR=/data
 USER rag
 EXPOSE 8000

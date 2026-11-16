@@ -22,3 +22,6 @@ dev = ["httpx>=0.27,<1"]
 
 [tool.setuptools.packages.find]
 include = ["adaptive_rag*"]
+
+[tool.setuptools.package-data]
+adaptive_rag = ["static/*.html", "static/*.css", "static/*.js", "static/*.svg"]

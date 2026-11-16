@@ -1,7 +1,10 @@
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const state = {
-  token: "",
+  user: null,
+  activeQuestion: "",
+  messages: [],
+  usersEpoch: 0,
   connected: false,
   capabilities: null,
   stages: [],
@@ -12,7 +15,7 @@ const state = {
   running: false,
   controller: null,
   runs: [],
-  tab: "flow",
+  tab: "inspect",
   started: 0,
   timer: null,
   sessionEpoch: 0,
@@ -200,18 +203,14 @@ $$("dialog").forEach((node) =>
     }
   }),
 );
-$("#connect-open").addEventListener("click", () => {
-  dialog("#connection-dialog");
-  $("#api-token").focus();
-});
 $("#plugins-open").addEventListener("click", () => dialog("#plugins-dialog"));
 
-async function api(path, options = {}, token = state.token) {
+async function api(path, options = {}) {
+  const epoch = state.sessionEpoch;
   const response = await fetch(path, {
     ...options,
     cache: "no-store",
-    credentials: "omit",
-    headers: { ...options.headers, Authorization: `Bearer ${token}` },
+    credentials: "same-origin",
   });
   if (!response.ok) {
     let message = `请求失败（HTTP ${response.status}）`;
@@ -219,72 +218,199 @@ async function api(path, options = {}, token = state.token) {
       const body = await response.json();
       message = body.error?.message || body.detail || message;
     } catch {}
-    if (response.status === 401)
-      message = "工作台令牌无效或已失效，请重新连接。";
-    if (response.status === 403)
-      message = "当前身份没有管理员权限，无法查看执行链路。";
+    if (response.status === 401) {
+      message = path === "/auth/login" ? "账号或密码不正确。" : "登录已失效，请重新登录。";
+      if (path !== "/auth/login" && epoch === state.sessionEpoch && state.connected)
+        showLogin(message);
+    }
+    if (response.status === 403) message = "当前账号没有执行此操作的权限。";
     if (response.status === 429) message = "请求过于频繁，请稍后重试。";
-    throw new Error(message);
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
   }
   return response;
 }
 
-$("#connect-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  if (state.running || state.connecting) return;
-  const token = $("#api-token").value.trim();
-  if (!token) return;
-  const previous = state.token;
-  const epoch = state.sessionEpoch;
-  state.connecting = true;
-  $("#connect-submit").disabled = true;
-  $("#connection-error").textContent = "";
-  try {
-    const session = await (await api("/console/session", {}, token)).json();
-    if (epoch !== state.sessionEpoch) return;
-    if (!session.admin) throw new Error("此工作台需要管理员身份。");
-    // A new principal must never inherit the previous principal's page data.
-    if (previous !== token) {
-      state.sessionEpoch++;
-      clearData();
-    }
-    state.token = token;
-    state.connected = true;
-    state.capabilities = session.capabilities;
-    $("#connection-label").textContent = "工作台已连接";
-    $("#connection-dot").classList.add("connected");
-    $("#disconnect-button").hidden = false;
-    $("#api-token").value = "";
-    renderPlugins();
-    $("#connection-dialog").close();
-    toast("已连接，读取到实际链路配置。");
-  } catch (error) {
-    if (epoch === state.sessionEpoch)
-      $("#connection-error").textContent = error.message;
-  } finally {
-    state.connecting = false;
-    $("#connect-submit").disabled = false;
-  }
-});
-
-function disconnect() {
+function showLogin(message = "") {
   state.sessionEpoch++;
-  if (state.controller) state.controller.abort();
+  state.usersEpoch++;
+  state.controller?.abort();
   state.controller = null;
   setRunning(false);
-  state.token = "";
   state.connected = false;
+  state.user = null;
   state.capabilities = null;
   clearData();
-  $("#connection-label").textContent = "连接工作台";
-  $("#connection-dot").classList.remove("connected");
-  $("#disconnect-button").hidden = true;
-  $("#api-token").value = "";
-  $("#connection-dialog").close();
+  $$("dialog[open]").forEach((node) => node.close());
+  $("#users-list").replaceChildren();
+  $("#user-create-form").reset();
+  $("#users-error").textContent = "";
+  $("#account-name").textContent = "";
+  $("#account-role").textContent = "";
+  $("#users-open").hidden = true;
+  $("#app-shell").hidden = true;
+  $("#login-page").hidden = false;
+  $("#login-password").value = "";
+  $("#login-error").textContent = message;
   renderPlugins();
-  toast("已断开连接，页面数据已清空。");
 }
-$("#disconnect-button").addEventListener("click", disconnect);
+function acceptSession(session) {
+  state.sessionEpoch++;
+  clearData();
+  state.user = session;
+  state.connected = true;
+  state.capabilities = session.capabilities;
+  $("#account-name").textContent = session.username || session.subject_id;
+  $(".account-avatar").textContent = (session.username || "U").slice(0, 1).toUpperCase();
+  $("#account-role").textContent = session.admin ? "管理员" : "成员";
+  $("#users-open").hidden = !session.admin;
+  $("#login-password").value = "";
+  $("#login-error").textContent = "";
+  $("#login-page").hidden = true;
+  $("#app-shell").hidden = false;
+  renderPlugins();
+  $("#question").focus({ preventScroll: true });
+}
+$("#login-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (state.connecting) return;
+  const username = $("#login-username").value.trim();
+  const password = $("#login-password").value;
+  if (!username || !password) return;
+  const epoch = state.sessionEpoch;
+  state.connecting = true;
+  $("#login-submit").disabled = true;
+  $("#login-error").textContent = "";
+  try {
+    const session = await (await api("/auth/login", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    })).json();
+    if (epoch === state.sessionEpoch) acceptSession(session);
+  } catch (error) {
+    if (epoch === state.sessionEpoch) $("#login-error").textContent = error.message;
+  } finally {
+    state.connecting = false;
+    $("#login-submit").disabled = false;
+  }
+});
+$("#logout-button").addEventListener("click", async () => {
+  if (state.connecting) return;
+  // Hide account data immediately; wait for cookie invalidation before another login.
+  showLogin();
+  state.connecting = true;
+  $("#login-submit").disabled = true;
+  try {
+    await api("/auth/logout", { method: "POST" });
+    toast("已退出登录。");
+  } catch (error) {
+    $("#login-error").textContent = `退出请求未完成：${error.message} 请刷新页面后重试退出。`;
+  } finally {
+    state.connecting = false;
+    $("#login-submit").disabled = false;
+  }
+});
+async function restoreSession() {
+  const epoch = state.sessionEpoch;
+  state.connecting = true;
+  $("#login-submit").disabled = true;
+  try {
+    const session = await (await api("/console/session")).json();
+    if (epoch === state.sessionEpoch) acceptSession(session);
+  } catch (error) {
+    if (epoch === state.sessionEpoch && error.status !== 401)
+      $("#login-error").textContent = `暂时无法连接工作台：${error.message}`;
+  } finally {
+    state.connecting = false;
+    $("#login-submit").disabled = false;
+  }
+}
+
+async function loadUsers() {
+  if (!state.user?.admin) return;
+  const session = state.sessionEpoch;
+  const epoch = ++state.usersEpoch;
+  $("#users-list").replaceChildren(el("p", "muted", "正在读取账号…"));
+  try {
+    const data = await (await api("/admin/users")).json();
+    if (session !== state.sessionEpoch || epoch !== state.usersEpoch) return;
+    $("#users-list").replaceChildren();
+    for (const user of data.users || []) {
+      const row = el("div", "user-row");
+      const info = el("div");
+      info.append(el("strong", "", user.username));
+      const date = user.created_at ? new Date(user.created_at).toLocaleString("zh-CN") : "";
+      info.append(el("p", "", `${user.admin ? "管理员" : "普通成员"}${date ? ` · ${date}` : ""}`));
+      const actions = el("div", "user-actions");
+      if (user.admin || user.username === "ragadmin") actions.append(el("span", "fixed-user", "固定管理员"));
+      else {
+        const remove = el("button", "", "删除");
+        remove.type = "button";
+        remove.setAttribute("aria-label", `删除账号 ${user.username}`);
+        remove.addEventListener("click", () => {
+          const confirm = el("button", "delete-confirm", "确认删除");
+          confirm.type = "button";
+          confirm.setAttribute("aria-label", `确认删除账号 ${user.username}`);
+          const cancel = el("button", "delete-cancel", "取消");
+          cancel.type = "button";
+          cancel.addEventListener("click", () => actions.replaceChildren(remove));
+          confirm.addEventListener("click", async () => {
+            confirm.disabled = true; cancel.disabled = true;
+            $("#users-error").textContent = "";
+            try {
+              await api(`/admin/users/${encodeURIComponent(user.username)}`, { method: "DELETE" });
+              if (session !== state.sessionEpoch) return;
+              toast(`账号 ${user.username} 已删除。`);
+              await loadUsers();
+            } catch (error) {
+              if (session === state.sessionEpoch) {
+                $("#users-error").textContent = error.message;
+                confirm.disabled = false; cancel.disabled = false;
+              }
+            }
+          });
+          actions.replaceChildren(confirm, cancel);
+          confirm.focus();
+        });
+        actions.append(remove);
+      }
+      row.append(info, actions); $("#users-list").append(row);
+    }
+  } catch (error) {
+    if (session === state.sessionEpoch && epoch === state.usersEpoch) {
+      $("#users-list").replaceChildren();
+      $("#users-error").textContent = error.message;
+    }
+  }
+}
+$("#users-open").addEventListener("click", () => {
+  if (!state.user?.admin) return;
+  $("#users-error").textContent = "";
+  dialog("#users-dialog");
+  loadUsers();
+});
+$("#user-create-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!state.user?.admin || $("#user-create-submit").disabled) return;
+  const username = $("#new-username").value.trim();
+  const password = $("#new-password").value;
+  if (!username || !password) return;
+  const session = state.sessionEpoch;
+  $("#user-create-submit").disabled = true;
+  $("#users-error").textContent = "";
+  try {
+    await api("/admin/users", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username, password }) });
+    if (session !== state.sessionEpoch) return;
+    $("#user-create-form").reset();
+    toast(`账号 ${username} 已创建。`);
+    await loadUsers();
+  } catch (error) {
+    if (session === state.sessionEpoch) $("#users-error").textContent = error.message;
+  } finally {
+    $("#user-create-submit").disabled = false;
+  }
+});
 
 function renderPlugins() {
   const plugins = state.capabilities?.plugins;
@@ -344,12 +470,10 @@ function renderPlugins() {
 function setRunning(value) {
   state.running = value;
   $("#run-button").disabled = value;
-  $("#run-button span").textContent = value ? "正在检索…" : "开始检索";
+  $("#run-button span").textContent = value ? "正在检索…" : "发送问题";
   $("#cancel-button").hidden = !value;
-  $("#connect-submit").disabled = value;
   $("#history-clear").disabled = value;
   $("#trace-form button").disabled = value;
-  $("#connect-open").disabled = value;
   $("#timeline-dot").classList.toggle("running-dot", value);
   clearInterval(state.timer);
   if (value)
@@ -371,12 +495,15 @@ function resetCurrent() {
   state.result = null;
   state.traceId = "";
   state.selected = null;
+  state.activeQuestion = "";
+  $("#chat-question").textContent = "";
+  $("#question-message").hidden = true;
   $("#timeline").replaceChildren();
   $("#inspector-body").replaceChildren(
     el("div", "plain-empty", "步骤开始后，点击查看详情。"),
   );
   $("#inspector-heading").textContent = "步骤详情";
-  $("#inspector-subtitle").textContent = "细节，比一个答案更多。";
+  $("#inspector-subtitle").textContent = "选择左侧步骤，查看实际返回。";
   $("#raw-data").textContent = "等待服务器返回实际运行数据…";
   $("#trace-label").textContent = "正在建立连接，等待服务器生成编号";
   $("#trace-copy").disabled = true;
@@ -401,14 +528,16 @@ function resetCurrent() {
     node.classList.remove("done", "running"),
   );
   notice();
-  switchTab("flow");
+  switchTab("inspect");
 }
 function clearData() {
   resetCurrent();
-  empty($("#panel-answer"), "开始检索后，查看核验完成的回答。");
+  renderWelcome();
   empty($("#panel-evidence"), "开始检索后，查看授权引用证据。");
   empty($("#panel-models"), "开始检索后，查看实际模型调用。");
   state.runs = [];
+  state.messages = [];
+  $("#chat-history").replaceChildren();
   $("#recent-runs").replaceChildren(
     el("p", "muted", "运行记录仅保留在当前页面。"),
   );
@@ -444,7 +573,7 @@ $("#query-form").addEventListener("submit", async (event) => {
     return;
   }
   if (!state.connected) {
-    dialog("#connection-dialog");
+    showLogin("请先登录工作台。");
     return;
   }
   const question = $("#question").value.trim();
@@ -452,11 +581,11 @@ $("#query-form").addEventListener("submit", async (event) => {
     toast("请输入一个非空问题。");
     return;
   }
-  const history = $("#history")
+  const explicitHistory = $("#history")
     .value.split("\n")
     .map((line) => line.trim())
     .filter(Boolean);
-  if (history.length > 6 || history.some((line) => line.length > 4000)) {
+  if (explicitHistory.length > 6 || explicitHistory.some((line) => line.length > 4000)) {
     toast("历史上下文最多 6 轮，每轮不超过 4000 字。");
     return;
   }
@@ -465,7 +594,17 @@ $("#query-form").addEventListener("submit", async (event) => {
     toast("SKU 仅支持字母、数字、下划线、点、冒号和连字符。");
     return;
   }
+  archiveCurrent();
+  const history = explicitHistory.length ? explicitHistory : state.messages
+    .filter((message) => ["answered", "partial"].includes(message.status))
+    .slice(-3).flatMap((message) => [message.question.slice(0, 4000), message.answer.slice(0, 4000)]);
   resetCurrent();
+  state.activeQuestion = question;
+  showQuestion(question);
+  renderChatHistory();
+  revealCurrentReply();
+  $("#question").value = "";
+  $("#char-count").textContent = "0 / 4000";
   state.started = performance.now();
   setRunning(true);
   const controller = new AbortController();
@@ -591,6 +730,7 @@ $("#query-form").addEventListener("submit", async (event) => {
     if (state.controller === controller) {
       setRunning(false);
       state.controller = null;
+      if (current()) revealCurrentReply();
     }
   }
 });
@@ -710,6 +850,7 @@ function renderTimeline() {
       state.selected = index;
       renderTimeline();
       renderInspector(index);
+      switchTab("inspect");
     });
     row.append(button);
     target.append(row);
@@ -776,6 +917,9 @@ function applyRun(result, trace) {
   state.trace = trace || null;
   state.stages = trace?.stages || state.stages;
   state.traceId = result?.trace_id || trace?.trace_id || state.traceId;
+  state.activeQuestion = trace?.question || state.activeQuestion;
+  showQuestion(state.activeQuestion);
+  renderChatHistory();
   $("#trace-label").textContent = state.traceId || "未提供";
   $("#trace-copy").disabled = !state.traceId;
   $("#export-button").disabled = false;
@@ -814,6 +958,7 @@ function applyRun(result, trace) {
   else if (failedStatuses.includes(status))
     notice(failureMessage(trace), "error");
   else notice();
+  revealCurrentReply();
 }
 
 function renderInspector(index) {
@@ -1200,7 +1345,7 @@ function renderRuns() {
     return;
   }
   state.runs.forEach((run, index) => {
-    const button = el("button", "recent-run");
+    const button = el("button", `recent-run${run.id === state.traceId ? " selected" : ""}`);
     button.type = "button";
     button.append(
       el("span", "", String(index + 1).padStart(2, "0")),
@@ -1225,7 +1370,7 @@ $("#history-clear").addEventListener("click", () => {
 });
 async function loadTrace(id) {
   if (!state.connected) {
-    dialog("#connection-dialog");
+    showLogin("请先登录工作台。");
     return;
   }
   if (state.running) return;
@@ -1235,9 +1380,11 @@ async function loadTrace(id) {
   try {
     const trace = await (await api(`/traces/${encodeURIComponent(id)}`)).json();
     if (epoch !== state.viewEpoch || session !== state.sessionEpoch) return;
+    archiveCurrent();
     resetCurrent();
     applyRun(trace.final_result || null, trace);
-    $("#question").value = trace.question || "";
+    $("#question").value = "";
+    renderChatHistory();
     $("#char-count").textContent = `${$("#question").value.length} / 4000`;
     toast("已按当前权限加载 Trace。");
   } catch (error) {
@@ -1271,12 +1418,71 @@ $("#export-button").addEventListener("click", () => {
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 });
+function revealCurrentReply() {
+  const epoch = state.viewEpoch;
+  const session = state.sessionEpoch;
+  requestAnimationFrame(() => {
+    if (epoch !== state.viewEpoch || session !== state.sessionEpoch) return;
+    const scroll = $("#chat-scroll");
+    const question = $("#question-message");
+    if (question.hidden) return;
+    scroll.scrollTop += question.getBoundingClientRect().top - scroll.getBoundingClientRect().top - 12;
+    if (window.matchMedia("(max-width: 970px)").matches) {
+      const bounds = scroll.getBoundingClientRect();
+      if (bounds.top < 12 || bounds.bottom > window.innerHeight - 12)
+        window.scrollBy({ top: bounds.top - 12, behavior: "instant" });
+    }
+  });
+}
+function showQuestion(question) {
+  $("#chat-question").textContent = question || "";
+  $("#question-message").hidden = !question;
+}
+function renderWelcome() {
+  const welcome = el("div", "chat-welcome");
+  const icon = el("div", "welcome-icon", "⌕");
+  icon.setAttribute("aria-hidden", "true");
+  const pills = el("div", "welcome-pills");
+  for (const label of ["真实检索", "逐步耗时", "引用回源"]) pills.append(el("span", "", label));
+  welcome.append(icon, el("h2", "", "从你的问题开始"),
+    el("p", "", "在下方输入问题。左侧追踪检索流程，右侧查看每一步的证据与结果。"), pills);
+  $("#panel-answer").replaceChildren(welcome);
+}
+function archiveCurrent() {
+  if (!state.activeQuestion || !state.traceId) return;
+  state.messages = state.messages.filter((message) => message.id !== state.traceId);
+  state.messages.push({
+    id: state.traceId, question: state.activeQuestion,
+    answer: state.result?.answer || (failedStatuses.includes(state.trace?.status)
+      ? failureMessage() : state.result?.message || "本次没有返回核验完成的最终答案。"),
+    status: state.result?.status || state.trace?.status || "cancelled",
+    duration: state.trace?.duration_ms,
+  });
+  state.messages = state.messages.slice(-6);
+  renderChatHistory();
+}
+function renderChatHistory() {
+  const target = $("#chat-history"); target.replaceChildren();
+  for (const message of state.messages) {
+    if (message.id === state.traceId) continue;
+    const question = el("article", "chat-message user-message");
+    question.append(el("div", "message-label", "你"), el("p", "", message.question));
+    const answer = el("article", "chat-message assistant-message");
+    const label = el("div", "message-label");
+    label.append(el("span", "assistant-mark", "A"), document.createTextNode("Adaptive RAG"));
+    answer.append(label, el("p", "history-answer", message.answer));
+    const footer = el("div", "history-caption");
+    footer.append(el("span", "", `${statuses[message.status] || message.status} · ${ms(message.duration)}`));
+    const button = el("button", "", "查看本轮流程 →"); button.type = "button";
+    button.addEventListener("click", () => loadTrace(message.id));
+    footer.append(button); answer.append(footer); target.append(question, answer);
+  }
+}
 document.addEventListener("keydown", (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
     event.preventDefault();
-    if (!state.running) {
-      dialog("#connection-dialog");
-      $("#api-token").focus();
-    }
+    if (state.connected) $("#question").focus();
+    else $("#login-username").focus();
   }
 });
+restoreSession();

@@ -70,6 +70,8 @@ def apply_environment(settings: Settings, values: Mapping[str, str]) -> Settings
     if values.get("RAG_HTTP_API_TOKEN"):
         principal = Principal(values.get("RAG_HTTP_TENANT", "demo"), values.get("RAG_HTTP_SUBJECT", "admin"), admin=True)
         updates["api_tokens"] = settings.api_tokens | {values["RAG_HTTP_API_TOKEN"]: principal}
+    if values.get("RAG_HTTP_TENANT"):
+        updates["browser_tenant"] = values["RAG_HTTP_TENANT"]
     return replace(settings, **updates)
 
 

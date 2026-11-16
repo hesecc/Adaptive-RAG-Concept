@@ -132,31 +132,40 @@ app = RagApplication(Settings(plugins={'lexical': 'my_local_search'}), registry)
 
 ## HTTP 本机入口
 
-按 [公开配置示例](examples/settings.example.toml) 创建 `config.local.toml`，在本机添加 token 与可信身份映射。可用 `uv run python -c "import secrets; print(secrets.token_urlsafe(32))"` 生成随机令牌。该私有配置已被 Git 忽略。配置至少一个身份后启动：
+直接启动 HTTP 服务即可使用账号登录，无需先配置 HTTP Key：
 
 ```powershell
-uv run adaptive-rag --config config.local.toml serve
+uv run adaptive-rag serve
 ```
 
-服务默认仅绑定 `127.0.0.1:8000`。页面与静态资源、`GET /health` 可公开加载；业务接口需 `Authorization: Bearer <本机配置中的令牌>`。身份来自 token 映射，请求正文禁止 `tenant_id`、`subject_id`、`groups`。写接口、job 与 trace 读取要求管理员；query 与 evidence 依实时 ACL。
+服务默认仅绑定 `127.0.0.1:8000`。在浏览器打开根路径，以固定管理员 `ragadmin` / `ragadmin123` 登录。管理员可在「账号管理」中创建、查看和删除普通账号；固定管理员不能删除。普通账号登录后可检索知识库、查看执行链路和引用证据，文档维护、作业读取和账号管理仍要求管理员。
 
-也可用 `--env-file .env serve` 读取 `RAG_HTTP_API_TOKEN`、`RAG_HTTP_TENANT`、`RAG_HTTP_SUBJECT`，创建一个显式管理员身份；多身份和普通用户权限继续用受控 TOML 映射。HTTP token 至少 24 个非空白字符，独立于 `RAG_CLOUD_API_KEY` 与 `MINERU_API_KEY`。
+账号与会话存放在数据目录的 `accounts.sqlite3`，服务重启后保留。浏览器通过 `an_rag_session` Cookie 保持登录，刷新页面自动恢复未过期会话；退出登录或删除账号后，原会话失效。页面不保存密码或模型 Key。普通账号共享管理员所在知识库租户，但仍使用独立身份检查现有文档权限。
+
+浏览器知识库租户优先由 `Settings.browser_tenant` 指定；使用环境配置时，`RAG_HTTP_TENANT` 设置该值。未显式指定时，沿用唯一管理员 token 所在租户；没有唯一值则使用 `demo`。已有账号数据库的租户与新配置不一致时拒绝启动，不会自动迁移账号或知识库。
+
+现有 Bearer 客户端继续兼容，供 CLI 脚本或维护程序使用。可按 [公开配置示例](examples/settings.example.toml) 添加 token 与可信身份映射，或通过 `--env-file .env serve` 读取 `RAG_HTTP_API_TOKEN`、`RAG_HTTP_TENANT`、`RAG_HTTP_SUBJECT`；浏览器使用不依赖这些配置。HTTP token 至少 24 个非空白字符，独立于 `RAG_CLOUD_API_KEY` 与 `MINERU_API_KEY`。请求正文仍禁止指定 `tenant_id`、`subject_id`、`groups`。
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
 | GET | `/`、`/static/*` | 同源检索工作台与静态资源 |
-| GET | `/console/session` | 管理员工作台连接验证与当前插件配置 |
+| POST | `/auth/login`、`/auth/logout` | 账号登录与退出 |
+| GET | `/console/session` | 当前登录身份与插件配置 |
+| GET / POST / DELETE | `/admin/users`、`/admin/users/{username}` | 管理员列出、创建、删除普通账号 |
 | GET | `/health`、`/capabilities` | 健康与插件状态 |
 | POST | `/documents`、`/publish` | 暂存与 CAS 发布 |
 | POST | `/query` | 规则编排、证据预览及显式启用的云查询/生成/质量检查 |
-| POST | `/query/stream` | 管理员实时阶段事件，完成后返回结果与授权 Trace |
-| GET | `/jobs/{id}`、`/traces/{id}` | 作业与链路诊断 |
+| POST | `/query/stream` | 登录用户的实时阶段事件，完成后返回结果与授权 Trace |
+| GET | `/jobs/{id}` | 管理员作业读取 |
+| GET | `/traces/{id}` | 同租户链路诊断，按当前源权限复核 |
 | GET | `/evidence/{generation}/{evidence_id}` | 按快照回源并复核实时 ACL |
 | POST | `/access`、`/documents/delete`、`/rollback` | 撤权、删除、回滚 |
 
 ### 检索工作台
 
-启动同一个 HTTP 服务后，在浏览器打开 `http://127.0.0.1:8000/`。点击「连接工作台」，输入本项目的 `RAG_HTTP_API_TOKEN` 管理员令牌，再输入问题运行。服务器部署时使用该实例的 HTTPS 根地址。工作台只向当前页面的同源服务请求数据；令牌保留在页面内存中，刷新或断开连接后需要重新输入，不填写云模型 Key。
+启动同一个 HTTP 服务后，在浏览器打开 `http://127.0.0.1:8000/`，用分配的账号和密码登录，再输入问题运行。服务器部署时使用该实例的 HTTPS 根地址。工作台只向当前页面的同源服务请求数据，不需要填写 HTTP Key、云模型 Key 或 MinerU Key。
+
+界面参考 MinerU 解析台的白灰底色、蓝色操作按钮和细分隔线：左侧查看会话、检索设置与实际执行流程，中间进行对话并输入问题，右侧查看步骤详情、证据、模型调用及 JSON。正文和输入框保持 15–16px，完整 Trace ID 可复制并加载回放。
 
 页面显示真实执行时间线、各步状态与服务端耗时，并可查看结构化返回、最终回答、逐条引用、证据回源、模型调用及平台返回的 Token 用量。实时事件先展示阶段元数据，结果经最终权限检查与 Trace 持久化后再展示内容；未启用或因预算跳过的步骤会明确标记。按 Trace ID 可重新加载历史记录并复核当前权限，也可下载本次运行 JSON。会话列表仅保留在当前页面；下载文件包含问题与证据，应按知识库数据管理。
 

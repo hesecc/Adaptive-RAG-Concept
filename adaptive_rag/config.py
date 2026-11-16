@@ -7,7 +7,7 @@ from pathlib import Path
 import tomllib
 from typing import Any
 
-from .domain import AccessContext, ValidationError
+from .domain import AccessContext, ValidationError, identifier
 
 
 DEFAULT_PLUGINS = {
@@ -60,6 +60,7 @@ class Settings:
     port: int = 8000
     plugins: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_PLUGINS))
     api_tokens: dict[str, Principal] = field(default_factory=dict, repr=False)
+    browser_tenant: str | None = None
     allow_models: bool = False
     allow_network: bool = False
     cloud: Any = field(default=None, repr=False)
@@ -104,6 +105,8 @@ class Settings:
                 raise ValidationError("API tokens must have at least 24 non-whitespace characters")
             if not isinstance(principal, Principal):
                 raise ValidationError("api_tokens values must be Principal instances")
+        if self.browser_tenant is not None:
+            identifier(self.browser_tenant, "browser_tenant")
 
 
 def load_settings(path: str | Path | None = None) -> Settings:

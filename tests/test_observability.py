@@ -60,7 +60,7 @@ class WorkbenchHTTPTests(unittest.TestCase):
     def query(self, **body):
         return self.client.post("/query/stream", headers=self.headers(), json={"question": "amber warranty", **body})
 
-    def test_static_is_public_but_console_and_stream_require_admin(self):
+    def test_static_is_public_but_console_and_stream_require_login(self):
         page = self.client.get("/")
         self.assertEqual(page.status_code, 200)
         self.assertIn("检索工作台", page.text)
@@ -68,7 +68,7 @@ class WorkbenchHTTPTests(unittest.TestCase):
         self.assertIn("frame-ancestors 'none'", page.headers["content-security-policy"])
         self.assertEqual(self.client.get("/static/app.js").status_code, 200)
         for path in ("/console/session", "/query/stream"):
-            for token, status in ((None, 401), ("invalid", 401), (READER, 403)):
+            for token, status in ((None, 401), ("invalid", 401), (READER, 200)):
                 headers = self.headers(token) if token else {}
                 response = self.client.get(path, headers=headers) if path.endswith("session") else self.client.post(path, headers=headers, json={"question": "warranty"})
                 self.assertEqual(response.status_code, status, response.text)

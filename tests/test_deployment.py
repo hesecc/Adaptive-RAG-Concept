@@ -237,8 +237,9 @@ class DeploymentTemplateTests(unittest.TestCase):
         nginx = (DEPLOY / "nginx.server.conf").read_text()
         for expected in ("listen 18444 ssl", "127.0.0.1:14175", "/opt/an-RAG/tls/server.key",
                          "limit_req zone=an_rag_requests", "client_max_body_size 12m",
-                         "proxy_set_header Authorization $http_authorization", "proxy_hide_header Set-Cookie"):
+                         "proxy_set_header Authorization $http_authorization"):
             self.assertIn(expected, nginx)
+        self.assertNotIn("proxy_hide_header Set-Cookie", nginx)
         self.assertNotIn("sj_session", nginx)
         self.assertNotIn("18443", nginx)
 

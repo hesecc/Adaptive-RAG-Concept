@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -57,8 +58,9 @@ class InterfaceTests(unittest.TestCase):
             "document_id": "p", "version": "v1", "content": "warranty",
         })
         self.assertEqual(denied.status_code, 403, denied.text)
-        with self.assertRaises(ValidationError):
-            create_api(Settings(data_dir=self.root / "no-tokens"))
+        with TestClient(create_api(Settings(data_dir=self.root / "no-tokens"))) as client:
+            self.assertEqual(client.get("/console/session").status_code, 401)
+            self.assertEqual(client.post("/auth/login", json={"username": "ragadmin", "password": "ragadmin123"}).status_code, 200)
 
     def test_api_identity_is_trusted_and_inputs_are_strict(self):
         for extra in ({"tenant_id": "beta"}, {"subject_id": "admin"}, {"groups": ["admin"]}):
@@ -84,7 +86,7 @@ class InterfaceTests(unittest.TestCase):
         self.assertEqual(self.client.get(url, headers=self.headers(READER_TOKEN)).status_code, 200)
         self.assertIn(self.client.get(url, headers=self.headers(OTHER_TOKEN)).status_code, (403, 404))
         self.assertEqual(self.client.get(f"/jobs/{job['job_id']}", headers=self.headers(OTHER_TOKEN)).status_code, 404)
-        self.assertEqual(self.client.get(f"/traces/{result['trace_id']}", headers=self.headers(READER_TOKEN)).status_code, 403)
+        self.assertEqual(self.client.get(f"/traces/{result['trace_id']}", headers=self.headers(READER_TOKEN)).status_code, 200)
         other = self.client.post("/query", headers=self.headers(OTHER_TOKEN), json={"question": "amber warranty"})
         self.assertEqual(other.status_code, 200, other.text)
         self.assertEqual(other.json()["evidence"], [])
@@ -114,9 +116,11 @@ class InterfaceTests(unittest.TestCase):
         self.assertEqual(out, "")
         self.assertEqual(json.loads(err)["error"]["code"], "validation_error")
         self.assertNotIn("Traceback", err)
-        code, out, err = self.invoke("serve")
-        self.assertEqual(code, 2)
-        self.assertIn("explicit API tokens", json.loads(err)["error"]["message"])
+        with patch("uvicorn.run") as run:
+            code, out, err = self.invoke("serve")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(json.loads(out)["status"], "stopped")
+        run.assert_called_once()
 
     def test_evaluation_denominators_and_saved_parameters(self):
         application = RagApplication(self.settings)

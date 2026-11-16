@@ -106,10 +106,13 @@ EMPTY=
         self.assertTrue(app.capabilities()["semantic_support_verification"])
         self.assertTrue(app.capabilities()["history_resolution"])
 
-    def test_server_requires_token_and_accepts_injected_identity(self):
+    def test_server_supports_login_without_token_and_accepts_injected_identity(self):
+        with patch.dict(os.environ, {"RAG_DATA_DIR": str(self.root / "login-data")}):
+            with TestClient(create()) as client:
+                response = client.post("/auth/login", json={"username": "ragadmin", "password": "ragadmin123"})
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["tenant_id"], "demo")
         with patch.dict(os.environ, {"RAG_DATA_DIR": str(self.root / "data")}):
-            with self.assertRaises(ValidationError):
-                create()
             with patch.dict(os.environ, {"RAG_HTTP_API_TOKEN": "synthetic-api-token-0000000001",
                                          "RAG_HTTP_TENANT": "tenant", "RAG_HTTP_SUBJECT": "operator"}):
                 api = create()

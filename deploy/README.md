@@ -55,8 +55,10 @@ Only install the new vhost and reload after loopback verification and a
 successful whole-host Nginx configuration check. Preserve its old configuration
 and remove/revert only the new an-rag vhost if the new configuration fails.
 Verify the public HTTPS response with strict CA/IP validation and test protected
-routes both with and without a Bearer token. The API uses no session cookies;
-the vhost hides `Set-Cookie` to avoid cross-port cookie interference.
+routes both with and without a login session. Pass `Cookie` and `Set-Cookie`
+unchanged so browser login works through the gateway. The application uses its
+own `an_rag_session` cookie; do not rename it or clear another project's cookies.
+Existing Bearer clients remain supported for maintenance.
 
 All release changes and container CLI writes must acquire the same
 `/opt/an-RAG/.maintenance.lock` used by the backup script. Do not run CLI writes

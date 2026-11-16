@@ -11,13 +11,14 @@ from typing import Annotated
 from anyio import CancelScope
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from .app import RagApplication
+from .auth import AccountStore, AuthenticationError, COOKIE_NAME, SESSION_SECONDS
 from .config import Principal, Settings, load_settings
-from .domain import IngestRequest, QueryRequest, RagError, ValidationError, safe_error
+from .domain import IngestRequest, QueryRequest, RagError, safe_error
 
 
 class Input(BaseModel):
@@ -65,13 +66,25 @@ class AccessInput(Input):
     revoked: bool = False
 
 
+class LoginInput(Input):
+    username: str = Field(min_length=1, max_length=32)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class AccountInput(Input):
+    username: str = Field(min_length=3, max_length=32)
+    password: str = Field(min_length=6, max_length=128)
+
+
 def create_api(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
-    if not settings.api_tokens:
-        raise ValidationError("HTTP requires explicit API tokens in trusted configuration")
     application = RagApplication(settings)
+    admin_tenants = {principal.tenant_id for principal in settings.api_tokens.values() if principal.admin}
+    browser_tenant = settings.browser_tenant or (next(iter(admin_tenants)) if len(admin_tenants) == 1 else "demo")
+    accounts = AccountStore(settings.data_dir, browser_tenant)
     api = FastAPI(title="Adaptive RAG Foundation", version="0.1.0")
     api.state.application = application
+    api.state.accounts = accounts
 
     @api.middleware("http")
     async def browser_headers(request: Request, call_next):
@@ -101,9 +114,14 @@ def create_api(settings: Settings | None = None) -> FastAPI:
             for configured, principal in settings.api_tokens.items():
                 if hmac.compare_digest(configured.encode("utf-8"), token.encode("utf-8")):
                     found = principal
+                    request.state.username = principal.subject_id
+        if not header:
+            account = accounts.session(request.cookies.get(COOKIE_NAME))
+            if account is not None:
+                found = account.principal
+                request.state.username = account.username
         if found is None:
-            from fastapi import HTTPException
-            raise HTTPException(status_code=401, detail="Invalid bearer token", headers={"WWW-Authenticate": "Bearer"})
+            raise AuthenticationError("请先登录工作台。")
         return found
 
     def administrator(principal: Annotated[Principal, Depends(authenticate)]) -> Principal:
@@ -144,9 +162,41 @@ def create_api(settings: Settings | None = None) -> FastAPI:
         return application.capabilities()
 
     @api.get("/console/session")
-    def console_session(principal: Admin):
+    def console_session(request: Request, principal: User):
         return {"tenant_id": principal.tenant_id, "subject_id": principal.subject_id,
-                "admin": True, "capabilities": application.capabilities()}
+                "username": request.state.username, "admin": principal.admin,
+                "capabilities": application.capabilities()}
+
+    @api.post("/auth/login")
+    def login(body: LoginInput, request: Request):
+        token, account = accounts.login(body.username, body.password)
+        principal = account.principal
+        response = JSONResponse(content={"tenant_id": principal.tenant_id, "subject_id": principal.subject_id,
+            "username": account.username, "admin": principal.admin, "capabilities": application.capabilities()})
+        response.set_cookie(COOKIE_NAME, token, max_age=SESSION_SECONDS, httponly=True,
+                            secure=request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https",
+                            samesite="lax", path="/")
+        return response
+
+    @api.post("/auth/logout", status_code=204)
+    def logout(request: Request):
+        accounts.logout(request.cookies.get(COOKIE_NAME))
+        response = Response(status_code=204)
+        response.delete_cookie(COOKIE_NAME, httponly=True, samesite="lax", path="/")
+        return response
+
+    @api.get("/admin/users")
+    def users(principal: Admin):
+        return {"users": accounts.users(principal)}
+
+    @api.post("/admin/users", status_code=201)
+    def create_user(body: AccountInput, principal: Admin):
+        return accounts.create(principal, body.username, body.password)
+
+    @api.delete("/admin/users/{username}", status_code=204)
+    def delete_user(username: str, principal: Admin):
+        accounts.delete(principal, username)
+        return Response(status_code=204)
 
     @api.post("/documents", status_code=201)
     def ingest(body: DocumentInput, principal: Admin):
@@ -166,7 +216,7 @@ def create_api(settings: Settings | None = None) -> FastAPI:
         return asdict(await application.query(QueryRequest(access=principal.access, **values)))
 
     @api.post("/query/stream")
-    async def query_stream(body: QueryInput, principal: Admin):
+    async def query_stream(body: QueryInput, principal: User):
         values = body.model_dump()
         values["history"] = tuple(values["history"])
         query_request = QueryRequest(access=principal.access, **values)
@@ -248,7 +298,7 @@ def create_api(settings: Settings | None = None) -> FastAPI:
         return application.get_job(principal.tenant_id, job_id)
 
     @api.get("/traces/{trace_id}")
-    def trace(trace_id: str, principal: Admin):
+    def trace(trace_id: str, principal: User):
         return application.get_accessible_trace(principal.access, trace_id)
 
     @api.get("/evidence/{generation}/{evidence_id}")

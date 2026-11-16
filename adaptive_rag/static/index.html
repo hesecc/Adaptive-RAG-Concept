@@ -4,449 +4,563 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <meta name="color-scheme" content="light" />
-    <meta
-      name="description"
-      content="Adaptive RAG 检索工作台：查看真实执行步骤、耗时、检索结果与引用证据。"
-    />
-    <title>Adaptive RAG · 检索工作台</title>
+    <meta name="description" content="Adaptive RAG 工作台：对话、真实检索流程与引用证据。" />
+    <title>
+      Adaptive RAG · 检索工作台
+    </title>
     <link rel="icon" href="/static/mark.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/static/app.css" />
-    <script type="module" src="/static/app.js"></script>
+    <script type="module" src="/static/app.js">
+    </script>
   </head>
   <body>
-    <a class="skip-link" href="#main">跳到工作台</a>
-    <header class="topbar">
-      <a class="brand" href="/" aria-label="Adaptive RAG 首页"
-        ><svg viewBox="0 0 36 36" aria-hidden="true">
-          <path d="M18 3 33 29H3Z" />
-          <path d="m18 13 9 16H9Z" /></svg
-        ><span>adaptive<span class="brand-light"> / rag</span></span
-        ><span class="edition">CONCEPT</span></a
-      >
-      <nav class="topnav" aria-label="主导航">
-        <a class="active" href="#main">检索工作台</a
-        ><button id="plugins-open" type="button">
-          能力配置 <span>↗</span>
-        </button>
-      </nav>
-      <button class="connection-button" id="connect-open" type="button">
-        <span class="status-dot" id="connection-dot"></span
-        ><span id="connection-label">连接工作台</span
-        ><span class="key-icon">⌘</span>
-      </button>
-    </header>
-
-    <main id="main" class="workspace">
-      <div class="heading-row">
-        <div>
-          <div class="eyebrow">
-            <span class="tiny-mark"></span> RETRIEVAL OBSERVATORY
-          </div>
-          <h1>把答案的来路，<span>看清楚。</span></h1>
-          <p class="intro">从问题到证据，跟随每一步真实发生的检索。</p>
-        </div>
-        <div class="live-tag">
-          <span class="status-dot"></span> 实时链路 · 实际数据
-        </div>
+    <section id="login-page" class="login-page" aria-labelledby="login-heading">
+      <div class="login-brand">
+        <span class="brand-symbol">
+          A
+        </span>
+        <b>
+          Adaptive RAG
+        </b>
+        <span>
+          检索工作台
+        </span>
       </div>
-      <div class="workbench">
-        <aside class="query-column">
-          <section class="card query-card" aria-labelledby="query-heading">
+      <main class="login-card">
+        <div class="login-kicker">
+          KNOWLEDGE WORKSPACE
+        </div>
+        <h1 id="login-heading">
+          登录工作台
+        </h1>
+        <p class="login-intro">
+          从一个问题出发，看见答案背后的每一步。
+        </p>
+        <form id="login-form">
+          <label for="login-username">
+            账号
+          </label>
+          <input id="login-username" name="username" autocomplete="username" maxlength="32" autocapitalize="none" spellcheck="false" placeholder="请输入账号" required />
+          <label for="login-password">
+            密码
+          </label>
+          <input id="login-password" name="password" type="password" autocomplete="current-password" maxlength="128" placeholder="请输入密码" required />
+          <div id="login-error" class="form-error" role="alert">
+          </div>
+          <button id="login-submit" class="primary-button" type="submit">
+            <span>
+              登录
+            </span>
+            <span aria-hidden="true">
+              →
+            </span>
+          </button>
+        </form>
+        <p class="login-footnote">
+          使用管理员分配的账号登录，即可开始检索。
+        </p>
+      </main>
+      <div class="login-bottom">
+        ADAPTIVE RAG CONCEPT
+        <span>
+          问题 · 检索 · 证据 · 回答
+        </span>
+      </div>
+    </section>
+    <div id="app-shell" class="app-shell" hidden>
+      <a class="skip-link" href="#question">
+        跳到对话输入
+      </a>
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="Adaptive RAG 首页">
+          <span class="brand-symbol">
+            A
+          </span>
+          <b>
+            Adaptive RAG
+          </b>
+          <span class="brand-light">
+            检索工作台
+          </span>
+        </a>
+        <span class="workspace-tag">
+          <span class="status-dot connected">
+          </span>
+          知识库已连接
+        </span>
+        <nav class="topnav" aria-label="工作台操作">
+          <button id="plugins-open" type="button">
+            能力配置
+          </button>
+          <button id="users-open" type="button" hidden>
+            账号管理
+          </button>
+          <span class="account-badge">
+            <span class="account-avatar" aria-hidden="true">
+              U
+            </span>
+            <span id="account-name">
+            </span>
+            <span id="account-role" class="role-badge">
+            </span>
+          </span>
+          <button id="logout-button" class="logout-button" type="button">
+            退出登录
+          </button>
+        </nav>
+      </header>
+      <main id="main" class="workspace">
+        <aside class="flow-column" aria-label="会话和执行流程">
+          <section class="session-card side-section">
             <div class="section-top">
-              <h2 id="query-heading">发起检索</h2>
-              <span class="step-label">01 / ASK</span>
-            </div>
-            <form id="query-form">
-              <label for="question">你想从知识库中了解什么？</label>
-              <div class="question-wrap">
-                <textarea
-                  id="question"
-                  name="question"
-                  maxlength="4000"
-                  rows="6"
-                  required
-                  placeholder="例如：Transformer 的注意力机制如何工作？"
-                ></textarea>
-                <div class="input-bottom">
-                  <span>基于已发布的知识库</span
-                  ><span id="char-count">0 / 4000</span>
-                </div>
-              </div>
-              <details class="advanced">
-                <summary>检索选项 <span>＋</span></summary>
-                <div class="options-grid">
-                  <label for="top-k"
-                    >证据数量<select id="top-k">
-                      <option value="3">3 条</option>
-                      <option value="5" selected>5 条</option>
-                      <option value="10">10 条</option>
-                      <option value="20">20 条</option>
-                    </select></label
-                  ><label for="sku"
-                    >SKU（可选）<input
-                      id="sku"
-                      maxlength="128"
-                      placeholder="商品范围" /></label
-                  ><label class="wide" for="history"
-                    >历史上下文（每行一轮，最多 6 轮）<textarea
-                      id="history"
-                      rows="3"
-                      placeholder="需要承接上文时填写"
-                    ></textarea>
-                  </label>
-                </div>
-              </details>
-              <button id="run-button" class="primary-button" type="submit">
-                <span>开始检索</span><span>↗</span>
-              </button>
-              <button
-                id="cancel-button"
-                class="secondary-button"
-                type="button"
-                hidden
-              >
-                停止本次查询
-              </button>
-              <p class="helper">Enter 换行 · Ctrl / ⌘ + Enter 运行</p>
-            </form>
-          </section>
-          <section class="card capability-card">
-            <div class="section-top">
-              <h2>当前链路</h2>
-              <span class="small-pill" id="mode-label">未连接</span>
-            </div>
-            <div id="plugin-summary" class="plugin-summary">
-              <p class="muted">连接后读取实际插件配置。</p>
-            </div>
-            <div class="capability-note">
-              <span>↳</span>
-              <p>Laya 保留接口<br /><span>当前由规则策略决策</span></p>
-            </div>
-          </section>
-          <section class="session-card">
-            <div class="section-top">
-              <h2>本次会话</h2>
+              <h2>
+                本次会话
+              </h2>
               <button type="button" id="history-clear" class="text-button">
-                清空
+                新对话
               </button>
             </div>
             <div id="recent-runs">
-              <p class="muted">运行记录仅保留在当前页面。</p>
+              <p class="muted">
+                运行记录仅保留在当前页面。
+              </p>
             </div>
             <details class="trace-lookup">
-              <summary>按 Trace ID 查看</summary>
+              <summary>
+                按 Trace ID 回放
+              </summary>
               <form id="trace-form">
-                <label class="sr-only" for="trace-id">Trace ID</label
-                ><input
-                  id="trace-id"
-                  placeholder="输入历史 Trace ID"
-                  maxlength="128"
-                  required
-                /><button type="submit" aria-label="加载 Trace">↗</button>
+                <label class="sr-only" for="trace-id">
+                  Trace ID
+                </label>
+                <input id="trace-id" placeholder="输入历史 Trace ID" maxlength="128" required />
+                <button type="submit" aria-label="加载 Trace">
+                  →
+                </button>
               </form>
             </details>
           </section>
-        </aside>
-
-        <section class="execution-column" aria-label="检索执行与结果">
-          <div class="metrics">
-            <div class="metric">
-              <span>执行耗时</span
-              ><strong id="metric-duration">—<small> ms</small></strong
-              ><span id="duration-caption">等待发起查询</span>
+          <section id="panel-flow" class="flow-section" aria-labelledby="flow-heading">
+            <div class="section-top">
+              <h2 id="flow-heading">
+                执行流程
+                <span id="stage-count" class="count">
+                  0
+                </span>
+              </h2>
+              <span class="tiny-label">
+                LIVE TRACE
+              </span>
             </div>
-            <div class="metric">
-              <span>执行步骤</span><strong id="metric-stages">—</strong
-              ><span id="stages-caption">按实际运行记录</span>
-            </div>
-            <div class="metric">
-              <span>检索通道</span><strong id="metric-lanes">—</strong
-              ><span>BM25 / 向量检索</span>
-            </div>
-            <div class="metric">
-              <span>引用证据</span><strong id="metric-evidence">—</strong
-              ><span id="evidence-caption">最终授权证据</span>
-            </div>
-          </div>
-          <section class="card results-card">
-            <div class="results-heading">
-              <div>
-                <span class="step-label">02 / OBSERVE</span>
-                <h2>
-                  检索运行现场
-                  <span class="small-pill" id="run-status">待运行</span>
-                </h2>
+            <div class="pipeline-map" aria-label="检索流程概览">
+              <div data-phase="plan">
+                规划
               </div>
-              <button
-                type="button"
-                id="export-button"
-                class="icon-button"
-                title="下载本次运行 JSON"
-                aria-label="下载本次运行 JSON"
-                disabled
-              >
-                ↓
-              </button>
-            </div>
-            <div class="trace-summary" aria-label="本次运行追踪编号">
-              <div class="trace-summary-main">
-                <span class="trace-summary-title">本次 Trace ID</span>
-                <code id="trace-label" aria-live="polite"
-                  >尚未开始，提交问题后自动生成</code
-                >
+              <i>
+                ›
+              </i>
+              <div data-phase="retrieve">
+                检索
               </div>
-              <button
-                type="button"
-                id="trace-copy"
-                class="trace-copy-button"
-                disabled
-              >
-                复制 Trace ID
-              </button>
-              <p>用于回放本次执行与定位异常；查询失败后也可复制保存。</p>
-            </div>
-            <div class="result-tabs" role="tablist" aria-label="运行结果视图">
-              <button
-                id="tab-flow"
-                role="tab"
-                aria-selected="true"
-                aria-controls="panel-flow"
-                data-tab="flow"
-              >
-                执行链路 <span id="stage-count">0</span></button
-              ><button
-                id="tab-answer"
-                role="tab"
-                aria-selected="false"
-                aria-controls="panel-answer"
-                data-tab="answer"
-                tabindex="-1"
-              >
-                回答</button
-              ><button
-                id="tab-evidence"
-                role="tab"
-                aria-selected="false"
-                aria-controls="panel-evidence"
-                data-tab="evidence"
-                tabindex="-1"
-              >
-                证据 <span id="evidence-count">0</span></button
-              ><button
-                id="tab-models"
-                role="tab"
-                aria-selected="false"
-                aria-controls="panel-models"
-                data-tab="models"
-                tabindex="-1"
-              >
-                模型调用</button
-              ><button
-                id="tab-raw"
-                role="tab"
-                aria-selected="false"
-                aria-controls="panel-raw"
-                data-tab="raw"
-                tabindex="-1"
-              >
-                JSON
-              </button>
-            </div>
-            <div class="run-notice" id="notice" role="status" hidden></div>
-            <div
-              id="panel-flow"
-              class="tab-panel"
-              role="tabpanel"
-              aria-labelledby="tab-flow"
-            >
-              <div class="pipeline-map" id="pipeline-map">
-                <div data-phase="plan"><span>01</span>问题规划</div>
-                <i>→</i>
-                <div data-phase="retrieve"><span>02</span>混合检索</div>
-                <i>→</i>
-                <div data-phase="rank"><span>03</span>排序回填</div>
-                <i>→</i>
-                <div data-phase="generate"><span>04</span>答案生成</div>
-                <i>→</i>
-                <div data-phase="verify"><span>05</span>证据核验</div>
+              <i>
+                ›
+              </i>
+              <div data-phase="rank">
+                排序
               </div>
-              <div class="timeline-top">
-                <span
-                  ><span id="timeline-dot" class="status-dot"></span
-                  ><b id="timeline-heading">准备就绪，等待一个好问题</b></span
-                ><label class="compact-toggle"
-                  ><input
-                    type="checkbox"
-                    id="show-disabled"
-                    checked
-                  />显示未启用步骤</label
-                >
+              <i>
+                ›
+              </i>
+              <div data-phase="generate">
+                生成
               </div>
-              <div class="timeline" id="timeline">
-                <div class="empty-state">
-                  <div class="orbit-art" aria-hidden="true">
-                    <span></span><span></span><span></span><b>↗</b>
-                  </div>
-                  <h3>让检索过程变得可见</h3>
-                  <p>
-                    输入问题并运行，实际步骤会在这里逐一出现。<br />点击任一步骤，查看耗时与结构化返回结果。
-                  </p>
-                  <div class="empty-tags">
-                    <span>真实耗时</span><span>逐步追踪</span
-                    ><span>证据回源</span>
-                  </div>
-                </div>
+              <i>
+                ›
+              </i>
+              <div data-phase="verify">
+                核验
               </div>
             </div>
-            <div
-              id="panel-answer"
-              class="tab-panel content-panel"
-              role="tabpanel"
-              aria-labelledby="tab-answer"
-              hidden
-            >
-              <div class="plain-empty">运行后查看回答与逐条引用。</div>
+            <div class="timeline-top">
+              <span>
+                <span class="status-dot" id="timeline-dot">
+                </span>
+                <span id="timeline-heading">
+                  等待发起检索
+                </span>
+              </span>
+              <label class="compact-toggle">
+                <input id="show-disabled" type="checkbox" />
+                显示未启用步骤
+              </label>
             </div>
-            <div
-              id="panel-evidence"
-              class="tab-panel content-panel"
-              role="tabpanel"
-              aria-labelledby="tab-evidence"
-              hidden
-            >
-              <div class="plain-empty">运行后查看真实检索证据。</div>
-            </div>
-            <div
-              id="panel-models"
-              class="tab-panel content-panel"
-              role="tabpanel"
-              aria-labelledby="tab-models"
-              hidden
-            >
+            <div id="timeline" class="timeline">
               <div class="plain-empty">
-                运行后查看实际调用、耗时与 Token 用量。
+                输入问题后，在这里查看每一步真实执行与耗时。
               </div>
-            </div>
-            <div
-              id="panel-raw"
-              class="tab-panel content-panel"
-              role="tabpanel"
-              aria-labelledby="tab-raw"
-              hidden
-            >
-              <pre id="raw-data">尚无运行数据。</pre>
             </div>
           </section>
-        </section>
-
-        <aside class="card inspector" aria-labelledby="inspector-heading">
-          <div class="inspector-header">
-            <span class="step-label">03 / INSPECT</span
-            ><span class="inspector-icon">↗</span>
-          </div>
-          <h2 id="inspector-heading">步骤详情</h2>
-          <p id="inspector-subtitle" class="muted">细节，比一个答案更多。</p>
-          <div id="inspector-body">
-            <div class="inspector-empty">
-              <div class="layer-art" aria-hidden="true">▱<br />▱<br />▱</div>
-              <h3>展开每一层</h3>
-              <p>选择时间线中的步骤，<br />查看它实际返回了什么。</p>
-            </div>
-            <div class="inspector-tip">
-              <span>i</span>
+          <section class="settings-section side-section">
+            <details class="advanced">
+              <summary>
+                检索设置
+                <span aria-hidden="true">
+                  ⌄
+                </span>
+              </summary>
+              <div class="options-grid">
+                <label for="top-k">
+                  证据数量
+                  <select id="top-k">
+                    <option value="3">
+                      3 条
+                    </option>
+                    <option value="5" selected>
+                      5 条
+                    </option>
+                    <option value="10">
+                      10 条
+                    </option>
+                    <option value="20">
+                      20 条
+                    </option>
+                  </select>
+                </label>
+                <label for="sku">
+                  SKU（可选）
+                  <input id="sku" maxlength="128" placeholder="商品范围" />
+                </label>
+                <label class="wide" for="history">
+                  补充上下文（每行一轮，最多 6 轮）
+                  <textarea id="history" rows="3" placeholder="需要指定上下文时填写">
+                  </textarea>
+                </label>
+              </div>
+            </details>
+            <details class="capability-card">
+              <summary>
+                当前链路
+                <span class="small-pill" id="mode-label">
+                  读取中
+                </span>
+              </summary>
+              <div id="plugin-summary" class="plugin-summary">
+              </div>
+              <p class="capability-note">
+                Laya 保留接口 · 当前由规则策略决策
+              </p>
+            </details>
+          </section>
+        </aside>
+        <section class="chat-column" aria-labelledby="chat-heading">
+          <div class="chat-heading">
+            <div>
+              <h1 id="chat-heading">
+                知识库对话
+              </h1>
               <p>
-                实时阶段先展示状态与耗时；<br />结果完成权限复核后展示内容。
+                有据可循的回答，可逐步检查的检索。
               </p>
             </div>
+            <span id="run-status" class="run-status" role="status">
+              待运行
+            </span>
           </div>
+          <div class="metrics">
+            <div class="metric">
+              <span>
+                执行耗时
+              </span>
+              <strong id="metric-duration">
+                —
+                <small>
+                  ms
+                </small>
+              </strong>
+              <span id="duration-caption">
+                等待发起查询
+              </span>
+            </div>
+            <div class="metric">
+              <span>
+                执行步骤
+              </span>
+              <strong id="metric-stages">
+                —
+              </strong>
+              <span id="stages-caption">
+                按实际运行记录
+              </span>
+            </div>
+            <div class="metric">
+              <span>
+                检索通道
+              </span>
+              <strong id="metric-lanes">
+                —
+              </strong>
+              <span>
+                BM25 / 向量检索
+              </span>
+            </div>
+            <div class="metric">
+              <span>
+                引用证据
+              </span>
+              <strong id="metric-evidence">
+                —
+              </strong>
+              <span>
+                最终授权证据
+              </span>
+            </div>
+          </div>
+          <div class="trace-summary">
+            <div class="trace-summary-label">
+              本次 Trace ID
+            </div>
+            <code id="trace-label">
+              尚未开始，提交问题后自动生成
+            </code>
+            <button id="trace-copy" class="trace-copy-button" type="button" disabled>
+              复制
+            </button>
+          </div>
+          <div id="chat-scroll" class="chat-scroll">
+            <div id="chat-history" class="chat-history">
+            </div>
+            <div id="current-chat" class="current-chat">
+              <article id="question-message" class="chat-message user-message" hidden>
+                <div class="message-label">
+                  你
+                </div>
+                <p id="chat-question">
+                </p>
+              </article>
+              <article class="chat-message assistant-message">
+                <div class="message-label">
+                  <span class="assistant-mark">
+                    A
+                  </span>
+                  Adaptive RAG
+                </div>
+                <div id="notice" class="run-notice" role="status" hidden>
+                </div>
+                <div id="panel-answer" class="answer-panel">
+                  <div class="chat-welcome">
+                    <div class="welcome-icon" aria-hidden="true">
+                      ⌕
+                    </div>
+                    <h2>
+                      从你的问题开始
+                    </h2>
+                    <p>
+                      在下方输入问题。回答显示在这里，
+                      <br />
+                      左侧追踪检索流程，右侧查看每一步的证据与结果。
+                    </p>
+                    <div class="welcome-pills">
+                      <span>
+                        真实检索
+                      </span>
+                      <span>
+                        逐步耗时
+                      </span>
+                      <span>
+                        引用回源
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </article>
+            </div>
+          </div>
+          <div class="composer">
+            <form id="query-form">
+              <label class="sr-only" for="question">
+                向知识库提问
+              </label>
+              <textarea id="question" name="question" maxlength="4000" rows="3" required placeholder="向知识库提问，例如：Transformer 的注意力机制如何工作？">
+              </textarea>
+              <div class="composer-bottom">
+                <span class="input-caption">
+                  Ctrl / ⌘ + Enter 发送
+                  <span id="char-count">
+                    0 / 4000
+                  </span>
+                </span>
+                <div class="composer-actions">
+                  <button id="cancel-button" class="secondary-button" type="button" hidden>
+                    停止查询
+                  </button>
+                  <button id="run-button" class="primary-button" type="submit">
+                    <span>
+                      发送问题
+                    </span>
+                    <span aria-hidden="true">
+                      ↑
+                    </span>
+                  </button>
+                </div>
+              </div>
+            </form>
+            <p class="composer-note">
+              回答基于已发布的知识库，引用内容可在右侧核对。
+            </p>
+          </div>
+        </section>
+        <aside class="details-column" aria-label="步骤详情和检索结果">
+          <div class="result-tabs" role="tablist" aria-label="检索详情">
+            <button id="tab-inspect" type="button" role="tab" data-tab="inspect" aria-selected="true" aria-controls="panel-inspect">
+              步骤详情
+            </button>
+            <button id="tab-evidence" type="button" role="tab" data-tab="evidence" aria-selected="false" aria-controls="panel-evidence" tabindex="-1">
+              证据
+              <span id="evidence-count" class="count">
+                0
+              </span>
+            </button>
+            <button id="tab-models" type="button" role="tab" data-tab="models" aria-selected="false" aria-controls="panel-models" tabindex="-1">
+              模型调用
+            </button>
+            <button id="tab-raw" type="button" role="tab" data-tab="raw" aria-selected="false" aria-controls="panel-raw" tabindex="-1">
+              JSON
+            </button>
+          </div>
+          <section id="panel-inspect" class="tab-panel inspector" role="tabpanel" aria-labelledby="tab-inspect">
+            <div class="detail-heading">
+              <span class="tiny-label">
+                STEP INSPECTOR
+              </span>
+              <span aria-hidden="true">
+                ↗
+              </span>
+            </div>
+            <h2 id="inspector-heading">
+              步骤详情
+            </h2>
+            <p id="inspector-subtitle" class="muted">
+              选择左侧步骤，查看实际返回。
+            </p>
+            <div id="inspector-body">
+              <div class="inspector-empty">
+                <span aria-hidden="true">
+                  ▤
+                </span>
+                <h3>
+                  让检索过程清晰可见
+                </h3>
+                <p>
+                  这里展示步骤耗时、状态和结构化返回。
+                  <br />
+                  失败步骤也会保留可用的诊断信息。
+                </p>
+              </div>
+              <p class="inspector-tip">
+                实时阶段先展示状态与耗时；完成权限复核后展示内容。
+              </p>
+            </div>
+          </section>
+          <section id="panel-evidence" class="tab-panel content-panel" role="tabpanel" aria-labelledby="tab-evidence" hidden>
+            <div class="plain-empty">
+              运行后查看实际检索证据与引用来源。
+            </div>
+          </section>
+          <section id="panel-models" class="tab-panel content-panel" role="tabpanel" aria-labelledby="tab-models" hidden>
+            <div class="plain-empty">
+              运行后查看模型调用、耗时与 Token 用量。
+            </div>
+          </section>
+          <section id="panel-raw" class="tab-panel content-panel" role="tabpanel" aria-labelledby="tab-raw" hidden>
+            <div class="raw-toolbar">
+              <span>
+                完整执行记录
+              </span>
+              <button id="export-button" class="secondary-button" type="button" disabled>
+                导出 JSON
+              </button>
+            </div>
+            <pre id="raw-data">
+              尚无运行数据。
+            </pre>
+          </section>
         </aside>
-      </div>
-      <footer class="page-footer">
-        <span
-          >ADAPTIVE RAG CONCEPT
-          <span class="footer-slash">/</span> 从检索到可信回答</span
-        ><span>规则决策 · 可插拔链路 · 云端模型</span>
-      </footer>
-    </main>
-
-    <dialog id="connection-dialog" class="modal">
-      <form id="connect-form">
-        <div class="modal-heading">
-          <div>
-            <span class="eyebrow">WORKSPACE CONNECTION</span>
-            <h2>连接你的检索工作台</h2>
-          </div>
-          <button
-            class="icon-button"
-            type="button"
-            data-close="connection-dialog"
-            aria-label="关闭连接面板"
-          >
-            ×
-          </button>
+      </main>
+    </div>
+    <dialog id="users-dialog" class="modal wide-modal" aria-labelledby="users-heading">
+      <div class="modal-heading">
+        <div>
+          <span class="tiny-label">
+            WORKSPACE MEMBERS
+          </span>
+          <h2 id="users-heading">
+            账号管理
+          </h2>
         </div>
-        <p>使用本项目的 HTTP 管理员令牌，读取插件配置并追踪检索过程。</p>
-        <label for="api-token">API Bearer Token</label
-        ><input
-          id="api-token"
-          type="password"
-          autocomplete="off"
-          spellcheck="false"
-          placeholder="输入 RAG_HTTP_API_TOKEN"
-          required
-        />
-        <p class="helper left">
-          令牌仅保留在页面内存中，刷新后需重新连接。<br />这里填写工作台令牌，云模型
-          Key 由服务器管理。
-        </p>
-        <div id="connection-error" class="form-error" role="alert"></div>
-        <button id="connect-submit" class="primary-button" type="submit">
-          <span>连接并读取配置</span><span>↗</span></button
-        ><button
-          id="disconnect-button"
-          type="button"
-          class="secondary-button"
-          hidden
-        >
-          断开连接并清空页面数据
+        <button class="icon-button" type="button" data-close="users-dialog" aria-label="关闭账号管理">
+          ×
+        </button>
+      </div>
+      <p>
+        创建普通账号后，即可把账号和密码交给其他人使用工作台。
+      </p>
+      <form id="user-create-form" class="user-create-form">
+        <label for="new-username">
+          账号
+          <input id="new-username" autocomplete="off" minlength="3" maxlength="32" pattern="[A-Za-z0-9_-]{3,32}" autocapitalize="none" spellcheck="false" title="3–32 位字母、数字、下划线或连字符" placeholder="3–32 位字母、数字等" required />
+        </label>
+        <label for="new-password">
+          密码
+          <input id="new-password" type="password" autocomplete="new-password" minlength="6" maxlength="128" placeholder="至少 6 位密码" required />
+        </label>
+        <button id="user-create-submit" class="primary-button" type="submit">
+          创建账号
         </button>
       </form>
+      <div id="users-error" class="form-error" role="alert">
+      </div>
+      <div id="users-list" class="users-list" aria-live="polite">
+      </div>
     </dialog>
-    <dialog id="plugins-dialog" class="modal wide-modal">
+    <dialog id="plugins-dialog" class="modal wide-modal" aria-labelledby="plugins-heading">
       <div class="modal-heading">
         <div>
-          <span class="eyebrow">PLUGGABLE FOUNDATION</span>
-          <h2>当前能力配置</h2>
+          <span class="tiny-label">
+            PLUGGABLE FOUNDATION
+          </span>
+          <h2 id="plugins-heading">
+            当前能力配置
+          </h2>
         </div>
-        <button
-          class="icon-button"
-          type="button"
-          data-close="plugins-dialog"
-          aria-label="关闭能力配置"
-        >
+        <button class="icon-button" type="button" data-close="plugins-dialog" aria-label="关闭能力配置">
           ×
         </button>
       </div>
-      <p>直接读取服务器启用的适配器；配置变更在服务端管理。</p>
-      <div id="plugins-list" class="plugins-list">连接后查看实际配置。</div>
+      <p>
+        直接读取服务器当前启用的适配器。
+      </p>
+      <div id="plugins-list" class="plugins-list">
+        登录后查看实际配置。
+      </div>
     </dialog>
-    <dialog id="source-dialog" class="modal wide-modal">
+    <dialog id="source-dialog" class="modal wide-modal" aria-labelledby="source-heading">
       <div class="modal-heading">
         <div>
-          <span class="eyebrow">SOURCE EVIDENCE</span>
-          <h2>证据回源</h2>
+          <span class="tiny-label">
+            SOURCE EVIDENCE
+          </span>
+          <h2 id="source-heading">
+            证据回源
+          </h2>
         </div>
-        <button
-          class="icon-button"
-          type="button"
-          data-close="source-dialog"
-          aria-label="关闭证据原文"
-        >
+        <button class="icon-button" type="button" data-close="source-dialog" aria-label="关闭证据原文">
           ×
         </button>
       </div>
-      <div id="source-content"></div>
+      <div id="source-content">
+      </div>
     </dialog>
-    <div id="toast" class="toast" role="status" hidden></div>
+    <div id="toast" class="toast" role="status" hidden>
+    </div>
   </body>
 </html>

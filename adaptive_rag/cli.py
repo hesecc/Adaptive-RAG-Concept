@@ -11,6 +11,7 @@ from .app import RagApplication
 from .config import load_settings
 from .domain import AccessContext, IngestRequest, QueryRequest, RagError, ValidationError
 from .evaluation import run_evaluation
+from .environment import apply_environment, pdf_settings, read_environment
 
 
 class JsonArgumentParser(argparse.ArgumentParser):
@@ -19,9 +20,10 @@ class JsonArgumentParser(argparse.ArgumentParser):
 
 
 def parser() -> argparse.ArgumentParser:
-    root = JsonArgumentParser(prog="adaptive-rag", description="Local model-free RAG foundation")
+    root = JsonArgumentParser(prog="adaptive-rag", description="Pluggable RAG with explicit cloud opt-in")
     root.add_argument("--data-dir", type=Path)
     root.add_argument("--config", type=Path)
+    root.add_argument("--env-file", type=Path, help="Explicit local credentials file; never loaded implicitly")
     commands = root.add_subparsers(dest="command", required=True)
 
     def tenant_command(name, **kwargs):
@@ -37,6 +39,14 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--sku", action="append", default=[])
     command.add_argument("--allow", action="append", default=[])
     command.add_argument("--language", default="zh")
+    command.add_argument("--pdf-backend", choices=("local", "mineru"))
+    command.add_argument("--pdf-checkpoint", type=Path, help="MinerU-only batch checkpoint for PDF ingestion")
+
+    command = commands.add_parser("parse-pdf")
+    command.add_argument("--file", required=True, type=Path)
+    command.add_argument("--backend", choices=("local", "mineru"))
+    command.add_argument("--output", required=True, type=Path)
+    command.add_argument("--checkpoint", type=Path, help="MinerU-only local checkpoint; resume the same batch after failure")
 
     command = tenant_command("publish")
     command.add_argument("--job", required=True)
@@ -87,7 +97,24 @@ def _access(args) -> AccessContext:
 
 
 def dispatch(args):
-    settings = load_settings(args.config)
+    environment = read_environment(args.env_file)
+    if args.command == "parse-pdf":
+        from .pdf import parse_pdf
+        output = args.output.resolve()
+        if output == args.file.resolve():
+            raise ValidationError("PDF output cannot replace the source file")
+        if args.checkpoint is not None and output == args.checkpoint.resolve():
+            raise ValidationError("PDF output cannot replace the checkpoint file")
+        parsed = parse_pdf(args.file, args.backend or environment.get("RAG_PDF_BACKEND", "local"), pdf_settings(environment),
+                           checkpoint_path=args.checkpoint)
+        try:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(parsed.markdown, encoding="utf-8")
+        except OSError:
+            raise ValidationError("cannot write PDF Markdown output") from None
+        return {"backend": parsed.backend, "pages": parsed.pages, "characters": len(parsed.markdown),
+                "duration_seconds": parsed.duration_seconds, "output": str(args.output), "metadata": parsed.metadata}
+    settings = apply_environment(load_settings(args.config), environment)
     if args.data_dir is not None:
         settings = replace(settings, data_dir=args.data_dir)
     if args.command == "serve":
@@ -98,10 +125,15 @@ def dispatch(args):
         return {"status": "stopped"}
     application = RagApplication(settings)
     if args.command == "ingest":
+        if args.file.suffix.lower() == ".pdf":
+            return application.ingest_pdf(args.file, backend=args.pdf_backend or environment.get("RAG_PDF_BACKEND", "local"),
+                pdf_settings=pdf_settings(environment), pdf_checkpoint=args.pdf_checkpoint, tenant_id=args.tenant, document_id=args.document, version=args.version,
+                title=args.title or args.file.stem, scope="sku" if args.sku else "store", sku_ids=tuple(args.sku),
+                allowed_subjects=tuple(args.allow), language=args.language)
         media_type = {".md": "text/markdown", ".markdown": "text/markdown", ".txt": "text/plain",
                       ".html": "text/html", ".htm": "text/html"}.get(args.file.suffix.lower())
         if media_type is None:
-            raise ValidationError("Supported source extensions: .md, .markdown, .txt, .html, .htm")
+            raise ValidationError("Supported source extensions: .md, .markdown, .txt, .html, .htm, .pdf")
         try:
             if args.file.stat().st_size > 8_000_000:
                 raise ValidationError("Source file exceeds the 8 MB input limit")

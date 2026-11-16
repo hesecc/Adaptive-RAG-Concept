@@ -14,9 +14,9 @@ class RagApplication:
         self.descriptions = self.registry.describe(settings)
         # Validate every selection before invoking any factory.
         for role, description in self.descriptions.items():
-            if description["requires_model"] or description["uses_network"]:
+            if (description["requires_model"] and not settings.allow_models) or (description["uses_network"] and not settings.allow_network):
                 from .domain import CapabilityError
-                raise CapabilityError(f"model/network plugin forbidden in model-free foundation: {role}")
+                raise CapabilityError(f"model/network plugin forbidden without explicit opt-in: {role}")
         self.components = {role: self.registry.build(role, settings) for role in settings.plugins}
         self.store = self.components["store"]
         self.objects = self.components["objects"]
@@ -28,6 +28,26 @@ class RagApplication:
 
     def ingest(self, request):
         return self.ingestion.ingest(request)
+
+    def ingest_pdf(self, path, *, backend="local", pdf_settings=None, pdf_checkpoint=None, **metadata):
+        from pathlib import Path
+        from hashlib import sha256
+        from .domain import IngestRequest
+        from .pdf import parse_pdf
+        source = Path(path)
+        parsed = parse_pdf(source, backend, pdf_settings,
+                           **({"checkpoint_path": pdf_checkpoint} if pdf_checkpoint is not None else {}))
+        try:
+            if source.stat().st_size > 50_000_000:
+                raise ValidationError("PDF source changed or exceeds the archive size limit")
+            raw = source.read_bytes()
+        except OSError:
+            raise ValidationError("cannot read PDF source for archival") from None
+        if sha256(raw).hexdigest() != parsed.metadata.get("source_sha256"):
+            raise ValidationError("PDF source changed during parsing; retry with a stable source")
+        raw_key = self.objects.put(raw)
+        return self.ingest(IngestRequest(content=parsed.markdown, media_type="text/markdown",
+            source_object_key=raw_key, source_parser=parsed.backend, **metadata))
 
     def publish(self, tenant_id, job_id, expected_generation):
         return self.store.publish(tenant_id, job_id, expected_generation)
@@ -74,7 +94,11 @@ class RagApplication:
         return evidence
 
     def capabilities(self):
-        return {"mode": "model_free", "model_calls": 0, "network_calls": 0,
+        cloud_mode = any(d["requires_model"] for d in self.descriptions.values())
+        return {"mode": "cloud" if cloud_mode else "model_free",
+                "model_calls": None if cloud_mode else 0, "network_calls": None if cloud_mode else 0,
+                "call_counts_basis": "per-request trace" if cloud_mode else "disabled",
                 "generation_enabled": self.descriptions["generator"]["enabled"],
-                "semantic_support_verification": False, "history_resolution": False,
+                "semantic_support_verification": self.settings.plugins["verifier"] == "cloud",
+                "history_resolution": any(self.settings.plugins[role] == "cloud" for role in ("planner", "rewrite")),
                 "plugins": self.descriptions}

@@ -56,8 +56,8 @@ class PluginRegistry:
 
     def build(self, role: str, settings: Settings) -> Any:
         spec = self.spec(role, settings.plugins[role])
-        if spec.requires_model or spec.uses_network:
-            raise CapabilityError(f"model/network plugin forbidden in model-free foundation: {role}/{spec.name}")
+        if (spec.requires_model and not settings.allow_models) or (spec.uses_network and not settings.allow_network):
+            raise CapabilityError(f"model/network plugin forbidden without explicit opt-in: {role}/{spec.name}")
         value = spec.factory(settings)
         if spec.enabled:
             missing = [method for method in REQUIRED_METHODS[role] if not callable(getattr(value, method, None))]
@@ -92,4 +92,41 @@ def default_registry() -> PluginRegistry:
     }
     for role, name in DEFAULT_PLUGINS.items():
         registry.register(role, name, factories.get(role, lambda s: None), enabled=role not in OPTIONAL)
+
+    def cloud_transport(settings):
+        from .cloud import CloudSettings, CloudTransport
+        if not isinstance(settings.cloud, CloudSettings):
+            raise ValidationError("cloud plugins require explicit cloud credentials and endpoint")
+        return CloudTransport(settings.cloud)
+
+    def dense(settings):
+        from .cloud import CloudDenseRetriever, CloudEmbedder
+        return CloudDenseRetriever(CloudEmbedder(cloud_transport(settings)), settings.data_dir)
+
+    def rerank(settings):
+        from .cloud import CloudReranker
+        return CloudReranker(cloud_transport(settings))
+
+    def generate(settings):
+        from .cloud import CloudGenerator
+        return CloudGenerator(cloud_transport(settings))
+
+    for role, factory in (("dense", dense), ("reranker", rerank), ("generator", generate)):
+        registry.register(role, "cloud", factory, requires_model=True, uses_network=True)
+    def planner(settings):
+        from .query import CloudPlanner
+        return CloudPlanner(cloud_transport(settings), settings.max_subqueries)
+
+    registry.register("planner", "cloud", planner, requires_model=True, uses_network=True)
+    for role in ("rewrite", "multi_query", "hyde"):
+        def transform(settings, mode=role):
+            from .query import CloudQueryTransform
+            return CloudQueryTransform(cloud_transport(settings), mode)
+        registry.register(role, "cloud", transform, requires_model=True, uses_network=True)
+    for role, class_name in (("judge", "CloudEvidenceJudge"), ("gap", "CloudGapTransform"),
+                             ("verifier", "CloudVerifier")):
+        def quality(settings, name=class_name):
+            from . import quality as adapters
+            return getattr(adapters, name)(cloud_transport(settings))
+        registry.register(role, "cloud", quality, requires_model=True, uses_network=True)
     return registry

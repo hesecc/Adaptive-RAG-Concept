@@ -193,8 +193,79 @@ class TextCleaner:
         return tuple(result)
 
 
-def _ranges(text: str, limit: int, overlap: int = 0):
-    """Yield bounded slices, preferring element/sentence breaks, always advancing."""
+def _structures(text: str):
+    """Locate protected Markdown elements without interpreting their contents.
+
+    A span longer than a chunk budget is deliberately split later, with a
+    locator marker describing that fragment. No repeated table header, closing
+    delimiter or other synthetic text is inserted into citable source spans.
+    """
+    spans = []
+    lines = text.splitlines(keepends=True)
+    offset, opened, table_start = 0, None, None
+    for line in lines:
+        fence = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line.rstrip("\r\n"))
+        if opened:
+            start, char, width = opened
+            if fence and fence.group(1)[0] == char and len(fence.group(1)) >= width and not fence.group(2).strip():
+                spans.append((start, offset + len(line.rstrip("\r\n")), "code", True))
+                opened = None
+        elif fence:
+            if table_start is not None:
+                spans.append((table_start, offset, "table", True))
+                table_start = None
+            opened = (offset, fence.group(1)[0], len(fence.group(1)))
+        elif line.lstrip().startswith("|") and line.count("|") >= 2:
+            if table_start is None:
+                table_start = offset
+        elif table_start is not None:
+            spans.append((table_start, offset, "table", True))
+            table_start = None
+        offset += len(line)
+    if opened:
+        spans.append((opened[0], len(text), "code", False))
+    if table_start is not None:
+        spans.append((table_start, len(text), "table", True))
+
+    def inside_code(position):
+        return any(start <= position < end for start, end, kind, _ in spans if kind == "code")
+
+    table_stack = []
+    for match in re.finditer(r"<table\b[^>]*>|</table\s*>", text, re.I):
+        if inside_code(match.start()):
+            continue
+        if match.group(0).lower().startswith("</"):
+            if table_stack:
+                start = table_stack.pop()
+                if not table_stack:
+                    spans.append((start, match.end(), "table", True))
+        else:
+            table_stack.append(match.start())
+    if table_stack:
+        spans.append((table_stack[0], len(text), "table", False))
+    for pattern in (r"(?<!\\)\$\$[\s\S]*?(?<!\\)\$\$", r"\\\[[\s\S]*?\\\]",
+                    r"\\begin\{(?P<env>equation\*?|align\*?|gather\*?|displaymath)\}[\s\S]*?\\end\{(?P=env)\}"):
+        for match in re.finditer(pattern, text):
+            if not inside_code(match.start()):
+                spans.append((match.start(), match.end(), "formula", True))
+    # Prefer the encompassing element when syntax is nested (formula in a
+    # table, literal table markup inside code), not competing boundaries.
+    merged = []
+    for start, end, kind, closed in sorted(spans, key=lambda item: (item[0], -item[1])):
+        while end > start and text[end - 1].isspace():
+            end -= 1
+        if start == end:
+            continue
+        if merged and start < merged[-1][1]:
+            old = merged[-1]
+            merged[-1] = (old[0], max(old[1], end), old[2], old[3] and closed)
+        else:
+            merged.append((start, end, kind, closed))
+    return tuple(merged)
+
+
+def _ranges(text: str, limit: int, overlap: int = 0, structures=()):
+    """Yield bounded slices, preserving fitting structures and always advancing."""
     cursor = 0
     while cursor < len(text):
         start = cursor
@@ -202,7 +273,8 @@ def _ranges(text: str, limit: int, overlap: int = 0):
             start += 1
         if start >= len(text):
             return
-        boundary = min(start + limit, len(text))
+        hard_boundary = min(start + limit, len(text))
+        boundary = hard_boundary
         if boundary < len(text):
             floor = start + max(1, limit // 3)
             for separators in (("\n\n",), ("\n",), ("。", "！", "？", "；", ". ", "! ", "? ", "; "), (" ", "\t")):
@@ -213,6 +285,12 @@ def _ranges(text: str, limit: int, overlap: int = 0):
                 if candidates:
                     boundary = max(candidates)
                     break
+        for element_start, element_end, _kind, _closed in structures:
+            if element_start < boundary < element_end and element_end - element_start <= limit:
+                # Include a whole fitting element if possible; otherwise end
+                # immediately before it and let the next chunk own the element.
+                boundary = element_end if element_end <= hard_boundary else element_start
+                break
         end = boundary
         while end > start and text[end - 1].isspace():
             end -= 1
@@ -221,6 +299,17 @@ def _ranges(text: str, limit: int, overlap: int = 0):
         if boundary >= len(text):
             return
         cursor = max(start + 1, end - overlap)
+        for element_start, element_end, _kind, _closed in structures:
+            if element_start < cursor < element_end and element_end - element_start <= limit:
+                # Do not let overlap re-enter the middle of an atomic element.
+                cursor = element_start if element_start > start else element_end
+                break
+
+
+def _structure_marker(start, end, structures):
+    kinds = sorted({kind for first, last, kind, closed in structures
+                    if first < end and last > start and (first < start or last > end or not closed)})
+    return ";structure_fragment:" + ",".join(kinds) if kinds else ""
 
 
 class ParentChildChunker:
@@ -237,25 +326,29 @@ class ParentChildChunker:
 
     @property
     def fingerprint(self) -> str:
-        return stable_id("parent-child-v1", self.parent_chars, self.child_chars, self.overlap_chars)
+        return stable_id("parent-child-structure-v2", self.parent_chars, self.child_chars, self.overlap_chars)
 
     def chunk(self, request: IngestRequest, revision_id: str, sections: Sequence[Section]) -> tuple[tuple[ParentChunk, ...], tuple[ChildChunk, ...]]:
         parents: list[ParentChunk] = []
         children: list[ChildChunk] = []
         for section_no, section in enumerate(sections):
             prefix = " | ".join(dict.fromkeys((request.title, *section.heading_path)))
-            for parent_no, (p_start, p_end) in enumerate(_ranges(section.text, self.parent_chars)):
+            structures = _structures(section.text)
+            for parent_no, (p_start, p_end) in enumerate(_ranges(section.text, self.parent_chars, structures=structures)):
                 body = section.text[p_start:p_end]
-                locator = f"{section.locator};chars:{p_start}-{p_end}"
+                locator = f"{section.locator}{_structure_marker(p_start, p_end, structures)};chars:{p_start}-{p_end}"
                 parent_id = stable_id("parent", request.tenant_id, request.document_id, revision_id,
                                       section_no, parent_no, locator, _digest(body))
                 parents.append(ParentChunk(
                     request.tenant_id, request.document_id, request.version, revision_id,
                     parent_id, section.heading_path, body, locator, _digest(body),
                 ))
-                for child_no, (c_start, c_end) in enumerate(_ranges(body, self.child_chars, self.overlap_chars)):
+                local_structures = tuple((max(0, first - p_start), min(p_end, last) - p_start, kind,
+                                          closed and first >= p_start and last <= p_end)
+                                         for first, last, kind, closed in structures if first < p_end and last > p_start)
+                for child_no, (c_start, c_end) in enumerate(_ranges(body, self.child_chars, self.overlap_chars, local_structures)):
                     text = body[c_start:c_end]
-                    child_locator = f"{section.locator};chars:{p_start + c_start}-{p_start + c_end}"
+                    child_locator = f"{section.locator}{_structure_marker(p_start + c_start, p_start + c_end, structures)};chars:{p_start + c_start}-{p_start + c_end}"
                     chunk_id = stable_id("child", parent_id, child_no, child_locator, _digest(text))
                     children.append(ChildChunk(
                         request.tenant_id, request.document_id, request.version, revision_id,

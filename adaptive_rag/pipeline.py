@@ -18,6 +18,7 @@ from .domain import (
     QueryRequest, QueryResult, RagError, SubQuery, ValidationError, Verification,
 )
 from .retrieval import tokenize
+from .cloud import start_usage, usage_snapshot, reset_usage
 
 
 def digest(text: str) -> str:
@@ -32,6 +33,7 @@ def make_evidence(parent, generation: str, length: int, query_ids=()) -> Evidenc
         evidence_id, tuple(query_ids), parent.tenant_id, generation,
         parent.document_id, parent.version, parent.revision_id, parent.parent_id,
         text, parent.locator, excerpt_hash, parent.content_hash, len(text) < len(parent.text),
+        parent.heading_path,
     )
 
 
@@ -99,6 +101,7 @@ class QueryPipeline:
         self.settings, self.c, self.descriptions = settings, components, descriptions
 
     async def run(self, request: QueryRequest, capabilities: dict) -> QueryResult:
+        usage_token = start_usage()
         started = monotonic()
         deadline = started + self.settings.timeout_seconds
         save_reserve = min(self.settings.stage_timeout_seconds, self.settings.timeout_seconds * 0.15)
@@ -115,6 +118,7 @@ class QueryPipeline:
 
         async def stage(name, function, *args):
             begin = monotonic()
+            before_calls = usage_snapshot()["model_calls"]
             record = {"name": name, "status": "running"}
             trace["stages"].append(record)
             try:
@@ -132,6 +136,10 @@ class QueryPipeline:
                 record["error_type"] = type(exc).__name__
                 raise
             finally:
+                owner = getattr(function, "__self__", None)
+                if (request.history and name in {"planner", "rewrite", "multi_query", "hyde"} and
+                        getattr(owner, "uses_history", False) and usage_snapshot()["model_calls"] > before_calls):
+                    trace["history_used"] = True
                 record["duration_ms"] = round((monotonic() - begin) * 1000, 3)
 
         def disabled(role):
@@ -142,7 +150,7 @@ class QueryPipeline:
             trace["evidence"] = [asdict(item) for item in evidence]
             return QueryResult(trace["trace_id"], status, message, trace["generation"],
                                tuple(evidence), draft.answer if draft else None, draft.claims if draft else (),
-                               tuple(missing), capabilities)
+                               tuple(missing), capabilities | {"usage": usage_snapshot()})
 
         async def decision(checkpoint, missing=()):
             value = await stage(f"decision.{checkpoint}", self.c["decision"].decide, {
@@ -167,9 +175,23 @@ class QueryPipeline:
             original = {q.query_id: q for q in queries}
             trace["subqueries"] = [asdict(q) for q in queries]
             variants = queries
+            role_count = sum(bool(self.descriptions[r]["enabled"]) for r in ("lexical", "dense"))
+            minimum_lanes = len(queries) * role_count
+            if minimum_lanes > self.settings.max_lanes:
+                raise ValidationError("retrieval lane budget cannot cover original questions")
+            reserve = (min(minimum_lanes, self.settings.max_lanes - minimum_lanes)
+                       if self.descriptions["gap"]["enabled"] and self.settings.max_retries else 0)
+            variant_budget = ((self.settings.max_lanes - reserve) // role_count
+                              if role_count else len(queries))
+            trace["reserved_repair_lanes"] = reserve
             for role in ("rewrite", "multi_query", "hyde"):
                 if self.descriptions[role]["enabled"]:
+                    if variant_budget <= len(variants):
+                        trace["stages"].append({"name": role, "status": "skipped",
+                                                "reason": "retrieval_lane_budget", "duration_ms": 0})
+                        continue
                     variants = self._variants(await stage(role, self.c[role].transform, variants, request), original)
+                    variants = self._budget_variants(variants, queries, variant_budget)
                 else:
                     disabled(role)
             trace["query_variants"] = [asdict(q) for q in variants]
@@ -240,6 +262,44 @@ class QueryPipeline:
                     budget -= length
                 return tuple(items)
 
+            async def finish(status, message, evidence, missing=(), draft=None):
+                # All exits exposing evidence or claims recheck current permissions.
+                parents = await stage("final_access_check", self.c["store"].get_parents, snapshot,
+                                      tuple(e.parent_id for e in evidence), request.access)
+                if {p.parent_id for p in parents} != {e.parent_id for e in evidence}:
+                    raise NotFoundError("evidence access changed during query; retry")
+                return result(status, message, evidence, missing, draft)
+
+            async def recover(missing, evidence, label):
+                # Initial evidence repair and post-generation repair share one budget.
+                nonlocal coverage
+                if not (chunks and missing and self.descriptions["gap"]["enabled"] and
+                        trace["retry_count"] < self.settings.max_retries):
+                    return evidence, False
+                role_count = sum(bool(self.descriptions[r]["enabled"]) for r in ("lexical", "dense"))
+                if lane_count + len(missing) * role_count > self.settings.max_lanes:
+                    trace["repair_skipped"] = "retrieval_lane_budget"
+                    return evidence, False
+                missing = self._missing_queries(missing, original)
+                gap = self._variants(await stage("gap." + label, self.c["gap"].transform, missing, request),
+                                     {q.query_id: q for q in missing})
+                if lane_count + len(gap) * role_count > self.settings.max_lanes:
+                    trace["repair_skipped"] = "retrieval_lane_budget"
+                    return evidence, False
+                before = {(item.parent_id, item.source_hash): item.text for item in evidence}
+                trace["retry_count"] += 1
+                trace["repair_checkpoint"] = label
+                await retrieve(gap)
+                updated = await assemble()
+                coverage = await stage("judge.retry", self.c["judge"].assess, queries, updated)
+                self._coverage(coverage, original)
+                trace["coverage"] = asdict(coverage)
+                changed = any((item.parent_id, item.source_hash) not in before or
+                              len(item.text) > len(before[item.parent_id, item.source_hash])
+                              for item in updated)
+                trace["repair_new_evidence"] = changed
+                return updated, changed
+
             await retrieve(variants)
             evidence = await assemble()
             coverage = await stage("judge", self.c["judge"].assess, queries, evidence)
@@ -248,38 +308,86 @@ class QueryPipeline:
             if action == "stop":
                 return result("policy_stopped", "策略在证据检查后停止查询。", missing=coverage.missing_query_ids)
             if self.descriptions["gap"]["enabled"] and action == "retry" and coverage.missing_query_ids and self.settings.max_retries:
-                missing = tuple(original[qid] for qid in coverage.missing_query_ids)
-                gap = self._variants(await stage("gap", self.c["gap"].transform, missing, request), {q.query_id: q for q in missing})
-                trace["retry_count"] = 1
-                await retrieve(gap)
-                evidence = await assemble()
-                coverage = await stage("judge.retry", self.c["judge"].assess, queries, evidence)
-                self._coverage(coverage, original)
+                missing = coverage.missing_queries or tuple(original[qid] for qid in coverage.missing_query_ids)
+                evidence, _ = await recover(missing, evidence, "evidence")
             elif not self.descriptions["gap"]["enabled"]:
                 disabled("gap")
             trace["coverage"] = asdict(coverage)
             if not evidence:
                 return result("empty", "没有检索到可访问的词法证据；这不等同于语义拒答判断。", missing=coverage.missing_query_ids)
+            semantic_coverage = coverage.basis == "cloud_semantic_sufficiency"
+            if semantic_coverage and not coverage.covered_query_ids:
+                return await finish("insufficient", "现有证据不足以完整支持问题，暂不生成答案。",
+                                    evidence, coverage.missing_query_ids)
             if await decision("generate", coverage.missing_query_ids) == "stop":
                 return result("policy_stopped", "策略停止生成阶段。", missing=coverage.missing_query_ids)
             if self.descriptions["generator"]["enabled"]:
-                draft = await stage("generator", self.c["generator"].generate, replace(plan, queries=queries), evidence)
+                generation_queries = tuple(q for q in queries if not semantic_coverage or q.query_id in coverage.covered_query_ids)
+                draft = await stage("generator", self.c["generator"].generate, replace(plan, queries=generation_queries), evidence)
                 if not isinstance(draft, Draft):
                     raise ValidationError("generator returned an invalid draft")
             else:
                 disabled("generator")
                 draft = Draft()
-            verification = await stage("verifier", self.c["verifier"].verify, draft, evidence)
-            if not isinstance(verification, Verification) or not verification.valid:
-                raise ValidationError("citation verification failed")
+            async def verify(current, items, label):
+                structural = await CitationVerifier().verify(current, items)
+                if not structural.valid:
+                    raise ValidationError("citation verification failed")
+                evaluator = getattr(self.c["verifier"], "evaluate", None)
+                if callable(evaluator):
+                    checked = await stage(label, evaluator, replace(plan, queries=queries), current, items)
+                else:
+                    checked = await stage(label, self.c["verifier"].verify, current, items)
+                self._verification(checked, current, original)
+                if not checked.valid and not checked.support_checked:
+                    raise ValidationError("citation verification failed")
+                return checked
+
+            verification = await verify(draft, evidence, "verifier")
+            missing = tuple(dict.fromkeys((*coverage.missing_query_ids,
+                                          *(q.query_id for q in verification.missing_queries))))
+            if verification.support_checked and draft.answer is not None and (not verification.valid or missing):
+                trace["verification_initial"] = asdict(verification)
+                gap_queries = verification.missing_queries or coverage.missing_queries
+                if not gap_queries:
+                    gap_queries = tuple(original[qid] for qid in (missing or tuple(original)))
+                previous_draft, previous_verification = draft, verification
+                evidence, changed = await recover(gap_queries, evidence, "answer")
+                if changed and (coverage.basis != "cloud_semantic_sufficiency" or coverage.covered_query_ids):
+                    generation_queries = tuple(q for q in queries if coverage.basis != "cloud_semantic_sufficiency" or q.query_id in coverage.covered_query_ids)
+                    draft = await stage("generator.retry", self.c["generator"].generate, replace(plan, queries=generation_queries), evidence)
+                    if not isinstance(draft, Draft):
+                        raise ValidationError("generator returned an invalid draft")
+                    verification = await verify(draft, evidence, "verifier.retry")
+                else:
+                    # Retry may reorder/truncate parents. Keep only claims with exactly
+                    # the same cited excerpts; never transplant a prior verdict.
+                    current_ids = {e.evidence_id for e in evidence}
+                    indexes = tuple(i for i in previous_verification.supported_claim_indexes
+                                    if set(previous_draft.claims[i].evidence_ids) <= current_ids)
+                    verification = replace(previous_verification, supported_claim_indexes=indexes)
+                missing = tuple(dict.fromkeys((*coverage.missing_query_ids,
+                                              *(q.query_id for q in verification.missing_queries))))
             trace["verification"] = asdict(verification)
-            final_parents = await stage("final_access_check", self.c["store"].get_parents, snapshot,
-                                        tuple(e.parent_id for e in evidence), request.access)
-            if {p.parent_id for p in final_parents} != {e.parent_id for e in evidence}:
-                raise NotFoundError("evidence access changed during query; retry")
-            return result("evidence_preview" if draft.answer is None else "answered",
-                          "无模型证据预览，未生成答案，未验证语义支持。" if draft.answer is None else "本地插件输出；引文完整性检查通过。",
-                          evidence, coverage.missing_query_ids, draft)
+            if verification.support_checked:
+                safe_claims = tuple(draft.claims[i] for i in verification.supported_claim_indexes)
+                safe_answer = "\n".join(claim.text + " " + " ".join(f"[{key}]" for key in claim.evidence_ids)
+                                         for claim in safe_claims) or None
+                draft = Draft(safe_answer, safe_claims, draft.mode)
+                if not safe_claims:
+                    return await finish("insufficient", "未获得可通过事实支持性检查的答案，需补充权威资料。",
+                                        evidence, missing or tuple(original), draft)
+                if not verification.valid or missing:
+                    return await finish("partial", "仅返回通过支持性检查的部分；仍有缺项需要确认。",
+                                        evidence, missing or tuple(original), draft)
+                message = ("回答已通过云端事实支持性与完整性检查；模型判断仍可能出错。"
+                           if verification.completeness_checked else
+                           "回答已通过事实支持性检查，尚未检查完整性；模型判断仍可能出错。")
+                return await finish("answered", message,
+                                    evidence, (), draft)
+            return await finish("evidence_preview" if draft.answer is None else "answered",
+                                "证据预览，未生成答案，未验证语义支持。" if draft.answer is None else "已生成带引用回答；出处完整性检查通过，未验证语义支持。",
+                                evidence, coverage.missing_query_ids, draft)
 
         try:
             async with asyncio.timeout(self.settings.timeout_seconds - save_reserve):
@@ -296,6 +404,9 @@ class QueryPipeline:
                 raise
             raise CapabilityError(f"query plugin failed; trace_id={trace['trace_id']}") from exc
         finally:
+            usage = usage_snapshot()
+            reset_usage(usage_token)
+            trace.update(model_calls=usage["model_calls"], network_calls=usage["network_calls"], usage=usage)
             trace["duration_ms"] = round((monotonic() - started) * 1000, 3)
             # Persistence is required for success, bounded, and never blocks the
             # event loop. A failed sink cannot record its own failure; surface it.
@@ -324,6 +435,25 @@ class QueryPipeline:
         return tuple(variants)
 
     @staticmethod
+    def _budget_variants(variants, originals, limit):
+        """Keep each original first, then distribute extension slots fairly."""
+        selected = list(originals)
+        seen = {(query.query_id, query.text) for query in selected}
+        extras = {query.query_id: [] for query in originals}
+        for query in variants:
+            identity = (query.query_id, query.text)
+            if identity not in seen:
+                extras[query.query_id].append(query)
+                seen.add(identity)
+        for rank in range(max((len(items) for items in extras.values()), default=0)):
+            for items in extras.values():
+                if len(selected) >= limit:
+                    return tuple(selected)
+                if rank < len(items):
+                    selected.append(items[rank])
+        return tuple(selected)
+
+    @staticmethod
     def _hits(hits, query_id, allowed, limit):
         if not isinstance(hits, (tuple, list)) or len(hits) > limit:
             raise ValidationError("retriever exceeded candidate budget")
@@ -341,3 +471,31 @@ class QueryPipeline:
         covered, missing = set(coverage.covered_query_ids), set(coverage.missing_query_ids)
         if covered & missing or covered | missing != set(originals):
             raise ValidationError("judge coverage must partition original subqueries")
+        if len(covered) != len(coverage.covered_query_ids) or len(missing) != len(coverage.missing_query_ids):
+            raise ValidationError("judge coverage must not repeat subqueries")
+        if coverage.missing_queries:
+            QueryPipeline._missing_queries(coverage.missing_queries, {qid: originals[qid] for qid in missing})
+
+    @staticmethod
+    def _missing_queries(queries, originals):
+        if not isinstance(queries, (tuple, list)) or not 1 <= len(queries) <= len(originals):
+            raise ValidationError("invalid missing-aspect queries")
+        seen = set()
+        for query in queries:
+            if not isinstance(query, SubQuery) or query.query_id not in originals or query.query_id in seen or not isinstance(query.text, str) or not query.text.strip() or len(query.text) > 4000 or "\x00" in query.text:
+                raise ValidationError("invalid missing-aspect queries")
+            seen.add(query.query_id)
+        return tuple(queries)
+
+    @staticmethod
+    def _verification(value, draft, originals):
+        if not isinstance(value, Verification) or any(type(flag) is not bool for flag in
+                (value.valid, value.support_checked, value.completeness_checked)):
+            raise ValidationError("verifier returned invalid result")
+        indexes = value.supported_claim_indexes
+        if not isinstance(indexes, tuple) or any(type(i) is not int or not 0 <= i < len(draft.claims) for i in indexes) or len(set(indexes)) != len(indexes):
+            raise ValidationError("verifier returned invalid supported claims")
+        if value.support_checked and value.valid and set(indexes) != set(range(len(draft.claims))):
+            raise ValidationError("verifier passed claims it did not check")
+        if value.missing_queries:
+            QueryPipeline._missing_queries(value.missing_queries, originals)

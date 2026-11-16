@@ -9,6 +9,8 @@ description = "A pluggable, model-free retrieval augmented generation foundation
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "pypdf>=7.1,<8",
   "uvicorn>=0.30,<1",
 ]
 

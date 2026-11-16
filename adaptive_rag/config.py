@@ -1,4 +1,4 @@
-"""Validated local configuration. No .env loading or model credentials."""
+"""Validated configuration; external capabilities require explicit opt-in."""
 
 from dataclasses import dataclass, field
 import ipaddress
@@ -60,9 +60,17 @@ class Settings:
     port: int = 8000
     plugins: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_PLUGINS))
     api_tokens: dict[str, Principal] = field(default_factory=dict, repr=False)
+    allow_models: bool = False
+    allow_network: bool = False
+    cloud: Any = field(default=None, repr=False)
 
     def __post_init__(self):
         object.__setattr__(self, "data_dir", Path(self.data_dir).resolve())
+        for name in ("allow_models", "allow_network"):
+            if type(getattr(self, name)) is not bool:
+                raise ValidationError(f"{name} must be boolean")
+        if self.allow_models and not self.allow_network:
+            raise ValidationError("cloud models require allow_network=true")
         limits = {
             "parent_chars": (64, 16000), "child_chars": (16, 4000),
             "overlap_chars": (0, 1000), "candidate_limit": (1, 100),
@@ -106,6 +114,7 @@ def load_settings(path: str | Path | None = None) -> Settings:
         with source.open("rb") as handle:
             values: dict[str, Any] = tomllib.load(handle)
         known = set(Settings.__dataclass_fields__)
+        known.remove("cloud")  # Credentials are injected, never serialized in TOML.
         if set(values) - known:
             raise ValidationError(f"unknown settings: {', '.join(sorted(set(values) - known))}")
         if "data_dir" in values:

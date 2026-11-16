@@ -49,6 +49,16 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(read.content_hash, evidence.content_hash)
         self.assertIn("disabled", {item["status"] for item in trace["stages"]})
 
+    async def test_evidence_preserves_source_heading_context_after_restart(self):
+        self.publish(content="# 部署验收用虚构售后政策\n\n## 质保与材料\n申请质保必须提供购买凭证。")
+        app = RagApplication(self.settings)
+        result = await app.query(QueryRequest(self.access, "申请质保材料"))
+        item = result.evidence[0]
+        self.assertEqual(getattr(item, "heading_path", ()), ("部署验收用虚构售后政策", "质保与材料"))
+        self.assertEqual(item.text, "申请质保必须提供购买凭证。")
+        read = app.get_evidence(self.access, result.generation, item.evidence_id)
+        self.assertEqual(read, replace(item, query_ids=()))
+
     async def test_no_index_empty_clarify_and_realtime_are_distinct(self):
         self.assertEqual((await self.app.query(QueryRequest(self.access, "退货"))).status, "no_index")
         self.publish()
@@ -255,9 +265,9 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
     def test_model_and_network_plugins_rejected_before_factory(self):
         for flags in ({"requires_model": True}, {"uses_network": True}):
             registry = default_registry()
-            registry.register("dense", "cloud", lambda s: self.fail("factory invoked"), **flags)
+            registry.register("dense", "forbidden-fixture", lambda s: self.fail("factory invoked"), **flags)
             with self.assertRaises(CapabilityError):
-                RagApplication(replace(self.settings, plugins={"dense": "cloud"}), registry)
+                RagApplication(replace(self.settings, plugins={"dense": "forbidden-fixture"}), registry)
 
     def test_config_and_domain_reject_ambiguous_types(self):
         for options in ({"top_k": True}, {"history": "x"}):

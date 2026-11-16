@@ -111,7 +111,7 @@ def create_api(settings: Settings | None = None) -> FastAPI:
 
     @api.get("/health")
     def health():
-        return {"status": "ok", "mode": "model_free"}
+        return {"status": "ok", "mode": application.capabilities()["mode"]}
 
     @api.get("/capabilities")
     def capabilities(principal: User):

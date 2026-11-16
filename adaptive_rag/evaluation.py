@@ -105,6 +105,7 @@ async def run_evaluation(
             "trace_id": result.trace_id, "generation": result.generation,
             "status": result.status, "gold_type": gold_type, "gold_ids": gold,
             "retrieved_ids": retrieved, "metrics": None,
+            "model_calls": result.capabilities.get("usage", {}).get("model_calls", 0),
         }
         if gold:
             scores = retrieval_metrics(retrieved, gold, top_k)
@@ -120,7 +121,8 @@ async def run_evaluation(
         "parameters": {"tenant_id": access.tenant_id, "subject_id": access.subject_id,
                        "groups": list(access.groups), "generation": pinned, "top_k": top_k,
                        "fixture_path": str(fixture_path)},
-        "capabilities": application.capabilities(), "model_calls": 0,
+        "capabilities": application.capabilities(),
+        "model_calls": sum(row.get("model_calls", 0) for row in rows),
         "case_count": len(rows), "positive_case_count": len(positive),
         "unlabelled_case_count": unlabelled_count,
         "metrics": {name: sum(item[name] for item in positive) / len(positive) if positive else None

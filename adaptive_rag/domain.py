@@ -94,12 +94,18 @@ class IngestRequest:
     sku_ids: tuple[str, ...] = ()
     allowed_subjects: tuple[str, ...] = ()
     language: str = "zh"
+    source_object_key: str | None = None
+    source_parser: str | None = None
 
     def __post_init__(self):
         for name in ("tenant_id", "document_id", "version", "language"):
             identifier(getattr(self, name), name)
         nonempty(self.content, "content", 2_000_000)
         nonempty(self.title, "title", 300)
+        if self.source_object_key is not None and not re.fullmatch(r"[a-f0-9]{64}", self.source_object_key):
+            raise ValidationError("source_object_key must be a SHA256 object key")
+        if self.source_parser is not None:
+            nonempty(self.source_parser, "source_parser", 100)
         if self.media_type not in ("text/plain", "text/markdown", "text/html"):
             raise ValidationError("media_type must be text/plain, text/markdown or text/html")
         if self.scope not in ("store", "sku"):
@@ -254,6 +260,7 @@ class Evidence:
     content_hash: str
     source_hash: str
     truncated: bool = False
+    heading_path: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -261,6 +268,7 @@ class Coverage:
     covered_query_ids: tuple[str, ...]
     missing_query_ids: tuple[str, ...]
     basis: str = "lexical_presence_only"
+    missing_queries: tuple[SubQuery, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -281,6 +289,9 @@ class Verification:
     valid: bool
     errors: tuple[str, ...] = ()
     support_checked: bool = False
+    supported_claim_indexes: tuple[int, ...] = ()
+    missing_queries: tuple[SubQuery, ...] = ()
+    completeness_checked: bool = False
 
 
 @dataclass(frozen=True)

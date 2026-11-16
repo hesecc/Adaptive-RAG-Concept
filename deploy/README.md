@@ -1,0 +1,112 @@
+# an-RAG server deployment artifacts
+
+These artifacts target the approved `/opt/an-RAG` namespace. The existing host
+Nginx terminates HTTPS; no new Caddy container is installed for this topology.
+Check active and reserved ports, available memory/CPU/disk, host and cloud
+firewalls, Compose version and certificate trust before activating them.
+
+## Files and private server state
+
+| Repository artifact | Installed server path |
+| --- | --- |
+| `compose.server.yaml` | `/opt/an-RAG/compose.yaml` |
+| `nginx.server.conf` | `/www/server/panel/vhost/nginx/an-rag.conf` |
+| `logrotate.server.conf` | `/etc/logrotate.d/an-rag` |
+| `backup.sh`, `snapshot.py` | `/opt/an-RAG/infra/` |
+
+Create `/opt/an-RAG/.managed` containing exactly `an-rag:standalone:v1`.
+Create independent `config`, `data`, `secrets`, `tls`, `logs`, `backups`, `infra`,
+`sources` and `releases` directories; never symlink these to another project.
+Keep the management root, private config, secrets and backups owner-restricted.
+The data bind is owned by application UID/GID `10001:10001` with writable access.
+Host Docker mounts the bind directly, so the container needs data permissions,
+not permission to traverse the host management root.
+
+`deployment.env` contains the fixed release image, for example
+`RAG_IMAGE=an-rag/app:release-<source-sha>`. `config/app.env` contains application
+configuration and secrets, excluding SSH credentials; both are private files.
+Compose `env_file.format: raw` requires Compose **2.30.0 or newer** and preserves
+literal dollar signs/quotes in environment values. Use unquoted `KEY=value`
+lines in this runtime file; do not `source` it in a shell.
+
+Use an independently issued server certificate and private key at
+`tls/server.crt` and `tls/server.key`. The current IP template requires an
+`IP:110.42.51.234` SAN. Publish only the public CA/certificate and its fingerprint.
+Never copy another application's private key. Nginx listens on `18444`; the API
+binds only to `127.0.0.1:14175`. Both are candidate ports until host preflight
+confirms them. The existing `18443`, `14173` and reserved `14174` remain untouched.
+
+## Start and change a release
+
+All commands must name this project's env and Compose file explicitly. Before
+the initial start, validate the image and files, resource limits, data ownership
+and health response. For subsequent releases, first take a successful backup
+and keep the previous image and deployment parameters.
+
+```bash
+docker compose --project-name an-rag --env-file /opt/an-RAG/deployment.env -f /opt/an-RAG/compose.yaml config --quiet
+docker compose --project-name an-rag --env-file /opt/an-RAG/deployment.env -f /opt/an-RAG/compose.yaml up -d --wait --wait-timeout 180
+curl --fail http://127.0.0.1:14175/health
+/www/server/nginx/sbin/nginx -t
+/www/server/nginx/sbin/nginx -s reload
+```
+
+Only install the new vhost and reload after loopback verification and a
+successful whole-host Nginx configuration check. Preserve its old configuration
+and remove/revert only the new an-rag vhost if the new configuration fails.
+Verify the public HTTPS response with strict CA/IP validation and test protected
+routes both with and without a Bearer token. The API uses no session cookies;
+the vhost hides `Set-Cookie` to avoid cross-port cookie interference.
+
+All release changes and container CLI writes must acquire the same
+`/opt/an-RAG/.maintenance.lock` used by the backup script. Do not run CLI writes
+or extra application processes during the cold snapshot. The lock is advisory;
+it does not magically stop a separately launched writer that ignores it.
+
+## Backup and isolated restore verification
+
+Install `backup.sh` and `snapshot.py` together, owned by the deployment operator
+and not writable by the app. Requirements are Bash, Python 3.11+, `flock`,
+Docker Compose and standard GNU/Linux file tools. The scripts never execute
+Compose `down`, delete volumes, run Docker prune or stop any other project.
+
+```bash
+sudo bash /opt/an-RAG/infra/backup.sh
+sudo python3 /opt/an-RAG/infra/snapshot.py restore-check /opt/an-RAG/backups/<completed-backup-id>
+```
+
+The backup takes a project maintenance lock, validates paths and ownership
+marker, stops only an existing `an-rag/api` writer, archives **all data plus
+config, deployment parameters, TLS and private secrets**, and verifies every
+member hash. An EXIT/INT/TERM trap starts an app that was previously running,
+including after a partial stop or failed archive. An app previously stopped
+remains stopped. A failed restart is a critical nonzero result requiring manual
+attention. SIGKILL, host crash and power loss cannot run shell traps.
+
+Completed backups contain `snapshot.tar.gz`, `manifest.json`, and `SHA256SUMS`.
+Unfinished backups stay under `.partial-*`; they are never accepted for restore
+checks. Archive checksums detect accidental corruption, not a malicious actor
+who can rewrite the archive and checksums. Backups contain credentials and must
+remain root/operator-only; do not commit or serve them over HTTP.
+
+Restore checks extract only into a new private `.restore-check-*` directory
+inside this project's backups directory. They reject links, special files,
+unknown members and path traversal, verify archive hashes and the project
+marker, run SQLite integrity/foreign-key checks, and verify every content-addressed
+object and stored revision object reference. The source data remains unchanged.
+Successful and failed isolated copies are retained as private evidence and take
+disk space; remove only explicitly inspected copies during planned maintenance.
+This verifies files, databases and object recovery, **not** a production restore,
+application boot from restored data, model quality, or off-host backup coverage.
+
+## Rollback
+
+Hold the project maintenance lock, preserve the failed release evidence and
+set `RAG_IMAGE` back to the recorded previous image. Run the scoped Compose
+configuration check and `up -d --wait`, then verify loopback/public API and other
+projects' unchanged container IDs and endpoints. Image rollback is valid only
+when persisted schema/data remain compatible; otherwise test a backup in an
+isolated directory before planning a data restore. Never overwrite production
+data from the restore checker. First-deployment withdrawal disables only the
+new an-rag vhost, validates/reloads Nginx and stops only an-rag/api, retaining
+its data for inspection.

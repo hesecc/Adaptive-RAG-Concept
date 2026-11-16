@@ -136,6 +136,55 @@ class ChunkerTests(unittest.TestCase):
             with self.subTest(values=values), self.assertRaises(ValidationError):
                 ParentChildChunker(*values)
 
+    def test_fitting_structures_are_kept_whole_even_across_preferred_breaks(self):
+        structures = (
+            "<table><tr><td>型号</td><td>A01</td></tr>\n<tr><td>容量</td><td>500ml</td></tr></table>",
+            "$$\nAttention(Q,K,V) = softmax(QK^T / sqrt(d_k))V\n$$",
+            "\\[\nE = mc^2\n\\]",
+            "\\begin{align}\na &= b+c \\\\\nd &= e\n\\end{align}",
+            "```python\nx = 1\nprint(x)\n```",
+            "| 型号 | 容量 |\n| --- | --- |\n| A01 | 500ml |",
+        )
+        for structure in structures:
+            with self.subTest(structure=structure):
+                text = "前言。" * 12 + "\n" + structure + "\n" + "结尾。" * 10
+                req = request(text)
+                sections = TextCleaner().clean(StructuredParser().parse(req))
+                parents, children = ParentChildChunker(180, 100, 15).chunk(req, "rev", sections)
+                self.assertTrue(any(structure in parent.text for parent in parents))
+                self.assertTrue(any(structure in child.text for child in children))
+                for child in children:
+                    self.assertLessEqual(len(child.text), 100)
+                    if any(token in child.text for token in ("<table", "Attention(", "E =", "a &=", "x =", "| A01")):
+                        self.assertIn(structure, child.text)
+                        self.assertNotIn("structure_fragment", child.locator)
+
+    def test_oversized_structures_split_bounded_citable_and_explicit_fragments(self):
+        for structure in ("<table>" + "<tr><td>500ml</td></tr>\n" * 20 + "</table>",
+                          "$$\n" + "x+y+z+" * 50 + "\n$$", "```\n" + "print(1)\n" * 50 + "```"):
+            with self.subTest(structure=structure[:12]):
+                req = request(structure)
+                section = Section((), structure, "lines:1-10")
+                parents, children = ParentChildChunker(120, 50, 5).chunk(req, "rev", (section,))
+                self.assertTrue(all(len(item.text) <= 120 for item in parents))
+                self.assertTrue(all(len(item.text) <= 50 for item in children))
+                self.assertTrue(all("structure_fragment:" in item.locator for item in (*parents, *children)))
+                coverage = set()
+                for child in children:
+                    start, end = map(int, re.search(r"chars:(\d+)-(\d+)$", child.locator).groups())
+                    self.assertEqual(child.text, structure[start:end])
+                    coverage.update(range(start, end))
+                self.assertTrue({i for i, char in enumerate(structure) if not char.isspace()} <= coverage)
+
+    def test_code_literal_markup_and_unclosed_elements_are_not_falsely_complete(self):
+        content = "```html\n<table><tr><td>literal</td></tr></table>\n```\nOutside."
+        req = request(content)
+        parents, children = ParentChildChunker(120, 90, 0).chunk(req, "rev", (Section((), content, "lines:1-5"),))
+        self.assertTrue(any("```html" in child.text and "```\nOutside" in child.text for child in children))
+        for text in ("```\nunfinished", "<table><tr><td>unfinished"):
+            _, children = ParentChildChunker(120, 90, 0).chunk(request(text), "rev", (Section((), text, "lines:1-2"),))
+            self.assertIn("structure_fragment:", children[0].locator)
+
 
 class IngestionTests(unittest.TestCase):
     def setUp(self):

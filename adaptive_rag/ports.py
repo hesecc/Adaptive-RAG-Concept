@@ -70,6 +70,11 @@ class Verifier(Protocol):
     async def verify(self, draft: Draft, evidence: Sequence[Evidence]) -> Verification: ...
 
 
+class AnswerVerifier(Verifier, Protocol):
+    """Optional semantic review; original questions are required to check omissions."""
+    async def evaluate(self, plan: Plan, draft: Draft, evidence: Sequence[Evidence]) -> Verification: ...
+
+
 class Embedder(Protocol):
     """Future cloud adapter. Document/query encoders must share model revision."""
     async def embed(self, texts: Sequence[str]) -> tuple[tuple[float, ...], ...]: ...

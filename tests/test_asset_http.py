@@ -134,6 +134,18 @@ class AssetHTTPTests(unittest.TestCase):
                       {"question": "RAG", "subject_id": "ragadmin"}):
             self.assertIn(self.admin.post("/assets/search", json=query).status_code, (400, 422))
 
+    def test_deleted_asset_id_can_be_uploaded_again(self):
+        asset = self.create()
+        self.assertEqual(self.admin.delete("/assets/rag-flow").status_code, 204)
+        again = self.admin.post("/assets", json=self.body | {"title": "新版流程图"})
+        self.assertEqual(again.status_code, 201, again.text)
+        self.assertNotEqual(again.json()["revision_id"], asset["revision_id"])
+        self.assertEqual(self.admin.get("/assets/rag-flow").json()["title"], "新版流程图")
+        # A live asset_id still conflicts, and the message names the supported way forward.
+        conflict = self.admin.post("/assets", json=self.body | {"title": "又一版"})
+        self.assertEqual(conflict.status_code, 409, conflict.text)
+        self.assertIn("expected_revision", conflict.text)
+
     def test_index_failure_and_search_failure_remain_replayable_and_sanitized(self):
         class BrokenEmbedder:
             async def embed(self, texts):

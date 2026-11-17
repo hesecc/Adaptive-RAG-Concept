@@ -42,7 +42,7 @@ uv run adaptive-rag serve
 | GET | `/assets`、`/assets/{id}` | 列表与当前元数据 |
 | POST | `/assets` | 管理员上传，JSON 中传 Base64 文件 |
 | PATCH | `/assets/{id}` | 管理员修改，必须传 `expected_revision` |
-| DELETE | `/assets/{id}?expected_revision=...` | 管理员删除，建议传当前版本以检测并发修改 |
+| DELETE | `/assets/{id}?expected_revision=...` | 管理员删除，建议传当前版本以检测并发修改；删除后 `asset_id` 可再次用于上传 |
 | GET | `/assets/{id}/content`、`/assets/{id}/thumbnail` | 登录后按当前权限读取原图或缩略图 |
 | POST | `/assets/search` | `{question, top_k}`，返回结果与 trace |
 | GET | `/assets/traces/{id}` | 当前查询身份回放记录 |
@@ -76,6 +76,8 @@ worker 与 API 必须使用相同的数据目录、存储选择、租户和 Embe
 | 账号与登录会话 | SQLite | 本轮保持 SQLite | 独立持久化文件 |
 
 配置选择不会自动迁移现有数据。图片元数据与任务在同一数据库事务内写入；对象存储和向量索引属于事务外效果。上传中断可能留下未被引用的对象，但不会发布缺少对象的资产。删除先撤销可见性，再通过任务清理向量；对象仍保留，当前没有自动物理清理策略。
+
+**删除后复用 `asset_id`：** 已删除图片的 `asset_id` 可以再次上传，得到全新的版本并重新登记索引；仍存在的 `asset_id` 继续返回 409，提示用 `expected_revision` 修改。向量清理任务按 `asset_id` 删除全部向量，所以重新上传会先取消尚未执行（待处理或已失败）的清理任务，避免它事后抹掉新图的向量；留下的旧版本向量在回查时因版本不符被忽略，并在新图再次删除时一并清理。清理任务正在执行时重新上传返回 409，稍候重试即可。
 
 检索先按租户及 Embedding 配置查询派生向量，再核验当前资产版本、状态和权限，不能把向量命中本身作为授权依据。旧向量或外部服务延迟不能让已删除、旧版本或越权图片出现在有效结果中。
 

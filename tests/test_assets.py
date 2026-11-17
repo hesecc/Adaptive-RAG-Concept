@@ -3,6 +3,7 @@ import io
 import os
 from pathlib import Path
 import tempfile
+from time import time
 import unittest
 from uuid import uuid4
 
@@ -12,7 +13,7 @@ except ImportError:
     Image = None
 
 from adaptive_rag.assets import AssetService
-from adaptive_rag.domain import AccessContext, CapabilityError, ConflictError, NotFoundError, ValidationError
+from adaptive_rag.domain import AccessContext, CapabilityError, ConflictError, NotFoundError, ValidationError, stable_id
 from adaptive_rag.storage import FileObjectStore
 from adaptive_rag.vector_store import SQLiteVectorIndex
 
@@ -325,6 +326,76 @@ class AssetTests(unittest.TestCase):
         self.assertEqual(len(self.index.search("team", service.profile, (1.0, 0.1), 100)), 1)
         self.assertEqual(asyncio.run(service.process_pending("team"))["processed"], 1)
         self.assertEqual(self.index.search("team", service.profile, (1.0, 0.1), 100), ())
+
+    def test_deleted_asset_id_can_be_created_again(self):
+        first = self.create()
+        self.service.delete(self.access, "diagram", first["revision_id"])
+        second = self.service.create(self.access, picture("blue"), asset_id="diagram",
+                                     title="新图", description="第二张图")
+        self.assertNotEqual(second["revision_id"], first["revision_id"])
+        self.assertEqual(self.service.get(self.access, "diagram")["title"], "新图")
+        self.assertEqual(self.service.content(self.access, "diagram"), (picture("blue"), "image/png"))
+        self.assertEqual([item["asset_id"] for item in self.service.list(self.access)], ["diagram"])
+        # A live asset_id keeps conflicting, and the message names the supported way forward.
+        with self.assertRaisesRegex(ConflictError, "expected_revision"):
+            self.create()
+
+    def test_reusing_asset_id_cancels_pending_cleanup_of_the_old_image(self):
+        service = AssetService(self.root, self.objects, self.index, embedder=TextEmbedder())
+        first = self.create(service)
+        asyncio.run(service.process_pending("team"))
+        service.delete(self.access, "diagram", first["revision_id"])  # the worker has not run, so cleanup is pending
+        second = service.create(self.access, picture("blue"), asset_id="diagram",
+                                title="RAG 新图", description="流程说明")
+        result = asyncio.run(service.process_pending("team"))
+        # Only the new image is indexed: a stale cleanup would delete every vector of the asset_id.
+        self.assertEqual((result["ready"], result["deleted"]), (1, 0))
+        hits = asyncio.run(service.search(self.access, "流程"))["hits"]
+        self.assertEqual([hit["asset"]["revision_id"] for hit in hits], [second["revision_id"]])
+
+    def test_reusing_asset_id_with_identical_content_is_indexed_again(self):
+        embedder = TextEmbedder()
+        service = AssetService(self.root, self.objects, self.index, embedder=embedder)
+        first = self.create(service)
+        asyncio.run(service.process_pending("team"))
+        service.delete(self.access, "diagram")
+        asyncio.run(service.process_pending("team"))
+        self.assertEqual(self.index.search("team", service.profile, (1.0, 0.1), 100), ())
+        again = self.create(service)
+        self.assertEqual(again["revision_id"], first["revision_id"])
+        self.assertEqual(again["indexing_status"], "pending")
+        self.assertEqual(asyncio.run(service.process_pending("team"))["ready"], 1)
+        self.assertEqual(embedder.calls, 1, "cached vectors are reused, no second embedding request")
+        self.assertEqual(len(asyncio.run(service.search(self.access, "流程"))["hits"]), 1)
+
+    def test_deleting_a_reused_asset_id_schedules_cleanup_again(self):
+        service = AssetService(self.root, self.objects, self.index, embedder=TextEmbedder())
+        self.create(service)
+        asyncio.run(service.process_pending("team"))
+        service.delete(self.access, "diagram")
+        asyncio.run(service.process_pending("team"))
+        again = service.create(self.access, picture("blue"), asset_id="diagram",
+                               title="RAG 新图", description="流程说明")
+        asyncio.run(service.process_pending("team"))
+        self.assertEqual(len(self.index.search("team", service.profile, (1.0, 0.1), 100)), 1)
+        service.delete(self.access, "diagram", again["revision_id"])
+        self.assertEqual(asyncio.run(service.process_pending("team"))["deleted"], 1)
+        self.assertEqual(self.index.search("team", service.profile, (1.0, 0.1), 100), ())
+
+    def test_reusing_asset_id_waits_while_its_cleanup_is_running(self):
+        self.create()
+        self.service.delete(self.access, "diagram")
+        cleanup = stable_id("image-delete", "team", "diagram")
+        with self.service.db.transaction() as connection:
+            connection.execute("UPDATE image_index_jobs SET state='running',owner='worker',started_at=? WHERE tenant_id=? AND job_id=?",
+                               (time(), "team", cleanup))
+        with self.assertRaisesRegex(ConflictError, "cleaned up"):
+            self.create()
+        with self.assertRaises(NotFoundError):
+            self.service.get(self.access, "diagram")
+        with self.service.db.transaction() as connection:
+            connection.execute("UPDATE image_index_jobs SET state='done',owner=NULL WHERE tenant_id=? AND job_id=?", ("team", cleanup))
+        self.assertEqual(self.create()["asset_id"], "diagram")
 
 
 @unittest.skipUnless(os.environ.get("RAG_TEST_POSTGRES_DSN") and Image is not None,

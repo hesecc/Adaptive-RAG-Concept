@@ -151,13 +151,33 @@ class AssetService:
                  **image, **metadata}
         with self.db.transaction(access.tenant_id + ":" + asset_id) as connection:
             current = self.db.current(connection, access.tenant_id, asset_id)
-            if current:
-                if not current[1] and current[0]["revision_id"] == revision and _allowed(current[0], access):
+            deleted = bool(current and current[1])
+            if current and not deleted:
+                if current[0]["revision_id"] == revision and _allowed(current[0], access):
                     return self._public(current[0])
                 raise ConflictError("asset_id already exists; update metadata using expected_revision")
+            if deleted:
+                self._free_asset_id(connection, access.tenant_id, asset_id)
+            # A reused asset_id may meet an index job of the same revision that is already done or
+            # cancelled; requeue it so the new asset is indexed again (cached vectors are reused).
             self.db.write_asset(connection, asset)
-            self.db.enqueue(connection, asset, self.profile)
+            self.db.enqueue(connection, asset, self.profile, requeue=deleted)
         return self._public(asset)
+
+    @staticmethod
+    def _free_asset_id(connection, tenant_id, asset_id):
+        """Make a deleted asset_id reusable.
+
+        Delete cleanup removes every vector stored under the asset_id. A cleanup that has not
+        run yet must therefore be cancelled, or it would later erase the new image's vectors.
+        Vectors of older revisions that stay behind are ignored when hits are hydrated and are
+        removed by the cleanup scheduled when the new image is deleted.
+        """
+        job_id = stable_id("image-delete", tenant_id, asset_id)
+        connection.execute("UPDATE image_index_jobs SET state='cancelled',owner=NULL WHERE tenant_id=? AND job_id=? AND state IN ('pending','failed')", (tenant_id, job_id))
+        row = connection.execute("SELECT state FROM image_index_jobs WHERE tenant_id=? AND job_id=?", (tenant_id, job_id)).fetchone()
+        if row and row["state"] == "running":
+            raise ConflictError("the previous image with this asset_id is still being cleaned up; retry in a moment")
 
     def list(self, access):
         with self.db.transaction() as connection:
@@ -200,7 +220,9 @@ class AssetService:
             # references until a future object retention policy removes them.
             connection.execute("UPDATE image_index_jobs SET state='cancelled',owner=NULL WHERE tenant_id=? AND asset_id=? AND state IN ('pending','failed','running')", (access.tenant_id, asset_id))
             cleanup = {"kind": "delete", "asset_id": asset_id, "revision_id": asset["revision_id"], "profile": self.profile, "vectors": None, "stages": []}
-            connection.execute("INSERT INTO image_index_jobs(tenant_id,job_id,asset_id,revision_id,state,body) VALUES(?,?,?,?,?,?) ON CONFLICT(tenant_id,job_id) DO NOTHING", (access.tenant_id, stable_id("image-delete", access.tenant_id, asset_id), asset_id, asset["revision_id"], "pending", encode(cleanup)))
+            # The job id is fixed per asset_id. A row left by an earlier incarnation of a reused
+            # asset_id (done, failed or cancelled) must be reset, or this delete would never clean up.
+            connection.execute("INSERT INTO image_index_jobs(tenant_id,job_id,asset_id,revision_id,state,body) VALUES(?,?,?,?,?,?) ON CONFLICT(tenant_id,job_id) DO UPDATE SET state='pending',owner=NULL,revision_id=excluded.revision_id,body=excluded.body", (access.tenant_id, stable_id("image-delete", access.tenant_id, asset_id), asset_id, asset["revision_id"], "pending", encode(cleanup)))
 
     def content(self, access, asset_id, *, thumbnail=False):
         with self.db.transaction() as connection:
@@ -336,7 +358,11 @@ class AssetService:
                 return None
             owner = uuid4().hex
             job = json.loads(row["body"])
-            connection.execute("UPDATE image_index_jobs SET state='running',owner=?,started_at=? WHERE tenant_id=? AND job_id=?", (owner, time(), tenant_id, row["job_id"]))
+            # Claim only a job that is still pending: a delete or an asset_id reuse may have
+            # cancelled it since the candidates were read (row locks, not this transaction, order them on PostgreSQL).
+            claimed = connection.execute("UPDATE image_index_jobs SET state='running',owner=?,started_at=? WHERE tenant_id=? AND job_id=? AND state='pending'", (owner, time(), tenant_id, row["job_id"]))
+            if claimed.rowcount != 1:
+                return None
             current = self.db.current(connection, tenant_id, job["asset_id"])
             asset = current[0] if (current and not current[1]
                                   and current[0]["revision_id"] == job["revision_id"]

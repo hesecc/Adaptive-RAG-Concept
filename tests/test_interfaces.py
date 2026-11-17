@@ -42,6 +42,7 @@ class InterfaceTests(unittest.TestCase):
         response = self.client.post("/documents", headers=self.headers(), json={
             "document_id": "policy", "version": "v1",
             "content": "# Returns\nThe amber warranty policy provides twelve months of coverage.",
+            "data_domains": ["public"],
         })
         self.assertEqual(response.status_code, 201, response.text)
         job = response.json()

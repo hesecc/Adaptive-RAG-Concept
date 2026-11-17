@@ -5,6 +5,11 @@ Nginx terminates HTTPS; no new Caddy container is installed for this topology.
 Check active and reserved ports, available memory/CPU/disk, host and cloud
 firewalls, Compose version and certificate trust before activating them.
 
+The optional PostgreSQL/Milvus/S3 topology is documented separately in
+[STORAGE.md](STORAGE.md). It uses a new Compose project and is not an overlay
+or an automatic migration of this currently deployed topology. The backup
+procedure below does not cover remote databases, object storage or its worker.
+
 ## Files and private server state
 
 | Repository artifact | Installed server path |

@@ -11,8 +11,12 @@ dependencies = [
   "fastapi>=0.115,<1",
   "httpx>=0.28,<1",
   "pypdf>=7.1,<8",
+  "Pillow>=13.0,<14",
   "uvicorn>=0.30,<1",
 ]
+
+[project.optional-dependencies]
+remote = ["psycopg[binary]>=3.3,<4", "boto3>=1.44,<2"]
 
 [project.scripts]
 adaptive-rag = "adaptive_rag.cli:main"

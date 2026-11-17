@@ -93,6 +93,27 @@ def default_registry() -> PluginRegistry:
     for role, name in DEFAULT_PLUGINS.items():
         registry.register(role, name, factories.get(role, lambda s: None), enabled=role not in OPTIONAL)
 
+    def postgres_store(settings):
+        from .infrastructure import infrastructure
+        from .postgres import PostgresKnowledgeStore
+        return PostgresKnowledgeStore(infrastructure(settings).postgres_dsn)
+
+    def postgres_trace(settings):
+        from .infrastructure import infrastructure
+        from .postgres import PostgresTraceSink
+        return PostgresTraceSink(infrastructure(settings).postgres_dsn)
+
+    def s3_objects(settings):
+        from .infrastructure import infrastructure
+        from .remote import S3ObjectStore
+        config = infrastructure(settings)
+        return S3ObjectStore(config.s3_endpoint, config.s3_access_key, config.s3_secret_key,
+                             config.s3_bucket, prefix=config.s3_prefix, region=config.s3_region)
+
+    registry.register("store", "postgres", postgres_store, uses_network=True)
+    registry.register("trace", "postgres", postgres_trace, uses_network=True)
+    registry.register("objects", "s3", s3_objects, uses_network=True)
+
     def cloud_transport(settings):
         from .cloud import CloudSettings, CloudTransport
         if not isinstance(settings.cloud, CloudSettings):

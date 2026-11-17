@@ -25,6 +25,14 @@ class RagApplication:
         self.ingestion = IngestionService(self.store, self.objects, self.components["parser"],
                                           self.components["cleaner"], self.components["chunker"], fingerprint)
         self.pipeline = QueryPipeline(settings, self.components, self.descriptions)
+        self._assets = None
+
+    @property
+    def assets(self):
+        if self._assets is None:
+            from .infrastructure import build_assets
+            self._assets = build_assets(self.settings, self.objects)
+        return self._assets
 
     def ingest(self, request):
         return self.ingestion.ingest(request)
@@ -58,8 +66,8 @@ class RagApplication:
     def rollback(self, tenant_id, generation, expected_generation):
         return self.store.rollback(tenant_id, generation, expected_generation)
 
-    def set_access(self, tenant_id, document_id, allowed_subjects, revoked=False):
-        return self.store.set_access(tenant_id, document_id, allowed_subjects, revoked)
+    def set_access(self, tenant_id, document_id, allowed_subjects=None, revoked=None, data_domains=None):
+        return self.store.set_access(tenant_id, document_id, allowed_subjects, revoked, data_domains)
 
     async def query(self, request, observer=None):
         return await self.pipeline.run(request, self.capabilities(), observer)

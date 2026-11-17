@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import hmac
+import json
 from pathlib import Path
 import re
 import secrets
@@ -13,6 +14,7 @@ import time
 import uuid
 
 from .config import Principal
+from .data_access import normalize_data_domains
 from .domain import ConflictError, ForbiddenError, NotFoundError, RagError, ValidationError, identifier
 
 
@@ -36,7 +38,9 @@ class Account:
 
     def public(self) -> dict:
         return {"username": self.username, "admin": self.principal.admin,
-                "created_at": self.created_at}
+                "created_at": self.created_at,
+                "data_domains": (None if self.principal.data_domains is None
+                                 else list(self.principal.data_domains))}
 
 
 def _username(value: str) -> str:
@@ -62,6 +66,12 @@ def _session_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def _account_domains(values: tuple[str, ...]) -> tuple[str, ...]:
+    """Ordinary accounts always retain access to explicitly public data."""
+    domains = normalize_data_domains(values)
+    return domains if "public" in domains else normalize_data_domains(("public", *domains))
+
+
 class AccountStore:
     """Own account/session transactions; deleted users never reuse subject IDs."""
 
@@ -76,7 +86,8 @@ class AccountStore:
                     account_id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE,
                     tenant_id TEXT NOT NULL, admin INTEGER NOT NULL CHECK(admin IN (0,1)),
                     password_salt TEXT NOT NULL, password_hash TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    data_domains TEXT NOT NULL DEFAULT '["public"]'
                 );
                 CREATE TABLE IF NOT EXISTS sessions (
                     session_hash TEXT PRIMARY KEY, account_id TEXT NOT NULL,
@@ -85,6 +96,11 @@ class AccountStore:
                 );
             """)
             connection.execute("BEGIN IMMEDIATE")
+            # Hold the same startup write lock for schema inspection and ALTER
+            # so concurrent API/worker startups cannot race the migration.
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(accounts)")}
+            if "data_domains" not in columns:
+                connection.execute("ALTER TABLE accounts ADD COLUMN data_domains TEXT NOT NULL DEFAULT '[\"public\"]'")
             # The fixed administrator is seeded once. Concurrent startup uses
             # the same unique username rather than creating multiple admins.
             existing = connection.execute("SELECT tenant_id FROM accounts WHERE username=?", (ADMIN_USERNAME,)).fetchone()
@@ -106,15 +122,27 @@ class AccountStore:
 
     @staticmethod
     def _account(row: sqlite3.Row) -> Account:
-        return Account(row["username"], Principal(row["tenant_id"], row["account_id"], admin=bool(row["admin"])), row["created_at"])
+        admin = bool(row["admin"])
+        domains = None
+        if not admin:
+            try:
+                stored = json.loads(row["data_domains"])
+                if not isinstance(stored, list):
+                    raise ValueError
+                domains = _account_domains(tuple(stored))
+            except (ValueError, TypeError, ValidationError):
+                raise ValidationError("账号数据权限配置无效，请联系管理员。") from None
+        return Account(row["username"], Principal(row["tenant_id"], row["account_id"],
+                       admin=admin, data_domains=domains), row["created_at"])
 
-    def _insert(self, connection, username, password, *, admin=False):
+    def _insert(self, connection, username, password, *, admin=False, data_domains=("public",)):
         salt = secrets.token_bytes(16)
         created = datetime.now(timezone.utc).isoformat()
         account_id = "user-" + uuid.uuid4().hex
         connection.execute(
-            "INSERT OR IGNORE INTO accounts VALUES (?,?,?,?,?,?,?)",
-            (account_id, username, self.tenant_id, int(admin), salt.hex(), _password_hash(password, salt), created),
+            "INSERT OR IGNORE INTO accounts(account_id,username,tenant_id,admin,password_salt,password_hash,created_at,data_domains) VALUES (?,?,?,?,?,?,?,?)",
+            (account_id, username, self.tenant_id, int(admin), salt.hex(), _password_hash(password, salt), created,
+             json.dumps(data_domains)),
         )
         return connection.execute("SELECT * FROM accounts WHERE username=?", (username,)).fetchone()
 
@@ -161,14 +189,35 @@ class AccountStore:
             rows = connection.execute("SELECT * FROM accounts ORDER BY admin DESC, username").fetchall()
             return [self._account(row).public() for row in rows]
 
-    def create(self, principal: Principal, username: str, password: str) -> dict:
+    def create(self, principal: Principal, username: str, password: str,
+               data_domains: tuple[str, ...] = ("public",)) -> dict:
         self._manage(principal)
         username, password = _username(username), _password(password)
+        domains = _account_domains(data_domains)
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             if connection.execute("SELECT 1 FROM accounts WHERE username=?", (username,)).fetchone():
                 raise ConflictError("该账号已存在。")
-            return self._account(self._insert(connection, username, password)).public()
+            return self._account(self._insert(connection, username, password, data_domains=domains)).public()
+
+    def set_domains(self, principal: Principal, username: str,
+                    data_domains: tuple[str, ...]) -> dict:
+        """Update live grants; existing sessions read them on their next request."""
+        self._manage(principal)
+        username = _username(username)
+        if username == ADMIN_USERNAME:
+            raise ConflictError("固定管理员的数据权限不能修改。")
+        domains = _account_domains(data_domains)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            result = connection.execute(
+                "UPDATE accounts SET data_domains=? WHERE username=? AND admin=0",
+                (json.dumps(domains), username),
+            )
+            if not result.rowcount:
+                raise NotFoundError("普通账号不存在。")
+            row = connection.execute("SELECT * FROM accounts WHERE username=?", (username,)).fetchone()
+            return self._account(row).public()
 
     def delete(self, principal: Principal, username: str) -> None:
         self._manage(principal)

@@ -1,7 +1,9 @@
 """Authenticated local HTTP adapter over the shared application."""
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import asyncio
+import base64
+import binascii
 from contextlib import suppress
 import hmac
 import json
@@ -34,6 +36,7 @@ class DocumentInput(Input):
     scope: str = "store"
     sku_ids: list[str] = Field(default_factory=list, max_length=1000)
     allowed_subjects: list[str] = Field(default_factory=list, max_length=1000)
+    data_domains: list[str] = Field(default_factory=list, max_length=6)
     language: str = "zh"
 
 
@@ -62,8 +65,9 @@ class RollbackInput(Input):
 
 class AccessInput(Input):
     document_id: str
-    allowed_subjects: list[str] = Field(default_factory=list, max_length=1000)
-    revoked: bool = False
+    allowed_subjects: list[str] | None = Field(default=None, max_length=1000)
+    revoked: bool | None = None
+    data_domains: list[str] | None = Field(default=None, max_length=6)
 
 
 class LoginInput(Input):
@@ -74,6 +78,43 @@ class LoginInput(Input):
 class AccountInput(Input):
     username: str = Field(min_length=3, max_length=32)
     password: str = Field(min_length=6, max_length=128)
+    data_domains: list[str] = Field(default_factory=lambda: ["public"], max_length=6)
+
+
+class AccountDomainsInput(Input):
+    data_domains: list[str] = Field(max_length=6)
+
+
+class AssetInput(Input):
+    asset_id: str = Field(min_length=1, max_length=128)
+    content_base64: str = Field(min_length=1, max_length=14_000_000)
+    title: str = Field(min_length=1, max_length=256)
+    description: str = Field(default="", max_length=16000)
+    ocr_text: str = Field(default="", max_length=32000)
+    tags: list[str] = Field(default_factory=list, max_length=50)
+    allowed_subjects: list[str] = Field(default_factory=list, max_length=1000)
+    data_domains: list[str] = Field(default_factory=list, max_length=6)
+    source_document_id: str | None = None
+    source_page: int | None = Field(default=None, ge=1)
+
+
+class AssetUpdate(Input):
+    expected_revision: str
+    title: str = Field(min_length=1, max_length=256)
+    description: str = Field(default="", max_length=16000)
+    ocr_text: str = Field(default="", max_length=32000)
+    tags: list[str] = Field(default_factory=list, max_length=50)
+    allowed_subjects: list[str] = Field(default_factory=list, max_length=1000)
+    data_domains: list[str] | None = Field(default=None, max_length=6)
+
+
+class AssetSearch(Input):
+    question: str = Field(min_length=1, max_length=4000)
+    top_k: int = Field(default=5, ge=1, le=20)
+
+
+class AssetIndex(Input):
+    limit: int = Field(default=10, ge=1, le=100)
 
 
 def create_api(settings: Settings | None = None) -> FastAPI:
@@ -106,6 +147,14 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     def workbench():
         return FileResponse(static / "index.html")
 
+    @api.get("/images", include_in_schema=False)
+    def image_workbench():
+        return FileResponse(static / "images.html")
+
+    @api.get("/knowledge", include_in_schema=False)
+    def knowledge_workbench():
+        return FileResponse(static / "knowledge.html")
+
     def authenticate(request: Request) -> Principal:
         header = request.headers.get("authorization", "")
         scheme, separator, token = header.partition(" ")
@@ -122,6 +171,10 @@ def create_api(settings: Settings | None = None) -> FastAPI:
                 request.state.username = account.username
         if found is None:
             raise AuthenticationError("请先登录工作台。")
+        if not found.admin and found.data_domains is None:
+            # Legacy Bearer readers receive the same limited default as
+            # browser accounts; an omitted scope is never an HTTP bypass.
+            found = replace(found, data_domains=("public",))
         return found
 
     def administrator(principal: Annotated[Principal, Depends(authenticate)]) -> Principal:
@@ -132,6 +185,13 @@ def create_api(settings: Settings | None = None) -> FastAPI:
 
     User = Annotated[Principal, Depends(authenticate)]
     Admin = Annotated[Principal, Depends(administrator)]
+
+    def accessible_trace(principal: Principal, trace_id: str):
+        value = application.get_accessible_trace(principal.access, trace_id)
+        if not principal.admin and value.get("subject_id") != principal.subject_id:
+            from .domain import NotFoundError
+            raise NotFoundError("trace not found")
+        return value
 
     @api.exception_handler(RagError)
     async def rag_error(_request: Request, exc: RagError):
@@ -165,14 +225,22 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     def console_session(request: Request, principal: User):
         return {"tenant_id": principal.tenant_id, "subject_id": principal.subject_id,
                 "username": request.state.username, "admin": principal.admin,
+                "data_domains": principal.data_domains,
                 "capabilities": application.capabilities()}
+
+    @api.get("/access/domains")
+    def data_domains(principal: User):
+        from .data_access import DATA_DOMAIN_LABELS
+        return {"domains": [{"id": key, "label": label} for key, label in DATA_DOMAIN_LABELS.items()],
+                "data_domains": principal.data_domains}
 
     @api.post("/auth/login")
     def login(body: LoginInput, request: Request):
         token, account = accounts.login(body.username, body.password)
         principal = account.principal
         response = JSONResponse(content={"tenant_id": principal.tenant_id, "subject_id": principal.subject_id,
-            "username": account.username, "admin": principal.admin, "capabilities": application.capabilities()})
+            "username": account.username, "admin": principal.admin, "data_domains": principal.data_domains,
+            "capabilities": application.capabilities()})
         response.set_cookie(COOKIE_NAME, token, max_age=SESSION_SECONDS, httponly=True,
                             secure=request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https",
                             samesite="lax", path="/")
@@ -191,7 +259,11 @@ def create_api(settings: Settings | None = None) -> FastAPI:
 
     @api.post("/admin/users", status_code=201)
     def create_user(body: AccountInput, principal: Admin):
-        return accounts.create(principal, body.username, body.password)
+        return accounts.create(principal, body.username, body.password, tuple(body.data_domains))
+
+    @api.patch("/admin/users/{username}/domains")
+    def update_user_domains(username: str, body: AccountDomainsInput, principal: Admin):
+        return accounts.set_domains(principal, username, tuple(body.data_domains))
 
     @api.delete("/admin/users/{username}", status_code=204)
     def delete_user(username: str, principal: Admin):
@@ -203,20 +275,31 @@ def create_api(settings: Settings | None = None) -> FastAPI:
         values = body.model_dump()
         values["sku_ids"] = tuple(values["sku_ids"])
         values["allowed_subjects"] = tuple(values["allowed_subjects"])
+        values["data_domains"] = tuple(values["data_domains"])
         return asdict(application.ingest(IngestRequest(tenant_id=principal.tenant_id, **values)))
+
+    @api.get("/documents")
+    def documents(principal: Admin):
+        snapshot = application.store.open_snapshot(principal.tenant_id)
+        return {"documents": application.store.list_documents(principal.tenant_id),
+                "generation": snapshot.generation if snapshot is not None else None}
 
     @api.post("/publish")
     def publish(body: PublishInput, principal: Admin):
         return asdict(application.publish(principal.tenant_id, body.job_id, body.expected_generation))
 
     @api.post("/query")
-    async def query(body: QueryInput, principal: User):
+    async def query(body: QueryInput, request: Request, principal: User):
         values = body.model_dump()
         values["history"] = tuple(values["history"])
-        return asdict(await application.query(QueryRequest(access=principal.access, **values)))
+        result = await application.query(QueryRequest(access=principal.access, **values))
+        # Account grants can change during remote/model work. Re-authenticate
+        # and validate every trace source before returning any answer text.
+        accessible_trace(authenticate(request), result.trace_id)
+        return asdict(result)
 
     @api.post("/query/stream")
-    async def query_stream(body: QueryInput, principal: User):
+    async def query_stream(body: QueryInput, request: Request, principal: User):
         values = body.model_dump()
         values["history"] = tuple(values["history"])
         query_request = QueryRequest(access=principal.access, **values)
@@ -236,8 +319,8 @@ def create_api(settings: Settings | None = None) -> FastAPI:
             async def run_query():
                 try:
                     value = await application.query(query_request, observer=observe)
-                    trace = await asyncio.to_thread(application.get_accessible_trace,
-                                                    principal.access, value.trace_id)
+                    current = await asyncio.to_thread(authenticate, request)
+                    trace = await asyncio.to_thread(accessible_trace, current, value.trace_id)
                     queue.put_nowait(("result", {"result": asdict(value), "trace": trace}))
                 except asyncio.CancelledError:
                     raise
@@ -254,8 +337,8 @@ def create_api(settings: Settings | None = None) -> FastAPI:
                     # returning them, exactly as for a successful terminal.
                     if trace_id:
                         try:
-                            value["trace"] = await asyncio.to_thread(
-                                application.get_accessible_trace, principal.access, trace_id)
+                            current = await asyncio.to_thread(authenticate, request)
+                            value["trace"] = await asyncio.to_thread(accessible_trace, current, trace_id)
                         except Exception:
                             pass
                     queue.put_nowait(("error", value))
@@ -289,8 +372,14 @@ def create_api(settings: Settings | None = None) -> FastAPI:
         return asdict(application.rollback(principal.tenant_id, body.generation, body.expected_generation))
 
     @api.post("/access")
+    @api.post("/documents/access")
     def access(body: AccessInput, principal: Admin):
-        application.set_access(principal.tenant_id, body.document_id, tuple(body.allowed_subjects), body.revoked)
+        from .domain import ValidationError
+        if body.allowed_subjects is None and body.revoked is None and body.data_domains is None:
+            raise ValidationError("请选择要修改的资料权限。")
+        application.set_access(principal.tenant_id, body.document_id,
+            tuple(body.allowed_subjects) if body.allowed_subjects is not None else None,
+            body.revoked, tuple(body.data_domains) if body.data_domains is not None else None)
         return {"status": "updated"}
 
     @api.get("/jobs/{job_id}")
@@ -299,10 +388,82 @@ def create_api(settings: Settings | None = None) -> FastAPI:
 
     @api.get("/traces/{trace_id}")
     def trace(trace_id: str, principal: User):
-        return application.get_accessible_trace(principal.access, trace_id)
+        return accessible_trace(principal, trace_id)
 
     @api.get("/evidence/{generation}/{evidence_id}")
     def evidence(generation: str, evidence_id: str, principal: User):
         return asdict(application.get_evidence(principal.access, generation, evidence_id))
+
+    def asset_view(value):
+        return value | {"content_url": f"/assets/{value['asset_id']}/content"}
+
+    @api.get("/assets")
+    def list_assets(principal: User):
+        return {"assets": [asset_view(value) for value in application.assets.list(principal.access)]}
+
+    @api.post("/assets", status_code=201)
+    def create_asset(body: AssetInput, principal: Admin):
+        from .domain import ValidationError
+        try:
+            content = base64.b64decode(body.content_base64, validate=True)
+        except (ValueError, binascii.Error):
+            raise ValidationError("图片编码无效，请重新选择图片。") from None
+        values = body.model_dump(exclude={"content_base64"})
+        values["tags"] = tuple(values["tags"])
+        values["allowed_subjects"] = tuple(values["allowed_subjects"])
+        values["data_domains"] = tuple(values["data_domains"])
+        return asset_view(application.assets.create(principal.access, content, **values))
+
+    @api.post("/assets/search")
+    async def search_assets(body: AssetSearch, request: Request, principal: User):
+        result = await application.assets.search(principal.access, body.question, body.top_k)
+        current = await asyncio.to_thread(authenticate, request)
+        result = await asyncio.to_thread(application.assets.get_trace, current.access, result["trace_id"])
+        result["hits"] = [hit | {"asset": asset_view(hit["asset"])} for hit in result.get("hits", ())]
+        return result
+
+    @api.post("/assets/index")
+    async def index_assets(body: AssetIndex, principal: Admin):
+        return await application.assets.process_pending(principal.tenant_id, body.limit)
+
+    @api.get("/assets/traces/{trace_id}")
+    def asset_trace(trace_id: str, principal: User):
+        return application.assets.get_trace(principal.access, trace_id)
+
+    @api.get("/assets/{asset_id}/content")
+    def asset_content(asset_id: str, request: Request, principal: User):
+        content, media_type = application.assets.content(principal.access, asset_id)
+        application.assets.get(authenticate(request).access, asset_id)
+        return Response(content=content, media_type=media_type,
+                        headers={"Content-Disposition": "inline", "Cache-Control": "private, no-store"})
+
+    @api.get("/assets/{asset_id}/thumbnail")
+    def asset_thumbnail(asset_id: str, request: Request, principal: User):
+        content, media_type = application.assets.content(principal.access, asset_id, thumbnail=True)
+        application.assets.get(authenticate(request).access, asset_id)
+        return Response(content=content, media_type=media_type,
+                        headers={"Content-Disposition": "inline", "Cache-Control": "private, no-store"})
+
+    @api.post("/assets/{asset_id}/reindex")
+    def reindex_asset(asset_id: str, principal: Admin):
+        return asset_view(application.assets.retry(principal.access, asset_id))
+
+    @api.get("/assets/{asset_id}")
+    def get_asset(asset_id: str, principal: User):
+        return asset_view(application.assets.get(principal.access, asset_id))
+
+    @api.patch("/assets/{asset_id}")
+    def update_asset(asset_id: str, body: AssetUpdate, principal: Admin):
+        values = body.model_dump()
+        values["tags"] = tuple(values["tags"])
+        values["allowed_subjects"] = tuple(values["allowed_subjects"])
+        if values["data_domains"] is not None:
+            values["data_domains"] = tuple(values["data_domains"])
+        return asset_view(application.assets.update(principal.access, asset_id, **values))
+
+    @api.delete("/assets/{asset_id}", status_code=204)
+    def delete_asset(asset_id: str, principal: Admin, expected_revision: str | None = None):
+        application.assets.delete(principal.access, asset_id, expected_revision)
+        return Response(status_code=204)
 
     return api

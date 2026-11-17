@@ -236,7 +236,7 @@ class DeploymentTemplateTests(unittest.TestCase):
     def test_independent_tls_rate_limits_and_no_cookie_overwrite(self):
         nginx = (DEPLOY / "nginx.server.conf").read_text()
         for expected in ("listen 18444 ssl", "127.0.0.1:14175", "/opt/an-RAG/tls/server.key",
-                         "limit_req zone=an_rag_requests", "client_max_body_size 12m",
+                         "limit_req zone=an_rag_requests", "client_max_body_size 16m",
                          "proxy_set_header Authorization $http_authorization"):
             self.assertIn(expected, nginx)
         self.assertNotIn("proxy_hide_header Set-Cookie", nginx)

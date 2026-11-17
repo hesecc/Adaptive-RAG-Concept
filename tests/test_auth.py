@@ -41,13 +41,15 @@ class AccountHTTPTests(unittest.TestCase):
     def create_user(self, username="alice", password="alice-password"):
         response = self.admin.post("/admin/users", json={"username": username, "password": password})
         self.assertEqual(response.status_code, 201, response.text)
-        self.assertEqual(set(response.json()), {"username", "admin", "created_at"})
+        self.assertEqual(set(response.json()), {"username", "admin", "created_at", "data_domains"})
         self.assertFalse(response.json()["admin"])
+        self.assertEqual(response.json()["data_domains"], ["public"])
         return response.json()
 
     def publish(self, allowed=()):
         app = self.api.state.application
-        job = app.ingest(IngestRequest("alpha", "warranty", "v1", "# Warranty\nAmber warranty provides twelve months of coverage.", allowed_subjects=allowed))
+        job = app.ingest(IngestRequest("alpha", "warranty", "v1", "# Warranty\nAmber warranty provides twelve months of coverage.", allowed_subjects=allowed,
+                                         data_domains=("public",)))
         return app.publish("alpha", job.job_id, None)
 
     def test_fixed_admin_cookie_login_logout_and_no_password_disclosure(self):

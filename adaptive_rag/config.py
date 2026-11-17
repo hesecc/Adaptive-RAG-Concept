@@ -27,15 +27,17 @@ class Principal:
     subject_id: str = "local"
     groups: tuple[str, ...] = ()
     admin: bool = False
+    data_domains: tuple[str, ...] | None = None
 
     def __post_init__(self):
-        AccessContext(self.tenant_id, self.subject_id, self.groups)
+        access = AccessContext(self.tenant_id, self.subject_id, self.groups, self.data_domains)
+        object.__setattr__(self, "data_domains", access.data_domains)
         if type(self.admin) is not bool:
             raise ValidationError("principal.admin must be boolean")
 
     @property
     def access(self) -> AccessContext:
-        return AccessContext(self.tenant_id, self.subject_id, self.groups)
+        return AccessContext(self.tenant_id, self.subject_id, self.groups, self.data_domains)
 
 
 def _integer(value: int, name: str, minimum: int, maximum: int) -> None:
@@ -64,6 +66,7 @@ class Settings:
     allow_models: bool = False
     allow_network: bool = False
     cloud: Any = field(default=None, repr=False)
+    infrastructure: Any = field(default=None, repr=False)
 
     def __post_init__(self):
         object.__setattr__(self, "data_dir", Path(self.data_dir).resolve())
@@ -118,6 +121,7 @@ def load_settings(path: str | Path | None = None) -> Settings:
             values: dict[str, Any] = tomllib.load(handle)
         known = set(Settings.__dataclass_fields__)
         known.remove("cloud")  # Credentials are injected, never serialized in TOML.
+        known.remove("infrastructure")
         if set(values) - known:
             raise ValidationError(f"unknown settings: {', '.join(sorted(set(values) - known))}")
         if "data_dir" in values:
@@ -129,7 +133,12 @@ def load_settings(path: str | Path | None = None) -> Settings:
         for token, entry in principals.items():
             if not isinstance(entry, dict) or not isinstance(entry.get("groups", []), list):
                 raise ValidationError("API principal must be a table with an optional groups array")
-            parsed[token] = Principal(**(entry | {"groups": tuple(entry.get("groups", ())) }))
+            principal_values = entry | {"groups": tuple(entry.get("groups", ()))}
+            if "data_domains" in entry:
+                if not isinstance(entry["data_domains"], list):
+                    raise ValidationError("API principal data_domains must be an array")
+                principal_values["data_domains"] = tuple(entry["data_domains"])
+            parsed[token] = Principal(**principal_values)
         values["api_tokens"] = parsed
         return Settings(**values)
     except (OSError, TypeError, ValueError) as exc:

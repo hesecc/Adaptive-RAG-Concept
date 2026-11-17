@@ -1650,6 +1650,24 @@ pre,.json-view {
   white-space:nowrap;
 }
 
+.domain-options { display:flex; flex-wrap:wrap; gap:10px 16px; }
+.domain-options .domain-option { display:flex; align-items:center; gap:7px; font-size:14px; color:var(--ink); font-weight:400; cursor:pointer; }
+.domain-option input[type=checkbox] { width:16px; height:16px; margin:0; accent-color:var(--accent); flex:none; }
+.user-domain-field { grid-column:1/-1; grid-row:2; padding:14px; border:1px solid var(--line); border-radius:9px; }
+.user-domain-field legend { font-size:14px; padding:0 6px; color:var(--muted); }
+.user-create-form .primary-button { grid-column:3; grid-row:1; }
+.account-domains { margin:0 0 18px; padding:10px 12px; font-size:14px; line-height:1.7; color:var(--accent); background:var(--accent-tint); border-radius:8px; overflow-wrap:anywhere; }
+.user-domain-summary { font-size:13px!important; color:var(--muted)!important; }
+.user-domain-editor { display:grid; gap:12px; margin:12px 0; padding:12px; border-radius:8px; background:var(--chrome); }
+.user-domain-editor button { padding:8px 12px; border:1px solid var(--line); border-radius:6px; background:white; font:inherit; cursor:pointer; }
+.user-actions .permission-edit { color:var(--accent); }
+.user-actions { flex-wrap:wrap; justify-content:flex-end; }
+@media(max-width:720px) {
+  .user-domain-field { grid-column:auto; grid-row:auto; }
+  .user-create-form .primary-button { grid-column:auto; grid-row:auto; }
+  .user-row { align-items:flex-start; }
+}
+
 .toast {
   position:fixed;
   bottom:24px;

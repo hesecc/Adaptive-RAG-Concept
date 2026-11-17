@@ -45,6 +45,16 @@ def _enabled(values: Mapping[str, str], name: str) -> bool:
 
 def apply_environment(settings: Settings, values: Mapping[str, str]) -> Settings:
     updates = {}
+    remote_enabled = _enabled(values, "RAG_ENABLE_REMOTE_STORAGE")
+    storage_names = {name for name in values if name.startswith(("RAG_STORE_", "RAG_TRACE_", "RAG_OBJECT_", "RAG_ASSET_", "RAG_POSTGRES_", "RAG_S3_", "RAG_MILVUS_"))}
+    if storage_names:
+        from .infrastructure import load_infrastructure, remote_requested
+        storage, selectors = load_infrastructure(values, settings.plugins)
+        if remote_requested(storage, selectors):
+            if not remote_enabled:
+                raise ValidationError("remote storage requires RAG_ENABLE_REMOTE_STORAGE=true")
+            updates["allow_network"] = True
+        updates.update(infrastructure=storage, plugins=settings.plugins | selectors)
     cloud_enabled = _enabled(values, "RAG_ENABLE_CLOUD")
     optional = {name: _enabled(values, name) for name in (
         "RAG_ENABLE_QUERY_PREPARATION", "RAG_ENABLE_QUALITY_CHECKS",
@@ -55,7 +65,7 @@ def apply_environment(settings: Settings, values: Mapping[str, str]) -> Settings
         updates["data_dir"] = Path(values["RAG_DATA_DIR"])
     if cloud_enabled:
         from .cloud import load_cloud_settings
-        selected = settings.plugins | {"dense": "cloud", "reranker": "cloud", "generator": "cloud"}
+        selected = updates.get("plugins", settings.plugins) | {"dense": "cloud", "reranker": "cloud", "generator": "cloud"}
         if optional["RAG_ENABLE_QUERY_PREPARATION"]:
             selected.update(planner="cloud", rewrite="cloud")
         if optional["RAG_ENABLE_QUALITY_CHECKS"]:

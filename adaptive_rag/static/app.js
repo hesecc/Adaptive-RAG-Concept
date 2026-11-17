@@ -249,6 +249,8 @@ function showLogin(message = "") {
   $("#account-name").textContent = "";
   $("#account-role").textContent = "";
   $("#users-open").hidden = true;
+  $("#knowledge-open").hidden = true;
+  $("#account-domains").textContent = "";
   $("#app-shell").hidden = true;
   $("#login-page").hidden = false;
   $("#login-password").value = "";
@@ -265,6 +267,13 @@ function acceptSession(session) {
   $(".account-avatar").textContent = (session.username || "U").slice(0, 1).toUpperCase();
   $("#account-role").textContent = session.admin ? "管理员" : "成员";
   $("#users-open").hidden = !session.admin;
+  $("#knowledge-open").hidden = !session.admin;
+  $("#account-domains").textContent = `数据权限：${RagDomains.text(session.data_domains)}`;
+  RagDomains.load().then(() => {
+    if (state.user !== session) return;
+    $("#account-domains").textContent = `数据权限：${RagDomains.text(session.data_domains)}`;
+    RagDomains.render($("#new-user-domains"), ["public"], {publicRequired: true});
+  }).catch(error => toast(error.message));
   $("#login-password").value = "";
   $("#login-error").textContent = "";
   $("#login-page").hidden = true;
@@ -331,8 +340,10 @@ async function loadUsers() {
   if (!state.user?.admin) return;
   const session = state.sessionEpoch;
   const epoch = ++state.usersEpoch;
+  $("#users-error").textContent = "";
   $("#users-list").replaceChildren(el("p", "muted", "正在读取账号…"));
   try {
+    await RagDomains.load();
     const data = await (await api("/admin/users")).json();
     if (session !== state.sessionEpoch || epoch !== state.usersEpoch) return;
     $("#users-list").replaceChildren();
@@ -342,9 +353,44 @@ async function loadUsers() {
       info.append(el("strong", "", user.username));
       const date = user.created_at ? new Date(user.created_at).toLocaleString("zh-CN") : "";
       info.append(el("p", "", `${user.admin ? "管理员" : "普通成员"}${date ? ` · ${date}` : ""}`));
+      info.append(el("p", "user-domain-summary", `数据权限：${RagDomains.text(user.data_domains)}`));
       const actions = el("div", "user-actions");
       if (user.admin || user.username === "ragadmin") actions.append(el("span", "fixed-user", "固定管理员"));
       else {
+        const edit = el("button", "permission-edit", "修改权限");
+        edit.type = "button";
+        edit.setAttribute("aria-label", `修改账号 ${user.username} 的数据权限`);
+        edit.addEventListener("click", () => {
+          const editor = el("div", "user-domain-editor");
+          const choices = el("div");
+          choices.setAttribute("role", "group");
+          choices.setAttribute("aria-label", `账号 ${user.username} 的数据访问权限`);
+          RagDomains.render(choices, user.data_domains || [], {publicRequired: true});
+          const save = el("button", "permission-edit", "保存权限");
+          save.type = "button";
+          const cancel = el("button", "delete-cancel", "取消");
+          cancel.type = "button";
+          cancel.addEventListener("click", () => { editor.remove(); edit.disabled = false; });
+          save.addEventListener("click", async () => {
+            save.disabled = true; cancel.disabled = true;
+            $("#users-error").textContent = "";
+            try {
+              await api(`/admin/users/${encodeURIComponent(user.username)}/domains`, {
+                method: "PATCH", headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({data_domains: RagDomains.values(choices)}),
+              });
+              if (session !== state.sessionEpoch) return;
+              toast(`账号 ${user.username} 的权限已更新，后续请求立即生效。`);
+              await loadUsers();
+            } catch (error) {
+              if (session === state.sessionEpoch) $("#users-error").textContent = error.message;
+              save.disabled = false; cancel.disabled = false;
+            }
+          });
+          editor.append(choices, save, cancel);
+          info.append(editor); edit.disabled = true;
+        });
+        actions.append(edit);
         const remove = el("button", "", "删除");
         remove.type = "button";
         remove.setAttribute("aria-label", `删除账号 ${user.username}`);
@@ -354,7 +400,7 @@ async function loadUsers() {
           confirm.setAttribute("aria-label", `确认删除账号 ${user.username}`);
           const cancel = el("button", "delete-cancel", "取消");
           cancel.type = "button";
-          cancel.addEventListener("click", () => actions.replaceChildren(remove));
+          cancel.addEventListener("click", () => actions.replaceChildren(edit, remove));
           confirm.addEventListener("click", async () => {
             confirm.disabled = true; cancel.disabled = true;
             $("#users-error").textContent = "";
@@ -400,9 +446,11 @@ $("#user-create-form").addEventListener("submit", async (event) => {
   $("#user-create-submit").disabled = true;
   $("#users-error").textContent = "";
   try {
-    await api("/admin/users", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username, password }) });
+    await RagDomains.load();
+    await api("/admin/users", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username, password, data_domains: RagDomains.values($("#new-user-domains")) }) });
     if (session !== state.sessionEpoch) return;
     $("#user-create-form").reset();
+    RagDomains.render($("#new-user-domains"), ["public"], {publicRequired: true});
     toast(`账号 ${username} 已创建。`);
     await loadUsers();
   } catch (error) {

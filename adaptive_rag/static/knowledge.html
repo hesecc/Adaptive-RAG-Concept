@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="color-scheme" content="light" />
+  <title>知识入库与权限 · Adaptive RAG</title>
+  <link rel="icon" href="/static/mark.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/static/app.css" />
+  <link rel="stylesheet" href="/static/knowledge.css" />
+  <script src="/static/domain-controls.js" defer></script>
+  <script src="/static/knowledge.js" defer></script>
+</head>
+<body class="knowledge-page">
+  <header class="topbar">
+    <a class="brand" href="/"><span class="brand-symbol">A</span><b>Adaptive RAG</b><span class="brand-light">知识管理</span></a>
+    <nav class="topnav"><a href="/">返回知识库对话</a><a href="/images">图片资料库</a><span id="knowledge-account" class="account-badge">正在连接</span></nav>
+  </header>
+  <div id="knowledge-notice" class="knowledge-notice" role="status" hidden></div>
+  <main id="knowledge-workspace" class="knowledge-workspace" hidden>
+    <aside class="knowledge-intake">
+      <span class="tiny-label">KNOWLEDGE INTAKE</span>
+      <h1>让资料，<br />进入正确的范围。</h1>
+      <p class="muted">选择资料的业务分类，再暂存和发布。检索、引用及历史记录都会按账号的当前数据权限检查。</p>
+      <p id="knowledge-domains" class="account-domains"></p>
+      <form id="knowledge-ingest-form">
+        <label for="knowledge-file">读取本地文件（可选）<input id="knowledge-file" type="file" accept=".md,.markdown,.txt,.html,.htm,text/plain,text/markdown,text/html" /></label>
+        <p class="muted file-hint">支持不超过 2MB 的文本、Markdown、HTML。PDF 可通过现有解析 / CLI 入库，再在右侧调整分类。</p>
+        <label for="knowledge-title">资料标题<input id="knowledge-title" maxlength="300" required placeholder="例如：运营活动执行规范" /></label>
+        <div class="knowledge-inline">
+          <label for="knowledge-id">文档 ID<input id="knowledge-id" maxlength="128" required /></label>
+          <label for="knowledge-version">内容版本<input id="knowledge-version" value="v1" maxlength="128" required /></label>
+        </div>
+        <label for="knowledge-format">内容格式<select id="knowledge-format"><option value="text/markdown">Markdown</option><option value="text/plain">纯文本</option><option value="text/html">HTML</option></select></label>
+        <fieldset class="knowledge-domain-field"><legend>允许访问的数据分类（必选）</legend><div id="knowledge-data-domains"></div></fieldset>
+        <p class="muted file-hint">公共表示所有成员可读。多个业务分类之间为“或”的关系；运营与财务同时选中时，两类账号均可访问。</p>
+        <label for="knowledge-content">资料正文<textarea id="knowledge-content" rows="8" maxlength="2000000" required placeholder="粘贴文本，或在上方选择本地文件。"></textarea></label>
+        <div id="knowledge-form-error" class="form-error" role="alert"></div>
+        <button id="knowledge-ingest" class="primary-button" type="submit">暂存资料 <span>↗</span></button>
+        <p class="muted file-hint">暂存完成后，在右侧点击发布才会进入可检索知识快照。相同 ID 用于同一资料的新版本，数据分类沿用该资料现有分类，需要调整请在右侧资料卡片修改。</p>
+      </form>
+    </aside>
+    <section class="knowledge-library">
+      <div class="knowledge-heading"><div><span class="tiny-label">ACCESS GOVERNANCE</span><h2>资料与数据分类</h2></div><button id="knowledge-refresh" class="secondary-button" type="button">刷新资料</button></div>
+      <p class="knowledge-summary">历史未分类资料仅管理员可见。分配正确分类后，账号才可按所授权限检索；这里修改分类不修改正文。</p>
+      <div class="knowledge-stats"><span id="knowledge-count">—</span><span id="knowledge-generation">读取当前快照中</span></div>
+      <div id="knowledge-documents" class="knowledge-documents" aria-live="polite"></div>
+    </section>
+  </main>
+</body>
+</html>

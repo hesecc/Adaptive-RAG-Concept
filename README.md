@@ -108,7 +108,7 @@ flowchart LR
 | --- | --- | --- |
 | 入库 | plain、ATX Markdown、惰性 HTML；PDF 本地/MinerU 转 Markdown；结构保护父子切块与配置指纹 | `Parser` / `Cleaner` / `Chunker` |
 | 知识生命周期 | 暂存、显式发布、不可变快照、CAS、删除、回滚 | `KnowledgeStore` |
-| 原文与 trace | 内容寻址文件、SQLite | `ObjectStore` / `TraceSink` |
+| 原文与 trace | 默认内容寻址文件、SQLite；可选 S3 兼容对象存储、PostgreSQL | `ObjectStore` / `TraceSink` |
 | 计划与控制 | 默认规则、可选云语义分解；最多 3 子问题、12 总通道、一次共享补救；Laya 未接入 | `Planner` / `DecisionPolicy` |
 | 查询变换 | 已有云改写、多查询、HyDE、定向 gap 实现，按独立开关显式开启 | `QueryTransform` |
 | 检索 | 默认 BM25 + RRF；显式启用云 Embedding 与本地精确余弦 dense | `Retriever` / `Fusion` |
@@ -169,7 +169,19 @@ uv run adaptive-rag serve
 
 页面显示真实执行时间线、各步状态与服务端耗时，并可查看结构化返回、最终回答、逐条引用、证据回源、模型调用及平台返回的 Token 用量。实时事件先展示阶段元数据，结果经最终权限检查与 Trace 持久化后再展示内容；未启用或因预算跳过的步骤会明确标记。按 Trace ID 可重新加载历史记录并复核当前权限，也可下载本次运行 JSON。会话列表仅保留在当前页面；下载文件包含问题与证据，应按知识库数据管理。
 
-当前页面用于已有知识库的检索与诊断，文档导入、发布、撤权和回滚仍使用现有 CLI 或 HTTP 接口。详细操作与事件契约见 [检索工作台说明](docs/workbench.md)。
+当前页面用于已有知识库的检索与诊断。管理员可在「知识管理」页（`/knowledge`）导入文本、Markdown、HTML 资料并选择数据分类，暂存、发布和调整分类；PDF 导入、撤权和回滚仍使用现有 CLI 或 HTTP 接口。详细操作与事件契约见 [检索工作台说明](docs/workbench.md)。
+
+## 数据分类与鉴权
+
+账号和资料各有数据分类（公共、运营、财务、产品、销售、人事），检索只返回账号有权读取的资料：运营账号读不到财务资料。创建账号时分配分类，资料入库时选择分类，修改后立即生效，历史 Trace 和引用链接也按当前权限复核。升级前入库的资料默认未分类，只有管理员可读，需要管理员分类后才开放给普通账号。规则、操作和边界见 [数据分类与检索鉴权](docs/data-permissions.md)。
+
+## 图片资料库
+
+登录后点击「图片资料库」，可上传图片、填写标题与说明、检索并查看原图。标题、人工说明、标签与已有 OCR 共同参与文字检索；显式启用云模型并完成索引后，复用当前文本 Embedding 做语义检索。页面展示原图、缩略图、命中文字、真实步骤耗时、模型调用和可回放的 Trace ID。
+
+图片资产、版本、持久化任务与图片 trace 默认使用 SQLite，可切换 PostgreSQL；原图与缩略图通过 `ObjectStore` 接本地文件或 S3；图片文字向量可接 SQLite 精确检索或 Milvus。远程存储开关与云模型开关相互独立，不会因切换存储自动调用模型或迁移已有数据。
+
+本轮不使用共享图文向量空间，不自动理解图片、不自动提取 PDF 配图，也不生成图片。图片结果暂为独立入口，文档 dense 检索不自动迁移到图片 Milvus。操作、接口、失败恢复与边界见 [图片资料库说明](docs/image-library.md)，配置见 [存储模板](deploy/storage.env.template)，测试覆盖和部署缺口见 [验收记录](docs/research/image-storage-validation.md)。可用于简历的实际项目描述见 [项目经历](docs/project-experience.md)。
 
 ## 不变量与当前边界
 
@@ -178,7 +190,7 @@ uv run adaptive-rag serve
 - `no_index`、`empty`、`clarify`、`capability_unavailable`、`partial`、`insufficient`、插件错误、超时各自可辨。`partial` 只包含通过当前检查的事实，`missing_query_ids` 标识仍需确认的子问题；`insufficient` 不返回无法支持的答案。trace 保存插件、阶段状态、耗时、实际 child IDs、覆盖、核验与补救诊断；默认模型调用为零，云查询按实际请求尝试（含重试）记录调用次数、网络次数、模型耗时及平台返回的 token 用量。全局 capabilities 不预估云调用次数，以每次查询的 usage/trace 为准；配置密钥不写入 trace。trace 含问题与证据，属于敏感本地数据。
 - 基座使用字符预算，不将字符数声称为模型 token 数。截断证据带 `truncated=true`，正文摘录 hash 与完整父块 source hash 分开。
 - 词法覆盖不等于语义充分性；默认引用核验只检查出处/哈希/ID，`support_checked=false`。开启质量检查才进行云语义判断并记录 `support_checked` / `completeness_checked`；审查器与生成器共用模型，仍需独立业务 gold 验证质量。云查询预处理可结合 history 理解问题，不授予权限、不代替商品身份确认。
-- 默认 BM25 每次对授权块计算词法统计；云 dense 对授权块精确计算余弦，相同模型配置的向量缓存在 SQLite，冷查询才补算缺失文档向量。两者适用于当前小规模验证，尚无生产 ANN/倒排索引、离线双索引就绪发布、独立向量库、分布式任务、迁移管理或高可用方案。已有手动冷备和隔离恢复检查脚本，尚无自动调度、异机副本及生产原位自动恢复。
+- 默认 BM25 每次对授权块计算词法统计；文档云 dense 对授权块精确计算余弦，相同模型配置的向量缓存在 SQLite，冷查询才补算缺失文档向量。图片文字检索新增独立 Milvus 适配与持久化索引任务。当前仍未提供文档双索引就绪发布、通用分布式任务或高可用方案。已有手动冷备、隔离恢复检查及显式 SQLite 知识库到空 PostgreSQL 迁移函数，账号和对象需分别处理；尚无自动调度、异机副本及生产原位自动恢复。
 - HTML 不执行脚本或网络请求；Markdown 暂支持 ATX 标题。结构保护不取消字符上限，超长表格、代码、公式和单行会分片并标记；不能把分片当成完整表格/公式。归档保留传入文本的 UTF-8 字节，引用文本不补造结构。
 - 超时约束协作式 async 插件与调用等待，不能强制终止不协作的 Python 插件。同步阶段在线程中执行，超时后线程仍可能完成；CLI 退出还需等待线程收尾。trace 保存有预留预算，保存失败会使成功查询报错。这里不是进程级硬实时保证。
 
@@ -190,7 +202,7 @@ uv run adaptive-rag serve
 
 ## 云服务器与 Docker
 
-单机方案需要应用容器、HTTPS 网关及持久化磁盘。SQLite、文件归档、向量缓存是进程内/本机存储，当前无需先安装 MySQL、Milvus 或 Redis。通用 Compose 使用 Caddy；指定服务器的同机共存方案使用宿主现有 Nginx、独立 `/opt/an-RAG` 目录及 an-rag Compose 命名空间，不额外部署 Caddy。后端只映射回环地址，公网端口、TLS 和其他项目共存必须现场验证。
+默认单机方案需要应用容器、HTTPS 网关及持久化磁盘，使用 SQLite、文件归档和本机向量缓存。可选远程存储方案将权威数据、图片文字索引和对象分别接 PostgreSQL、Milvus 和 S3 兼容服务，须先评估容量与迁移。通用 Compose 使用 Caddy；指定服务器的同机共存方案使用宿主现有 Nginx、独立 `/opt/an-RAG` 目录及 an-rag Compose 命名空间，不额外部署 Caddy。后端只映射回环地址，公网端口、TLS 和其他项目共存必须现场验证。
 
 已有项目专用冷备脚本：获取维护锁、短暂停止本项目写进程、归档数据与私密配置并恢复原运行状态；恢复检查只在独立目录校验归档、SQLite 和内容寻址对象，不覆盖生产数据，也不等于从恢复数据启动应用的演练。备份含秘密，必须限制访问。没有自动调度或异机副本，仓库中的部署文件本身不证明服务已上线。
 

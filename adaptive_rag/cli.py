@@ -38,6 +38,7 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--title")
     command.add_argument("--sku", action="append", default=[])
     command.add_argument("--allow", action="append", default=[])
+    command.add_argument("--data-domain", action="append", default=[], help="Data classification, e.g. operations or finance; repeat for several. Without it the document is unclassified and only administrators can read it. Ignored when the document already exists")
     command.add_argument("--language", default="zh")
     command.add_argument("--pdf-backend", choices=("local", "mineru"))
     command.add_argument("--pdf-checkpoint", type=Path, help="MinerU-only batch checkpoint for PDF ingestion")
@@ -89,6 +90,8 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--subject", default="local")
     command.add_argument("--group", action="append", default=[])
     commands.add_parser("serve")
+    command = tenant_command("assets-index", help="Process durable image-description indexing tasks")
+    command.add_argument("--limit", type=int, default=10)
     return root
 
 
@@ -124,12 +127,14 @@ def dispatch(args):
         uvicorn.run(api, host=settings.host, port=settings.port, access_log=False)
         return {"status": "stopped"}
     application = RagApplication(settings)
+    if args.command == "assets-index":
+        return asyncio.run(application.assets.process_pending(args.tenant, args.limit))
     if args.command == "ingest":
         if args.file.suffix.lower() == ".pdf":
             return application.ingest_pdf(args.file, backend=args.pdf_backend or environment.get("RAG_PDF_BACKEND", "local"),
                 pdf_settings=pdf_settings(environment), pdf_checkpoint=args.pdf_checkpoint, tenant_id=args.tenant, document_id=args.document, version=args.version,
                 title=args.title or args.file.stem, scope="sku" if args.sku else "store", sku_ids=tuple(args.sku),
-                allowed_subjects=tuple(args.allow), language=args.language)
+                allowed_subjects=tuple(args.allow), language=args.language, data_domains=tuple(args.data_domain))
         media_type = {".md": "text/markdown", ".markdown": "text/markdown", ".txt": "text/plain",
                       ".html": "text/html", ".htm": "text/html"}.get(args.file.suffix.lower())
         if media_type is None:
@@ -145,6 +150,7 @@ def dispatch(args):
             media_type=media_type, title=args.title or args.file.stem,
             scope="sku" if args.sku else "store", sku_ids=tuple(args.sku),
             allowed_subjects=tuple(args.allow), language=args.language,
+            data_domains=tuple(args.data_domain),
         ))
     if args.command == "publish":
         return application.publish(args.tenant, args.job, args.expected_generation)

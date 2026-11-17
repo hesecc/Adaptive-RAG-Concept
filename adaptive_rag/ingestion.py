@@ -389,6 +389,11 @@ class IngestionService:
         metadata.pop("content")
         metadata["sku_ids"] = sorted(set(request.sku_ids))
         metadata["allowed_subjects"] = sorted(set(request.allowed_subjects))
+        if request.data_domains:
+            metadata["data_domains"] = list(request.data_domains)
+        else:
+            # Preserve identities for pre-classification imports.
+            metadata.pop("data_domains")
         revision_id = stable_id("revision-v1", metadata, content_hash, self.processing_fingerprint)
         raw_key = self.objects.put(raw)
         sections = self.cleaner.clean(self.parser.parse(request))

@@ -93,6 +93,7 @@ class AccessContext:
     tenant_id: str
     subject_id: str = "local"
     groups: tuple[str, ...] = ()
+    data_domains: tuple[str, ...] | None = None
 
     def __post_init__(self):
         identifier(self.tenant_id, "tenant_id")
@@ -101,6 +102,9 @@ class AccessContext:
             raise ValidationError("groups must be a tuple of at most 1000 subjects")
         for group in self.groups:
             identifier(group, "group")
+        if self.data_domains is not None:
+            from .data_access import normalize_data_domains
+            object.__setattr__(self, "data_domains", normalize_data_domains(self.data_domains))
 
     @property
     def subjects(self) -> frozenset[str]:
@@ -121,6 +125,7 @@ class IngestRequest:
     language: str = "zh"
     source_object_key: str | None = None
     source_parser: str | None = None
+    data_domains: tuple[str, ...] = ()
 
     def __post_init__(self):
         for name in ("tenant_id", "document_id", "version", "language"):
@@ -145,6 +150,8 @@ class IngestRequest:
             identifier(sku, "sku_id")
         for subject in self.allowed_subjects:
             identifier(subject, "allowed_subject")
+        from .data_access import normalize_data_domains
+        object.__setattr__(self, "data_domains", normalize_data_domains(self.data_domains))
 
 
 @dataclass(frozen=True)

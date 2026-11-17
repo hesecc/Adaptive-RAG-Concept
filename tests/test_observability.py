@@ -320,7 +320,9 @@ class PipelineObservationTests(unittest.IsolatedAsyncioTestCase):
         class SlowPlanner:
             async def plan(self, request):
                 await asyncio.Event().wait()
-        app = RagApplication(replace(self.settings, stage_timeout_seconds=0.05))
+        # This budget also bounds real trace persistence. Leave enough time
+        # for file I/O under load while still exercising the stage timeout.
+        app = RagApplication(replace(self.settings, stage_timeout_seconds=1))
         app.components["planner"] = SlowPlanner()
         observed = []
         with self.assertRaises(CapabilityError):

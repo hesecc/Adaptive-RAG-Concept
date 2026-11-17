@@ -172,7 +172,7 @@ class KnowledgeStoreTests(unittest.TestCase):
         self.assertNotEqual(rolled.generation, old.generation)
         self.assertEqual(rolled.revisions, old.revisions)
         self.assertEqual(self.store.list_chunks(rolled, self.access), ())
-        self.store.set_access("tenant-a", "shipping", ())
+        self.store.set_access("tenant-a", "shipping", (), revoked=False)
         self.assertEqual(self.store.list_chunks(rolled, self.access), document.children)
 
     def test_delete_and_rollback_validate_cas_and_target(self):

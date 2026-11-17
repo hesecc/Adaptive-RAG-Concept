@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import time
 import tempfile
 from typing import Any, Iterator, Sequence
 from uuid import uuid4
@@ -22,6 +23,7 @@ from .domain import (
     NotFoundError, ParentChunk, PreparedDocument, Snapshot, ValidationError,
     identifier, nonempty, stable_id,
 )
+from .data_access import domains_allowed, normalize_data_domains
 
 
 def _json(value: Any) -> str:
@@ -40,6 +42,31 @@ def _hash(value: str, name: str) -> str:
     if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
         raise ValidationError(f"{name} must be a lowercase SHA-256 digest")
     return value
+
+
+def _document_listing(rows, generation, published) -> list[dict[str, Any]]:
+    """Describe live policies without returning any document content."""
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row["document_id"], []).append(row)
+    result = []
+    for document_id, versions in grouped.items():
+        versions = sorted(versions, key=lambda row: (row["created_at"], row["revision_id"]), reverse=True)
+        current = next((row for row in versions if row["revision_id"] == published.get(document_id)), versions[0])
+        metadata = json.loads(current["metadata_json"])
+        result.append({
+            "document_id": document_id, "title": metadata.get("title", document_id),
+            "version": current["version"], "revision_id": current["revision_id"],
+            "generation": generation, "published": document_id in published,
+            "revoked": bool(current["revoked"]),
+            "allowed_subjects": json.loads(current["allowed_subjects"]),
+            "data_domains": json.loads(current["data_domains"]),
+            "staged_jobs": [{"job_id": row["job_id"], "revision_id": row["revision_id"],
+                             "version": row["version"], "title": json.loads(row["metadata_json"]).get("title", document_id),
+                             "created_at": row["created_at"]}
+                            for row in versions if row["state"] == "staged"],
+        })
+    return result
 
 
 class FileObjectStore:
@@ -115,12 +142,14 @@ INSERT OR IGNORE INTO schema_metadata VALUES (1, 1);
 CREATE TABLE IF NOT EXISTS documents (
     tenant_id TEXT NOT NULL, document_id TEXT NOT NULL,
     allowed_subjects TEXT NOT NULL, revoked INTEGER NOT NULL CHECK (revoked IN (0,1)),
+    data_domains TEXT NOT NULL DEFAULT '[]',
     PRIMARY KEY (tenant_id, document_id)
 );
 CREATE TABLE IF NOT EXISTS revisions (
     tenant_id TEXT NOT NULL, document_id TEXT NOT NULL, revision_id TEXT NOT NULL,
     version TEXT NOT NULL, processing_fingerprint TEXT NOT NULL, content_hash TEXT NOT NULL,
     raw_key TEXT NOT NULL, metadata_json TEXT NOT NULL, payload_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (tenant_id, document_id, revision_id),
     FOREIGN KEY (tenant_id, document_id) REFERENCES documents (tenant_id, document_id)
 );
@@ -180,11 +209,33 @@ class _Database:
         connection = sqlite3.connect(self.path, timeout=10, isolation_level=None)
         try:
             connection.execute("PRAGMA busy_timeout=10000")
-            connection.execute("PRAGMA journal_mode=WAL")
+            # Changing a legacy database to WAL can report BUSY immediately
+            # during concurrent startup, even with a busy timeout configured.
+            deadline = time.monotonic() + 10
+            while True:
+                try:
+                    connection.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.OperationalError as exc:
+                    code = getattr(exc, "sqlite_errorcode", 0) & 255
+                    if code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED) or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.02)
             connection.executescript(_SCHEMA)
             version = connection.execute("SELECT version FROM schema_metadata WHERE id=1").fetchone()[0]
             if version != 1:
                 raise ConflictError("unsupported storage schema version")
+            # Serialize the read/ALTER sequence across concurrent API/worker
+            # startup. Existing unclassified documents stay restricted.
+            connection.execute("BEGIN IMMEDIATE")
+            for table, column, definition in (
+                ("documents", "data_domains", "TEXT NOT NULL DEFAULT '[]'"),
+                ("revisions", "created_at", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+                if column not in columns:
+                    connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            connection.commit()
         finally:
             connection.close()
 
@@ -276,6 +327,8 @@ class SQLiteKnowledgeStore(_Database):
         canonical = asdict(document)
         canonical["request"]["sku_ids"] = sorted(set(request.sku_ids))
         canonical["request"]["allowed_subjects"] = sorted(set(request.allowed_subjects))
+        if not request.data_domains:
+            canonical["request"].pop("data_domains")
         canonical["parents"] = sorted(canonical["parents"], key=lambda parent: parent["parent_id"])
         canonical["children"] = sorted(canonical["children"], key=lambda child: child["chunk_id"])
         for child in canonical["children"]:
@@ -295,13 +348,13 @@ class SQLiteKnowledgeStore(_Database):
                     row = self._job(connection, tenant, job_id)
                     return self._ingest_result(row, request.version, duplicate=True)
                 connection.execute(
-                    "INSERT OR IGNORE INTO documents VALUES (?,?,?,0)",
-                    (tenant, doc, _json(request.allowed_subjects)),
+                    "INSERT OR IGNORE INTO documents(tenant_id,document_id,allowed_subjects,revoked,data_domains) VALUES (?,?,?,0,?)",
+                    (tenant, doc, _json(request.allowed_subjects), _json(request.data_domains)),
                 )
                 connection.execute(
-                    "INSERT INTO revisions VALUES (?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO revisions(tenant_id,document_id,revision_id,version,processing_fingerprint,content_hash,raw_key,metadata_json,payload_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
                     (tenant, doc, revision, request.version, document.processing_fingerprint,
-                     document.content_hash, document.raw_key, _json(metadata), payload_hash),
+                     document.content_hash, document.raw_key, _json(metadata), payload_hash, datetime.now(timezone.utc).isoformat()),
                 )
                 connection.executemany(
                     "INSERT INTO parents VALUES (?,?,?,?,?)",
@@ -340,6 +393,19 @@ class SQLiteKnowledgeStore(_Database):
         identifier(job_id, "job_id")
         with self._connection() as connection:
             return dict(self._job(connection, tenant_id, job_id))
+
+    def list_documents(self, tenant_id: str) -> list[dict[str, Any]]:
+        identifier(tenant_id, "tenant_id")
+        with self._connection() as connection:
+            generation = self._current(connection, tenant_id)
+            rows = connection.execute(
+                "SELECT d.document_id,d.allowed_subjects,d.revoked,d.data_domains,r.revision_id,r.version,r.metadata_json,r.created_at,j.job_id,j.state "
+                "FROM documents d JOIN revisions r USING(tenant_id,document_id) "
+                "JOIN jobs j USING(tenant_id,document_id,revision_id) WHERE d.tenant_id=? "
+                "ORDER BY d.document_id,r.created_at DESC,r.revision_id DESC", (tenant_id,),
+            ).fetchall()
+            published = dict(self._snapshot(connection, tenant_id, generation).revisions) if generation else {}
+            return _document_listing(rows, generation, published)
 
     @staticmethod
     def _current(connection: sqlite3.Connection, tenant: str) -> str | None:
@@ -426,7 +492,8 @@ class SQLiteKnowledgeStore(_Database):
     @staticmethod
     def _allowed(row: sqlite3.Row, access: AccessContext) -> bool:
         subjects = json.loads(row["allowed_subjects"])
-        return not row["revoked"] and (not subjects or bool(access.subjects.intersection(subjects)))
+        return (not row["revoked"] and domains_allowed(json.loads(row["data_domains"]), access.data_domains)
+                and (not subjects or bool(access.subjects.intersection(subjects))))
 
     def list_chunks(self, snapshot: Snapshot, access: AccessContext, sku: str | None = None) -> tuple[ChildChunk, ...]:
         if sku is not None:
@@ -434,7 +501,7 @@ class SQLiteKnowledgeStore(_Database):
         with self._connection() as connection:
             actual = self._trusted_snapshot(connection, snapshot, access)
             rows = connection.execute(
-                "SELECT c.value_json,d.allowed_subjects,d.revoked FROM children c "
+                "SELECT c.value_json,d.allowed_subjects,d.revoked,d.data_domains FROM children c "
                 "JOIN snapshot_revisions s USING(tenant_id,document_id,revision_id) "
                 "JOIN documents d USING(tenant_id,document_id) "
                 "WHERE s.tenant_id=? AND s.generation=? ORDER BY c.document_id,c.chunk_id",
@@ -459,7 +526,7 @@ class SQLiteKnowledgeStore(_Database):
             actual = self._trusted_snapshot(connection, snapshot, access)
             # No dynamic SQL/variable-count limit: read only the true snapshot.
             rows = connection.execute(
-                "SELECT p.value_json,p.parent_id,d.allowed_subjects,d.revoked FROM parents p "
+                "SELECT p.value_json,p.parent_id,d.allowed_subjects,d.revoked,d.data_domains FROM parents p "
                 "JOIN snapshot_revisions s USING(tenant_id,document_id,revision_id) "
                 "JOIN documents d USING(tenant_id,document_id) "
                 "WHERE s.tenant_id=? AND s.generation=?", (actual.tenant_id, actual.generation),
@@ -496,17 +563,26 @@ class SQLiteKnowledgeStore(_Database):
             target = self._snapshot(connection, tenant_id, generation)
             return self._create_snapshot(connection, tenant_id, dict(target.revisions))
 
-    def set_access(self, tenant_id: str, document_id: str, allowed_subjects: tuple[str, ...], revoked: bool = False) -> None:
+    def set_access(self, tenant_id: str, document_id: str, allowed_subjects: tuple[str, ...] | None = None,
+                   revoked: bool | None = None,
+                   data_domains: tuple[str, ...] | None = None) -> None:
         identifier(tenant_id, "tenant_id")
         identifier(document_id, "document_id")
-        if not isinstance(allowed_subjects, tuple) or not isinstance(revoked, bool):
-            raise ValidationError("allowed_subjects must be a tuple and revoked a boolean")
-        for subject in allowed_subjects:
+        if ((allowed_subjects is not None and not isinstance(allowed_subjects, tuple))
+                or (revoked is not None and type(revoked) is not bool)):
+            raise ValidationError("allowed_subjects must be a tuple and revoked a boolean, or None to preserve")
+        for subject in allowed_subjects or ():
             identifier(subject, "allowed_subject")
+        if data_domains is not None:
+            data_domains = normalize_data_domains(data_domains)
         with self._connection(write=True) as connection:
             result = connection.execute(
-                "UPDATE documents SET allowed_subjects=?,revoked=? WHERE tenant_id=? AND document_id=?",
-                (_json(allowed_subjects), int(revoked), tenant_id, document_id),
+                "UPDATE documents SET allowed_subjects=COALESCE(?,allowed_subjects),"
+                "revoked=COALESCE(?,revoked),data_domains=COALESCE(?,data_domains) "
+                "WHERE tenant_id=? AND document_id=?",
+                (_json(allowed_subjects) if allowed_subjects is not None else None,
+                 int(revoked) if revoked is not None else None,
+                 _json(data_domains) if data_domains is not None else None, tenant_id, document_id),
             )
             if result.rowcount != 1:
                 raise NotFoundError("document not found")

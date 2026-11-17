@@ -10,6 +10,7 @@
     </title>
     <link rel="icon" href="/static/mark.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/static/app.css" />
+    <script src="/static/domain-controls.js" defer></script>
     <script type="module" src="/static/app.js">
     </script>
   </head>
@@ -89,6 +90,8 @@
           知识库已连接
         </span>
         <nav class="topnav" aria-label="工作台操作">
+          <a class="text-button" href="/images">图片资料库</a>
+          <a id="knowledge-open" class="text-button" href="/knowledge" hidden>知识入库与权限</a>
           <button id="plugins-open" type="button">
             能力配置
           </button>
@@ -112,6 +115,7 @@
       <main id="main" class="workspace">
         <aside class="flow-column" aria-label="会话和执行流程">
           <section class="session-card side-section">
+            <p id="account-domains" class="account-domains"></p>
             <div class="section-top">
               <h2>
                 本次会话
@@ -502,7 +506,7 @@
         </button>
       </div>
       <p>
-        创建普通账号后，即可把账号和密码交给其他人使用工作台。
+        为账号选择可访问的数据分类。公共资料对所有成员开放，业务资料仅向获得对应分类的成员开放。
       </p>
       <form id="user-create-form" class="user-create-form">
         <label for="new-username">
@@ -513,6 +517,7 @@
           密码
           <input id="new-password" type="password" autocomplete="new-password" minlength="6" maxlength="128" placeholder="至少 6 位密码" required />
         </label>
+        <fieldset class="user-domain-field"><legend>数据访问权限</legend><div id="new-user-domains"></div></fieldset>
         <button id="user-create-submit" class="primary-button" type="submit">
           创建账号
         </button>

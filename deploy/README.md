@@ -70,6 +70,30 @@ All release changes and container CLI writes must acquire the same
 or extra application processes during the cold snapshot. The lock is advisory;
 it does not magically stop a separately launched writer that ignores it.
 
+## Gateway rate limits
+
+`nginx.server.conf` limits requests per client address with three `limit_req`
+zones. A request is counted by the first location that matches it.
+
+| Zone | Rate and burst | Covers |
+| --- | --- | --- |
+| `an_rag_requests` | 30 r/min, burst 10 | Everything else: login, every write, `/health`, model and search endpoints, JSON reads such as `/documents` and `/assets` |
+| `an_rag_media` | 300 r/min, burst 120 | Image bytes: `/assets/<id>/thumbnail` and `/assets/<id>/content` |
+| `an_rag_pages` | 300 r/min, burst 60 | Read-only page loads: `/`, `/images`, `/knowledge`, `/evaluation`, `/static/*`, `/console/session`, `/access/domains` |
+
+Every response is `no-store`, so switching pages fetches the HTML, scripts,
+stylesheet and both session reads again. Under the strict zone alone, two page
+switches within a few seconds exhausted its burst and a random script or API call
+got 429: the browser showed only the background, or fell back to the login form.
+The pages location accepts GET only (`limit_except GET`), so a write can never
+reach the generous zone. Keep new write, login and model routes out of it.
+
+Never change the key of an existing `limit_req_zone`. `nginx -t` still passes,
+but `nginx -s reload` fails with `[emerg] ... uses the "..." key while
+previously it used the "$binary_remote_addr" key`, and the old configuration
+keeps serving. Add a zone under a new name instead. Rejections are logged
+(`limiting requests`) in `/opt/an-RAG/logs/nginx-error.log` with the zone name.
+
 ## Backup and isolated restore verification
 
 Install `backup.sh` and `snapshot.py` together, owned by the deployment operator

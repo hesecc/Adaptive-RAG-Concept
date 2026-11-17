@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -12,9 +13,11 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from adaptive_rag.api import create_api
 from adaptive_rag.app import RagApplication
 from adaptive_rag.config import Settings
 from adaptive_rag.domain import IngestRequest
+from support import ADMIN_PASSWORD
 
 
 DEPLOY = Path(__file__).resolve().parents[1] / "deploy"
@@ -222,6 +225,27 @@ printf synthetic >"$3/snapshot.tar.gz"
         self.assertIn("CRITICAL", result.stderr)
 
 
+def nginx_locations(config):
+    """Every `location` block as (match rule, body). The body keeps nested blocks such as limit_except."""
+    blocks = []
+    for opening in re.finditer(r"^[ \t]*location[ \t]+([^{;\n]+?)[ \t]*\{", config, re.MULTILINE):
+        depth, end = 1, opening.end()
+        while depth:
+            depth += {"{": 1, "}": -1}.get(config[end], 0)
+            end += 1
+        blocks.append((opening.group(1), config[opening.end():end - 1]))
+    return blocks
+
+
+def guarding_zone(config, path):
+    """The limit_req zone nginx applies to a path: the first matching regex location, else the plain `/` one."""
+    blocks = nginx_locations(config)
+    for rule, body in blocks:
+        if rule.startswith("~ ") and re.search(rule[2:], path):
+            return re.search(r"limit_req zone=(\w+)", body).group(1)
+    return re.search(r"limit_req zone=(\w+)", dict(blocks)["/"]).group(1)
+
+
 class DeploymentTemplateTests(unittest.TestCase):
     def test_server_resources_are_scoped_and_backend_is_loopback(self):
         compose = (DEPLOY / "compose.server.yaml").read_text()
@@ -247,9 +271,9 @@ class DeploymentTemplateTests(unittest.TestCase):
         nginx = (DEPLOY / "nginx.server.conf").read_text()
         # One zone per purpose; the strict zone must still guard the catch-all.
         self.assertIn("zone=an_rag_media:10m rate=300r/m", nginx)
-        media = nginx.index("location ~ ^/assets/[^/]+/(thumbnail|content)$")
-        catch_all = nginx.index("location / {")
-        media_block, catch_block = nginx[media:catch_all], nginx[catch_all:]
+        blocks = dict(nginx_locations(nginx))
+        media_block = blocks["~ ^/assets/[^/]+/(thumbnail|content)$"]
+        catch_block = blocks["/"]
         self.assertIn("limit_req zone=an_rag_media burst=120 nodelay", media_block)
         self.assertNotIn("an_rag_requests", media_block)
         self.assertIn("limit_req zone=an_rag_requests burst=10 nodelay", catch_block)
@@ -260,7 +284,63 @@ class DeploymentTemplateTests(unittest.TestCase):
                        "proxy_set_header X-Forwarded-Proto https", "proxy_pass http://127.0.0.1:14175"):
             self.assertIn(header, media_block)
             self.assertIn(header, catch_block)
-        self.assertEqual(nginx.count("location "), 2)
+
+    def test_page_loads_have_their_own_generous_read_only_limit(self):
+        nginx = (DEPLOY / "nginx.server.conf").read_text()
+        # nginx refuses to reload when a zone that already exists changes its key, so the running zones stay as they were.
+        self.assertIn("limit_req_zone $binary_remote_addr zone=an_rag_requests:10m rate=30r/m;", nginx)
+        self.assertIn("limit_req_zone $binary_remote_addr zone=an_rag_media:10m rate=300r/m;", nginx)
+        # Page shells, scripts and the session reads get a zone of their own, so a quick switch between pages
+        # cannot drain the 30 requests per minute that guard login and the model-backed routes.
+        self.assertIn("limit_req_zone $binary_remote_addr zone=an_rag_pages:10m rate=300r/m;", nginx)
+        blocks = nginx_locations(nginx)
+        self.assertEqual(len(blocks), 3, [rule for rule, _ in blocks])
+        pages = [body for _, body in blocks if "an_rag_pages" in body]
+        self.assertEqual(len(pages), 1)
+        self.assertIn("limit_req zone=an_rag_pages burst=60 nodelay", pages[0])
+        self.assertIn("limit_except GET { deny all; }", pages[0])
+        self.assertNotIn("an_rag_requests", pages[0])
+        self.assertNotIn("an_rag_media", pages[0])
+        for _, body in blocks:
+            self.assertEqual(body.count("limit_req zone="), 1)
+            for line in ("proxy_pass http://127.0.0.1:14175", "proxy_set_header Authorization $http_authorization",
+                         "proxy_set_header X-Real-IP $remote_addr", "proxy_set_header X-Forwarded-For $remote_addr",
+                         "proxy_set_header X-Forwarded-Proto https", 'proxy_set_header Connection ""'):
+                self.assertIn(line, body)
+            # A location that declares its own add_header drops the security headers set once on the server.
+            self.assertNotIn("add_header", body)
+        for header in ("X-Content-Type-Options nosniff", "Referrer-Policy no-referrer", 'Cache-Control "no-store"'):
+            self.assertEqual(nginx.count(f"add_header {header} always;"), 1)
+
+    def test_only_cheap_reads_are_relaxed_and_every_write_stays_strict(self):
+        nginx = (DEPLOY / "nginx.server.conf").read_text()
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as data:
+            routes = create_api(Settings(data_dir=Path(data), admin_password=ADMIN_PASSWORD)).routes
+        pages = {"/", "/images", "/knowledge", "/evaluation", "/console/session", "/access/domains"}
+        relaxed = set()
+        for route in routes:
+            methods = getattr(route, "methods", None)
+            if not methods:
+                continue  # the /static mount has no methods; it is checked below
+            path = re.sub(r"\{[^}]+\}", "x1", route.path)
+            zone = guarding_zone(nginx, path)
+            label = f"{sorted(methods)} {path}"
+            if methods & {"POST", "PUT", "PATCH", "DELETE"}:
+                self.assertEqual(zone, "an_rag_requests", label)
+            elif path in pages:
+                self.assertEqual(zone, "an_rag_pages", label)
+                relaxed.add(path)
+            elif re.fullmatch(r"/assets/x1/(thumbnail|content)", path):
+                self.assertEqual(zone, "an_rag_media", label)
+            else:
+                self.assertEqual(zone, "an_rag_requests", label)
+        self.assertEqual(relaxed, pages)
+        for path in ("/static/app.js", "/static/domain-controls.js", "/static/mark.svg"):
+            self.assertEqual(guarding_zone(nginx, path), "an_rag_pages", path)
+        # Lookalikes of the relaxed paths do not slip into the relaxed zone.
+        for path in ("/images/", "/images/x1", "/static", "/static/", "/console/session/x1", "/health",
+                     "/evaluation/reports", "/auth/login", "/capabilities"):
+            self.assertEqual(guarding_zone(nginx, path), "an_rag_requests", path)
 
 
 if __name__ == "__main__":

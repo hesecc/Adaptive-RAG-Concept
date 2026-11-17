@@ -38,7 +38,10 @@ async function api(path, options = {}) {
     location.href = "/";
     throw Error("请先登录工作台。");
   }
-  const value = response.status === 204 ? null : await response.json();
+  if (response.status === 429) throw Error("请求过于频繁，请稍后重试。");
+  let value = null;
+  try { value = response.status === 204 ? null : await response.json(); }
+  catch { if (response.ok) throw Error(`服务返回格式错误（HTTP ${response.status}），请稍后重试。`); }
   if (!response.ok) throw Error(value?.error?.message || `请求失败 (${response.status})`);
   return value;
 }

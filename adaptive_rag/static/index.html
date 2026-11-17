@@ -16,9 +16,20 @@
     </script>
   </head>
   <body>
-    <section id="login-page" class="login-page" aria-labelledby="login-heading">
+    <section id="boot-page" class="boot-page">
+      <svg class="brand-mark" width="36" height="36" viewBox="0 0 36 36" aria-hidden="true">
+        <rect class="m-fill" width="36" height="36" rx="10" />
+        <path class="m-cut" d="M18 6 32 30H4Z" />
+        <path class="m-fill" d="m18 16 8 14H10Z" />
+      </svg>
+      <p id="boot-message" class="boot-message" role="status">正在连接工作台…</p>
+      <div id="boot-actions" class="boot-actions">
+        <a id="boot-reload" class="secondary-button" href="/">重新加载页面</a>
+      </div>
+    </section>
+    <section id="login-page" class="login-page" aria-labelledby="login-heading" hidden>
       <div class="login-brand">
-        <svg class="brand-mark" viewBox="0 0 36 36" aria-hidden="true">
+        <svg class="brand-mark" width="36" height="36" viewBox="0 0 36 36" aria-hidden="true">
           <rect class="m-fill" width="36" height="36" rx="10" />
           <path class="m-cut" d="M18 6 32 30H4Z" />
           <path class="m-fill" d="m18 16 8 14H10Z" />
@@ -40,7 +51,7 @@
         <p class="login-intro">
           从一个问题出发，看见答案背后的每一步。
         </p>
-        <form id="login-form">
+        <form id="login-form" method="post">
           <label for="login-username">
             账号
           </label>
@@ -77,7 +88,7 @@
       </a>
       <header class="topbar">
         <a class="brand" href="/" aria-label="Adaptive RAG 首页">
-          <svg class="brand-mark" viewBox="0 0 36 36" aria-hidden="true">
+          <svg class="brand-mark" width="36" height="36" viewBox="0 0 36 36" aria-hidden="true">
             <rect class="m-fill" width="36" height="36" rx="10" />
             <path class="m-cut" d="M18 6 32 30H4Z" />
             <path class="m-fill" d="m18 16 8 14H10Z" />

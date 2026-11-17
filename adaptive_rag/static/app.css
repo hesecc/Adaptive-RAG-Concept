@@ -2332,6 +2332,46 @@ pre {
   letter-spacing: 0;
 }
 
+/* Shown while the session is checked, so a signed-in user never sees the login form flash up
+   and a failed request is reported here instead of passing for a signed-out user. */
+.boot-page {
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 16px;
+  min-height: 100dvh;
+  padding: 24px;
+  text-align: center;
+}
+
+.boot-page .brand-mark {
+  width: 36px;
+  height: 36px;
+}
+
+.boot-message {
+  max-width: 34em;
+  color: var(--fg2);
+  font-size: 14px;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+}
+
+/* When the page script never loads nothing can reveal the reload button, so a CSS delay does. */
+.boot-actions {
+  visibility: hidden;
+  animation: boot-actions 0s 10s forwards;
+}
+
+.boot-actions.shown {
+  visibility: visible;
+  animation: none;
+}
+
+@keyframes boot-actions {
+  to { visibility: visible; }
+}
+
 @keyframes spin {
   to { transform: rotate(360deg); }
 }
@@ -2718,6 +2758,11 @@ pre {
     animation: none !important;
     transition: none !important;
     scroll-behavior: auto !important;
+  }
+
+  /* The reveal above is an animation, so without animations show the reload button at once. */
+  .boot-actions {
+    visibility: visible;
   }
 }
 

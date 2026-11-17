@@ -215,11 +215,17 @@ $("#plugins-open").addEventListener("click", () => dialog("#plugins-dialog"));
 
 async function api(path, options = {}) {
   const epoch = state.sessionEpoch;
-  const response = await fetch(path, {
-    ...options,
-    cache: "no-store",
-    credentials: "same-origin",
-  });
+  let response;
+  try {
+    response = await fetch(path, {
+      ...options,
+      cache: "no-store",
+      credentials: "same-origin",
+    });
+  } catch (error) {
+    if (error.name === "AbortError") throw error;
+    throw Object.assign(new Error("无法连接服务，请检查网络或服务状态后重试。"), { status: 0 });
+  }
   if (!response.ok) {
     let message = `请求失败（HTTP ${response.status}）`;
     try {
@@ -261,6 +267,7 @@ function showLogin(message = "") {
   $("#evaluation-open").hidden = true;
   $("#account-domains").textContent = "";
   $("#app-shell").hidden = true;
+  $("#boot-page").hidden = true;
   $("#login-page").hidden = false;
   $("#login-password").value = "";
   $("#login-error").textContent = message;
@@ -286,6 +293,7 @@ function acceptSession(session) {
   }).catch(error => toast(error.message));
   $("#login-password").value = "";
   $("#login-error").textContent = "";
+  $("#boot-page").hidden = true;
   $("#login-page").hidden = true;
   $("#app-shell").hidden = false;
   renderPlugins();
@@ -330,16 +338,51 @@ $("#logout-button").addEventListener("click", async () => {
     $("#login-submit").disabled = false;
   }
 });
+// The page opens on a neutral "connecting" screen. The login form appears only when the server
+// answers 401, so a request that fails for a passing reason never passes for a signed-out user.
+function showBoot(message, final = false) {
+  $("#app-shell").hidden = true;
+  $("#login-page").hidden = true;
+  $("#boot-page").hidden = false;
+  $("#boot-message").textContent = message;
+  $("#boot-actions").classList.toggle("shown", final);
+}
+// Network failure (0), the gateway's rate limit (429) or a service that is restarting (502 to 504).
+const passingStatuses = [0, 429, 502, 503, 504];
+const retryDelays = [2000, 4000, 8000];
+
 async function restoreSession() {
   const epoch = state.sessionEpoch;
   state.connecting = true;
   $("#login-submit").disabled = true;
   try {
-    const session = await (await api("/console/session")).json();
-    if (epoch === state.sessionEpoch) acceptSession(session);
-  } catch (error) {
-    if (epoch === state.sessionEpoch && error.status !== 401)
-      $("#login-error").textContent = `暂时无法连接工作台：${error.message}`;
+    if (!window.RagDomains) {
+      showBoot("页面脚本没有加载完整，请重新加载页面。", true);
+      return;
+    }
+    for (let attempt = 0; ; attempt++) {
+      let session;
+      try {
+        session = await (await api("/console/session")).json();
+      } catch (error) {
+        if (epoch !== state.sessionEpoch) return;
+        if (error.status === 401) return showLogin();
+        if (!passingStatuses.includes(error.status) || attempt === retryDelays.length)
+          return showBoot(`暂时无法连接工作台：${error.message}`, true);
+        showBoot(`服务暂时繁忙，正在自动重试（${attempt + 1}/${retryDelays.length}）…`);
+        await new Promise((resolve) => setTimeout(resolve, retryDelays[attempt]));
+        if (epoch !== state.sessionEpoch) return;
+        continue;
+      }
+      if (epoch !== state.sessionEpoch) return;
+      try {
+        acceptSession(session);
+      } catch (error) {
+        // acceptSession has already moved the session epoch on, so an unreported error would leave this screen.
+        showBoot(`工作台初始化失败：${error.message}`, true);
+      }
+      return;
+    }
   } finally {
     state.connecting = false;
     $("#login-submit").disabled = false;

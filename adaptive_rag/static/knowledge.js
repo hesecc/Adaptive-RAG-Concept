@@ -18,6 +18,7 @@ async function knowledgeApi(path, options = {}) {
       headers: {"Content-Type": "application/json", ...options.headers}});
   } catch { throw Error("无法连接服务，请检查网络或服务状态后重试。"); }
   if (response.status === 401) { location.href = "/"; throw Error("请先登录工作台。"); }
+  if (response.status === 429) throw Error("请求过于频繁，请稍后重试。");
   let value;
   try { value = response.status === 204 ? null : await response.json(); }
   catch { throw Error(`服务返回格式错误（HTTP ${response.status}），请稍后重试。`); }

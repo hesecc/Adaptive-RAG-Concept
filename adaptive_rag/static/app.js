@@ -173,11 +173,19 @@ function failureMessage(trace = state.trace) {
 }
 let toastTimer;
 function toast(message) {
-  $("#toast").textContent = message;
-  $("#toast").hidden = false;
+  const box = $("#toast");
+  box.textContent = message;
+  box.hidden = false;
+  if (box.showPopover) {
+    // A popover sits in the top layer, so the message stays visible above an open modal <dialog>.
+    // Hiding first re-enters the top layer when a dialog was opened after an earlier toast.
+    box.hidePopover();
+    box.showPopover();
+  }
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => {
-    $("#toast").hidden = true;
+    if (box.hidePopover) box.hidePopover();
+    box.hidden = true;
   }, 3000);
 }
 

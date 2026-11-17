@@ -3,7 +3,8 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <meta name="color-scheme" content="light" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#2b2a28" />
     <meta name="description" content="Adaptive RAG 工作台：对话、真实检索流程与引用证据。" />
     <title>
       Adaptive RAG · 检索工作台
@@ -17,9 +18,11 @@
   <body>
     <section id="login-page" class="login-page" aria-labelledby="login-heading">
       <div class="login-brand">
-        <span class="brand-symbol">
-          A
-        </span>
+        <svg class="brand-mark" viewBox="0 0 36 36" aria-hidden="true">
+          <rect class="m-fill" width="36" height="36" rx="10" />
+          <path class="m-cut" d="M18 6 32 30H4Z" />
+          <path class="m-fill" d="m18 16 8 14H10Z" />
+        </svg>
         <b>
           Adaptive RAG
         </b>
@@ -74,24 +77,26 @@
       </a>
       <header class="topbar">
         <a class="brand" href="/" aria-label="Adaptive RAG 首页">
-          <span class="brand-symbol">
-            A
-          </span>
+          <svg class="brand-mark" viewBox="0 0 36 36" aria-hidden="true">
+            <rect class="m-fill" width="36" height="36" rx="10" />
+            <path class="m-cut" d="M18 6 32 30H4Z" />
+            <path class="m-fill" d="m18 16 8 14H10Z" />
+          </svg>
           <b>
             Adaptive RAG
           </b>
-          <span class="brand-light">
-            检索工作台
-          </span>
         </a>
+        <nav class="tabs" aria-label="页面">
+          <a class="tab" href="/" aria-current="page">检索工作台</a>
+          <a class="tab" href="/images">图片资料库</a>
+          <a id="knowledge-open" class="tab" href="/knowledge" hidden>知识入库与权限</a>
+        </nav>
         <span class="workspace-tag">
           <span class="status-dot connected">
           </span>
           知识库已连接
         </span>
         <nav class="topnav" aria-label="工作台操作">
-          <a class="text-button" href="/images">图片资料库</a>
-          <a id="knowledge-open" class="text-button" href="/knowledge" hidden>知识入库与权限</a>
           <button id="plugins-open" type="button">
             能力配置
           </button>

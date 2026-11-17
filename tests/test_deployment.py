@@ -243,6 +243,25 @@ class DeploymentTemplateTests(unittest.TestCase):
         self.assertNotIn("sj_session", nginx)
         self.assertNotIn("18443", nginx)
 
+    def test_image_bytes_have_their_own_limit_and_other_routes_keep_the_strict_one(self):
+        nginx = (DEPLOY / "nginx.server.conf").read_text()
+        # One zone per purpose; the strict zone must still guard the catch-all.
+        self.assertIn("zone=an_rag_media:10m rate=300r/m", nginx)
+        media = nginx.index("location ~ ^/assets/[^/]+/(thumbnail|content)$")
+        catch_all = nginx.index("location / {")
+        media_block, catch_block = nginx[media:catch_all], nginx[catch_all:]
+        self.assertIn("limit_req zone=an_rag_media burst=120 nodelay", media_block)
+        self.assertNotIn("an_rag_requests", media_block)
+        self.assertIn("limit_req zone=an_rag_requests burst=10 nodelay", catch_block)
+        self.assertNotIn("an_rag_media", catch_block)
+        # The relaxed route is read-only and must forward the same identity headers.
+        self.assertIn("limit_except GET { deny all; }", media_block)
+        for header in ("proxy_set_header Authorization $http_authorization",
+                       "proxy_set_header X-Forwarded-Proto https", "proxy_pass http://127.0.0.1:14175"):
+            self.assertIn(header, media_block)
+            self.assertIn(header, catch_block)
+        self.assertEqual(nginx.count("location "), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

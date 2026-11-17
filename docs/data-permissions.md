@@ -58,8 +58,12 @@ PDF 目前只能通过命令行入库，HTTP 与页面不接收 PDF。
 
 SQLite 与 PostgreSQL 在启动时幂等地添加分类字段：旧资料的分类为空（未分类），旧普通账号迁移为只含公共，固定管理员不受限制。旧 SQLite 迁到 PostgreSQL 时分类字段一并保留。
 
+线上服务已按此规则升级（见[服务器部署记录](deployment-server.md)）：升级前已有的两份资料现在是未分类，只有管理员可读，管理员逐份设置分类后，普通账号才读得到。
+
+升级后的库不能直接交给上一版镜像读写。上一版用位置参数写入，新建账号和资料入库会返回 5xx，而 `/health`、读取和登录仍然正常。回退要先运行 `deploy/downgrade_schema.py` 删除新增的三列，资料分类和账号授权会先导出为 JSON，步骤见 [deploy/README.md](../deploy/README.md)。
+
 ## 边界
 
 - 分类是固定的六类，增减分类需要修改 `adaptive_rag/data_access.py` 中的目录。
-- 本文描述本地实现。线上服务尚未更新，`docs/image-library.md` 与 `deploy/STORAGE.md` 中的存储部署缺口仍然有效。
+- 本文描述的实现已于 2026-11-17 随 `rag-20261117T041936Z` 上线，线上仍使用 SQLite 与本地文件；PostgreSQL、Milvus、S3 只在本地验证过。`docs/image-library.md` 与 `deploy/STORAGE.md` 中的存储部署缺口仍然有效。
 - 权限覆盖的是本项目 HTTP 与页面入口。直接读取数据目录、数据库或对象存储的人不受这些检查约束，需要用操作系统和云平台的权限另行保护。

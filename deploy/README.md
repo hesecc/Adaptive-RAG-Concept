@@ -117,3 +117,31 @@ isolated directory before planning a data restore. Never overwrite production
 data from the restore checker. First-deployment withdrawal disables only the
 new an-rag vhost, validates/reloads Nginx and stops only an-rag/api, retaining
 its data for inspection.
+
+### Rolling back past the data-domain release
+
+The data-domain release (`rag-20261117T041936Z`) added three SQLite columns,
+and the previous release writes with positional `INSERT ... VALUES (...)`. On an
+upgraded database the previous image still starts and `/health`, reads and login
+stay green, but creating an account or ingesting a document fails with 5xx. An
+image-only rollback is therefore not a rollback. Under the maintenance lock:
+
+1. Stop only `api`, so nothing writes while the schema changes.
+2. Run `deploy/downgrade_schema.py` inside the new image as the application user
+   (it drops exactly `documents.data_domains`, `revisions.created_at` and
+   `accounts.data_domains`; the docstring has the full `docker run` command with
+   `--network none --read-only --cap-drop ALL --user 10001:10001`). Keep stdout:
+   it is the JSON export of the document classifications and account domain
+   grants that the downgrade deletes. Progress goes to stderr. The tool needs
+   SQLite 3.35 or newer, which the image provides, and a second run changes
+   nothing.
+3. Run the same command with `--check` and confirm both databases report
+   `none (already previous shape)`.
+4. Restore the recorded vhost, `deployment.env`, Compose file and backup scripts
+   from `config/rollback-<release>/`, then `nginx -t` and reload.
+5. Start the previous image with `up -d --wait`, then prove it can write: create
+   and delete a temporary account. A green health check alone is not proof.
+
+The cold backup taken before the release stays the authoritative recovery point.
+This path was rehearsed on a copy of production data and covered with stubbed
+Docker, Compose and Nginx; it has not been triggered on the production server.

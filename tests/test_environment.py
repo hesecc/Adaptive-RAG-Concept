@@ -16,6 +16,7 @@ from adaptive_rag.config import Settings
 from adaptive_rag.domain import ValidationError
 from adaptive_rag.environment import apply_environment, pdf_settings, read_environment
 from adaptive_rag.server import create
+from support import ADMIN_PASSWORD
 
 
 class EnvironmentTests(unittest.TestCase):
@@ -106,13 +107,27 @@ EMPTY=
         self.assertTrue(app.capabilities()["semantic_support_verification"])
         self.assertTrue(app.capabilities()["history_resolution"])
 
+    def test_admin_password_comes_from_the_environment_and_is_never_echoed(self):
+        config = apply_environment(Settings(data_dir=self.root), {"RAG_ADMIN_PASSWORD": "synthetic-admin-password"})
+        self.assertEqual(config.admin_password, "synthetic-admin-password")
+        self.assertNotIn("synthetic-admin-password", repr(config))
+        # An empty value counts as unset, like the other optional variables.
+        for values in ({}, {"RAG_ADMIN_PASSWORD": ""}):
+            self.assertIsNone(apply_environment(Settings(data_dir=self.root), values).admin_password)
+
+    def test_new_database_needs_the_admin_password_before_the_server_starts(self):
+        with patch.dict(os.environ, {"RAG_DATA_DIR": str(self.root / "fresh")}):
+            with self.assertRaises(ValidationError) as caught:
+                create()
+        self.assertIn("RAG_ADMIN_PASSWORD", str(caught.exception))
+
     def test_server_supports_login_without_token_and_accepts_injected_identity(self):
-        with patch.dict(os.environ, {"RAG_DATA_DIR": str(self.root / "login-data")}):
+        with patch.dict(os.environ, {"RAG_DATA_DIR": str(self.root / "login-data"), "RAG_ADMIN_PASSWORD": ADMIN_PASSWORD}):
             with TestClient(create()) as client:
-                response = client.post("/auth/login", json={"username": "ragadmin", "password": "ragadmin123"})
+                response = client.post("/auth/login", json={"username": "ragadmin", "password": ADMIN_PASSWORD})
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertEqual(response.json()["tenant_id"], "demo")
-        with patch.dict(os.environ, {"RAG_DATA_DIR": str(self.root / "data")}):
+        with patch.dict(os.environ, {"RAG_DATA_DIR": str(self.root / "data"), "RAG_ADMIN_PASSWORD": ADMIN_PASSWORD}):
             with patch.dict(os.environ, {"RAG_HTTP_API_TOKEN": "synthetic-api-token-0000000001",
                                          "RAG_HTTP_TENANT": "tenant", "RAG_HTTP_SUBJECT": "operator"}):
                 api = create()
@@ -137,7 +152,7 @@ EMPTY=
         self.assertNotIn("private-key", stderr.getvalue())
 
     def test_cloud_server_health_requires_no_paid_call(self):
-        injected = {"RAG_DATA_DIR": str(self.root / "cloud-data"),
+        injected = {"RAG_DATA_DIR": str(self.root / "cloud-data"), "RAG_ADMIN_PASSWORD": ADMIN_PASSWORD,
                     "RAG_HTTP_API_TOKEN": "synthetic-api-token-0000000001",
                     "RAG_ENABLE_CLOUD": "true",
                     "RAG_CLOUD_BASE_URL": "https://models.example.test/v1",

@@ -122,7 +122,7 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     application = RagApplication(settings)
     admin_tenants = {principal.tenant_id for principal in settings.api_tokens.values() if principal.admin}
     browser_tenant = settings.browser_tenant or (next(iter(admin_tenants)) if len(admin_tenants) == 1 else "demo")
-    accounts = AccountStore(settings.data_dir, browser_tenant)
+    accounts = AccountStore(settings.data_dir, browser_tenant, settings.admin_password)
     api = FastAPI(title="Adaptive RAG Foundation", version="0.1.0")
     api.state.application = application
     api.state.accounts = accounts

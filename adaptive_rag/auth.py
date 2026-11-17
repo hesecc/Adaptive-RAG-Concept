@@ -21,7 +21,6 @@ from .domain import ConflictError, ForbiddenError, NotFoundError, RagError, Vali
 COOKIE_NAME = "an_rag_session"
 SESSION_SECONDS = 7 * 24 * 60 * 60
 ADMIN_USERNAME = "ragadmin"
-_ADMIN_PASSWORD = "ragadmin123"
 _PASSWORD_ROUNDS = 120_000
 
 
@@ -62,6 +61,10 @@ def _password_hash(password: str, salt: bytes) -> str:
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, _PASSWORD_ROUNDS).hex()
 
 
+def _password_matches(row: sqlite3.Row, password: str) -> bool:
+    return hmac.compare_digest(row["password_hash"], _password_hash(password, bytes.fromhex(row["password_salt"])))
+
+
 def _session_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
@@ -73,10 +76,20 @@ def _account_domains(values: tuple[str, ...]) -> tuple[str, ...]:
 
 
 class AccountStore:
-    """Own account/session transactions; deleted users never reuse subject IDs."""
+    """Own account/session transactions; deleted users never reuse subject IDs.
 
-    def __init__(self, data_dir: Path, tenant_id: str):
+    `admin_password` (RAG_ADMIN_PASSWORD) is the only source of the fixed administrator's
+    password: it creates the account, and a changed value replaces the stored password on
+    startup. Without it an existing account is left alone and a new database cannot be seeded.
+    """
+
+    def __init__(self, data_dir: Path, tenant_id: str, admin_password: str | None = None):
         self.tenant_id = identifier(tenant_id, "browser_tenant")
+        if admin_password is not None:
+            try:
+                admin_password = _password(admin_password)
+            except ValidationError:
+                raise ValidationError("RAG_ADMIN_PASSWORD must be 6-128 characters without control characters") from None
         root = Path(data_dir).resolve()
         root.mkdir(parents=True, exist_ok=True)
         self.path = root / "accounts.sqlite3"
@@ -103,11 +116,19 @@ class AccountStore:
                 connection.execute("ALTER TABLE accounts ADD COLUMN data_domains TEXT NOT NULL DEFAULT '[\"public\"]'")
             # The fixed administrator is seeded once. Concurrent startup uses
             # the same unique username rather than creating multiple admins.
-            existing = connection.execute("SELECT tenant_id FROM accounts WHERE username=?", (ADMIN_USERNAME,)).fetchone()
+            existing = connection.execute("SELECT * FROM accounts WHERE username=?", (ADMIN_USERNAME,)).fetchone()
             if existing is None:
-                self._insert(connection, ADMIN_USERNAME, _ADMIN_PASSWORD, admin=True)
+                if admin_password is None:
+                    raise ValidationError("RAG_ADMIN_PASSWORD is required to create the fixed administrator account")
+                self._insert(connection, ADMIN_USERNAME, admin_password, admin=True)
             elif existing["tenant_id"] != self.tenant_id:
                 raise ValidationError("browser_tenant differs from the existing account database")
+            elif admin_password is not None and not _password_matches(existing, admin_password):
+                # A changed RAG_ADMIN_PASSWORD rotates the password and ends sessions signed in with the old one.
+                salt = secrets.token_bytes(16)
+                connection.execute("UPDATE accounts SET password_salt=?,password_hash=? WHERE account_id=?",
+                                   (salt.hex(), _password_hash(admin_password, salt), existing["account_id"]))
+                connection.execute("DELETE FROM sessions WHERE account_id=?", (existing["account_id"],))
 
     @contextmanager
     def _connection(self):
@@ -156,7 +177,7 @@ class AccountStore:
             # transaction so a concurrent deletion cannot issue a live session.
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute("SELECT * FROM accounts WHERE username=?", (username,)).fetchone()
-            if row is None or not hmac.compare_digest(row["password_hash"], _password_hash(password, bytes.fromhex(row["password_salt"]))):
+            if row is None or not _password_matches(row, password):
                 raise AuthenticationError("账号或密码不正确。")
             token = secrets.token_urlsafe(32)
             now = time.time()

@@ -11,13 +11,14 @@ from PIL import Image
 
 from adaptive_rag.api import create_api
 from adaptive_rag.config import Principal, Settings
+from support import ADMIN_PASSWORD
 
 
 class AssetHTTPTests(unittest.TestCase):
     def setUp(self):
         temp = TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.settings = Settings(data_dir=Path(temp.name), browser_tenant="alpha",
+        self.settings = Settings(data_dir=Path(temp.name), browser_tenant="alpha", admin_password=ADMIN_PASSWORD,
                                  api_tokens={"other-tenant-test-token-000000": Principal("beta", "operator", admin=True)})
         self.api = create_api(self.settings)
         self.admin = self.client()
@@ -35,7 +36,7 @@ class AssetHTTPTests(unittest.TestCase):
         self.addCleanup(client.close)
         return client
 
-    def login(self, client, username="ragadmin", password="ragadmin123"):
+    def login(self, client, username="ragadmin", password=ADMIN_PASSWORD):
         response = client.post("/auth/login", json={"username": username, "password": password})
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()

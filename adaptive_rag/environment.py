@@ -82,6 +82,8 @@ def apply_environment(settings: Settings, values: Mapping[str, str]) -> Settings
         updates["api_tokens"] = settings.api_tokens | {values["RAG_HTTP_API_TOKEN"]: principal}
     if values.get("RAG_HTTP_TENANT"):
         updates["browser_tenant"] = values["RAG_HTTP_TENANT"]
+    if values.get("RAG_ADMIN_PASSWORD"):
+        updates["admin_password"] = values["RAG_ADMIN_PASSWORD"]
     return replace(settings, **updates)
 
 

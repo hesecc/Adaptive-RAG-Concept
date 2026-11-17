@@ -12,17 +12,18 @@ from PIL import Image
 
 from adaptive_rag.api import create_api
 from adaptive_rag.config import Principal, Settings
+from support import ADMIN_PASSWORD
 
 
 class DataDomainHTTPTests(unittest.TestCase):
     def setUp(self):
         directory = TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        self.settings = Settings(data_dir=Path(directory.name), browser_tenant="company")
+        self.settings = Settings(data_dir=Path(directory.name), browser_tenant="company", admin_password=ADMIN_PASSWORD)
         self.api = create_api(self.settings)
         self.admin = self.client()
         self.assertEqual(self.admin.post("/auth/login", json={
-            "username": "ragadmin", "password": "ragadmin123"}).status_code, 200)
+            "username": "ragadmin", "password": ADMIN_PASSWORD}).status_code, 200)
         self.generation = None
 
     def client(self, api=None):

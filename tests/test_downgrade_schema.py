@@ -16,9 +16,10 @@ from adaptive_rag.app import RagApplication
 from adaptive_rag.auth import AccountStore
 from adaptive_rag.config import Principal, Settings
 from adaptive_rag.domain import IngestRequest
+from support import ADMIN_PASSWORD
 
 
-DEPLOY = Path(__file__).resolve().parents[1] / "deploy"
+DEPLOY =Path(__file__).resolve().parents[1] / "deploy"
 spec = importlib.util.spec_from_file_location("rag_downgrade", DEPLOY / "downgrade_schema.py")
 downgrade_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(downgrade_module)
@@ -45,7 +46,7 @@ class DowngradeSchemaTests(unittest.TestCase):
         for document_id, domains in (("ops-guide", ("operations",)), ("fin-report", ("finance",)), ("legacy", ())):
             result = self.application.ingest(IngestRequest("demo", document_id, "v1", f"# {document_id}\nbody text", data_domains=domains))
             generation = self.application.publish("demo", result.job_id, generation).generation
-        AccountStore(self.data, "company").create(
+        AccountStore(self.data, "company", ADMIN_PASSWORD).create(
             Principal("company", "admin", admin=True), "alice", "account-password", ("operations", "finance"))
 
     def run_downgrade(self, check_only=False):
@@ -116,7 +117,7 @@ class DowngradeSchemaTests(unittest.TestCase):
             self.assertEqual({r[0] for r in connection.execute("SELECT data_domains FROM documents")}, {"[]"})
         accounts = AccountStore(self.data, "company")
         self.assertEqual(accounts.login("alice", "account-password")[1].principal.data_domains, ("public",))
-        self.assertIsNone(accounts.login("ragadmin", "ragadmin123")[1].principal.data_domains)
+        self.assertIsNone(accounts.login("ragadmin", ADMIN_PASSWORD)[1].principal.data_domains)
         self.assertIsNotNone(upgraded)
 
     def test_second_run_is_a_no_op_and_reports_it(self):

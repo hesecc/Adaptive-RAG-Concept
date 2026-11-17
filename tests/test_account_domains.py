@@ -11,6 +11,7 @@ import unittest
 from adaptive_rag.auth import AccountStore
 from adaptive_rag.config import Principal
 from adaptive_rag.domain import ConflictError, ForbiddenError, NotFoundError, ValidationError
+from support import ADMIN_PASSWORD
 
 
 class AccountDomainTests(unittest.TestCase):
@@ -18,7 +19,7 @@ class AccountDomainTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.store = AccountStore(self.root, "company")
+        self.store = AccountStore(self.root, "company", ADMIN_PASSWORD)
         self.admin = Principal("company", "test-admin", admin=True)
 
     def create(self, username="alice", domains=("operations",)):
@@ -28,7 +29,7 @@ class AccountDomainTests(unittest.TestCase):
         return self.store.login(username, "account-password")
 
     def test_admin_is_unrestricted_and_new_readers_default_to_public_only(self):
-        _, admin = self.store.login("ragadmin", "ragadmin123")
+        _, admin = self.store.login("ragadmin", ADMIN_PASSWORD)
         self.assertIsNone(admin.principal.data_domains)
         self.assertIsNone(admin.principal.access.data_domains)
         self.assertIsNone(admin.public()["data_domains"])
@@ -95,7 +96,7 @@ class AccountDomainTests(unittest.TestCase):
                 self.store.set_domains(self.admin, username, ("operations",))
         with self.assertRaises(NotFoundError):
             self.store.set_domains(self.admin, "missing", ("operations",))
-        self.assertIsNone(self.store.login("ragadmin", "ragadmin123")[1].principal.data_domains)
+        self.assertIsNone(self.store.login("ragadmin", ADMIN_PASSWORD)[1].principal.data_domains)
 
     def test_grants_and_same_session_survive_store_restart(self):
         self.create()
@@ -142,7 +143,7 @@ class AccountDomainTests(unittest.TestCase):
         self.assertEqual(account.principal.subject_id, subject_id)
         self.assertEqual(account.principal.data_domains, ("public",))
         self.assertEqual(upgraded.login("alice", "account-password")[1].principal.subject_id, subject_id)
-        self.assertIsNone(upgraded.login("ragadmin", "ragadmin123")[1].principal.data_domains)
+        self.assertIsNone(upgraded.login("ragadmin", ADMIN_PASSWORD)[1].principal.data_domains)
         self.assertEqual(len(upgraded.users(self.admin)), 2)
 
     def test_concurrent_legacy_upgrade_is_idempotent(self):

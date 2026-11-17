@@ -132,13 +132,13 @@ app = RagApplication(Settings(plugins={'lexical': 'my_local_search'}), registry)
 
 ## HTTP 本机入口
 
-直接启动 HTTP 服务即可使用账号登录，无需先配置 HTTP Key：
+启动 HTTP 服务即可使用账号登录，无需配置 HTTP Key。固定管理员 `ragadmin` 的口令只从环境变量 `RAG_ADMIN_PASSWORD` 读取（6–128 位，不含控制字符）：先把 `.env.example` 复制为 `.env`（已被 Git 忽略）并填写该项，再启动：
 
 ```powershell
-uv run adaptive-rag serve
+uv run adaptive-rag --env-file .env serve
 ```
 
-服务默认仅绑定 `127.0.0.1:8000`。在浏览器打开根路径，以固定管理员 `ragadmin` / `ragadmin123` 登录。管理员可在「账号管理」中创建、查看和删除普通账号；固定管理员不能删除。普通账号登录后可检索知识库、查看执行链路和引用证据，文档维护、作业读取和账号管理仍要求管理员。
+服务默认仅绑定 `127.0.0.1:8000`。在浏览器打开根路径，以 `ragadmin` 和上面设置的口令登录。新数据目录首次启动必须提供口令，否则拒绝启动；已有账号库缺少该变量时保持原口令，变量的值变化则在启动时替换口令并使旧的登录会话失效。管理员可在「账号管理」中创建、查看和删除普通账号；固定管理员不能删除。普通账号登录后可检索知识库、查看执行链路和引用证据，文档维护、作业读取和账号管理仍要求管理员。
 
 账号与会话存放在数据目录的 `accounts.sqlite3`，服务重启后保留。浏览器通过 `an_rag_session` Cookie 保持登录，刷新页面自动恢复未过期会话；退出登录或删除账号后，原会话失效。页面不保存密码或模型 Key。普通账号共享管理员所在知识库租户，但仍使用独立身份检查现有文档权限。
 
@@ -181,7 +181,7 @@ uv run adaptive-rag serve
 
 图片资产、版本、持久化任务与图片 trace 默认使用 SQLite，可切换 PostgreSQL；原图与缩略图通过 `ObjectStore` 接本地文件或 S3；图片文字向量可接 SQLite 精确检索或 Milvus。远程存储开关与云模型开关相互独立，不会因切换存储自动调用模型或迁移已有数据。
 
-本轮不使用共享图文向量空间，不自动理解图片、不自动提取 PDF 配图，也不生成图片。图片结果暂为独立入口，文档 dense 检索不自动迁移到图片 Milvus。操作、接口、失败恢复与边界见 [图片资料库说明](docs/image-library.md)，配置见 [存储模板](deploy/storage.env.template)，测试覆盖和部署缺口见 [验收记录](docs/research/image-storage-validation.md)。可用于简历的实际项目描述见 [项目经历](docs/project-experience.md)。
+本轮不使用共享图文向量空间，不自动理解图片、不自动提取 PDF 配图，也不生成图片。图片结果暂为独立入口，文档 dense 检索不自动迁移到图片 Milvus。操作、接口、失败恢复与边界见 [图片资料库说明](docs/image-library.md)，配置见 [存储模板](deploy/storage.env.template)，测试覆盖和部署缺口见 [验收记录](docs/research/image-storage-validation.md)。
 
 ## 不变量与当前边界
 

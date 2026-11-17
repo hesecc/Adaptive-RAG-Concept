@@ -2,6 +2,7 @@ import asyncio
 from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -15,9 +16,10 @@ from adaptive_rag.cli import main
 from adaptive_rag.config import Principal, Settings
 from adaptive_rag.domain import AccessContext, IngestRequest, QueryRequest, ValidationError
 from adaptive_rag.evaluation import load_cases, retrieval_metrics, run_evaluation
+from support import ADMIN_PASSWORD
 
 
-ADMIN_TOKEN = "admin-test-token-0000000000000001"
+ADMIN_TOKEN ="admin-test-token-0000000000000001"
 READER_TOKEN = "reader-test-token-000000000000001"
 OTHER_TOKEN = "other-test-token-0000000000000001"
 
@@ -27,7 +29,7 @@ class InterfaceTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
-        self.settings = Settings(data_dir=self.root / "data", api_tokens={
+        self.settings = Settings(data_dir=self.root / "data", admin_password=ADMIN_PASSWORD, api_tokens={
             ADMIN_TOKEN: Principal("alpha", "admin", admin=True),
             READER_TOKEN: Principal("alpha", "reader"),
             OTHER_TOKEN: Principal("beta", "admin", admin=True),
@@ -59,9 +61,9 @@ class InterfaceTests(unittest.TestCase):
             "document_id": "p", "version": "v1", "content": "warranty",
         })
         self.assertEqual(denied.status_code, 403, denied.text)
-        with TestClient(create_api(Settings(data_dir=self.root / "no-tokens"))) as client:
+        with TestClient(create_api(Settings(data_dir=self.root / "no-tokens", admin_password=ADMIN_PASSWORD))) as client:
             self.assertEqual(client.get("/console/session").status_code, 401)
-            self.assertEqual(client.post("/auth/login", json={"username": "ragadmin", "password": "ragadmin123"}).status_code, 200)
+            self.assertEqual(client.post("/auth/login", json={"username": "ragadmin", "password": ADMIN_PASSWORD}).status_code, 200)
 
     def test_api_identity_is_trusted_and_inputs_are_strict(self):
         for extra in ({"tenant_id": "beta"}, {"subject_id": "admin"}, {"groups": ["admin"]}):
@@ -117,8 +119,16 @@ class InterfaceTests(unittest.TestCase):
         self.assertEqual(out, "")
         self.assertEqual(json.loads(err)["error"]["code"], "validation_error")
         self.assertNotIn("Traceback", err)
-        with patch("uvicorn.run") as run:
+        env_file = self.root / "admin.env"
+        env_file.write_text(f"RAG_ADMIN_PASSWORD={ADMIN_PASSWORD}\n", encoding="utf-8")
+        with patch("uvicorn.run") as run, patch.dict(os.environ):
+            os.environ.pop("RAG_ADMIN_PASSWORD", None)
+            # A new data directory has no administrator yet, so serving needs the password.
             code, out, err = self.invoke("serve")
+            self.assertEqual((code, out), (2, ""))
+            self.assertIn("RAG_ADMIN_PASSWORD", json.loads(err)["error"]["message"])
+            run.assert_not_called()
+            code, out, err = self.invoke("--env-file", str(env_file), "serve")
         self.assertEqual((code, err), (0, ""))
         self.assertEqual(json.loads(out)["status"], "stopped")
         run.assert_called_once()

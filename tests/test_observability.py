@@ -17,9 +17,10 @@ from adaptive_rag.domain import AccessContext, CapabilityError, Hit, IngestReque
 from adaptive_rag.pipeline import RulePlanner
 from adaptive_rag.cloud import CloudSettings, CloudTransport
 from adaptive_rag.quality import CloudEvidenceJudge
+from support import ADMIN_PASSWORD
 
 
-ADMIN = "console-admin-test-0000000000000000"
+ADMIN ="console-admin-test-0000000000000000"
 READER = "console-reader-test-000000000000000"
 OTHER = "console-other-test-0000000000000000"
 
@@ -37,7 +38,7 @@ class WorkbenchHTTPTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        settings = Settings(data_dir=Path(self.temp.name), api_tokens={
+        settings = Settings(data_dir=Path(self.temp.name), admin_password=ADMIN_PASSWORD, api_tokens={
             ADMIN: Principal("alpha", "admin", admin=True),
             READER: Principal("alpha", "reader"),
             OTHER: Principal("beta", "admin", admin=True),
@@ -217,7 +218,7 @@ class PipelineObservationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.settings = Settings(data_dir=Path(self.temp.name))
+        self.settings = Settings(data_dir=Path(self.temp.name), admin_password=ADMIN_PASSWORD)
         self.app = RagApplication(self.settings)
         self.access = AccessContext("alpha", "admin")
         job = self.app.ingest(IngestRequest("alpha", "policy", "v1", "Amber warranty lasts twelve months."))

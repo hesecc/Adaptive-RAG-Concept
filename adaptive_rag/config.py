@@ -63,6 +63,7 @@ class Settings:
     plugins: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_PLUGINS))
     api_tokens: dict[str, Principal] = field(default_factory=dict, repr=False)
     browser_tenant: str | None = None
+    admin_password: str | None = field(default=None, repr=False)
     allow_models: bool = False
     allow_network: bool = False
     cloud: Any = field(default=None, repr=False)
@@ -122,6 +123,7 @@ def load_settings(path: str | Path | None = None) -> Settings:
         known = set(Settings.__dataclass_fields__)
         known.remove("cloud")  # Credentials are injected, never serialized in TOML.
         known.remove("infrastructure")
+        known.remove("admin_password")
         if set(values) - known:
             raise ValidationError(f"unknown settings: {', '.join(sorted(set(values) - known))}")
         if "data_dir" in values:

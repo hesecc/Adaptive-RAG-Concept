@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import json
 import math
 from pathlib import Path
+import time
 from typing import Any
 
 from .domain import AccessContext, QueryRequest, ValidationError, identifier
@@ -69,6 +70,18 @@ def retrieval_metrics(retrieved: list[str], gold: list[str], top_k: int) -> dict
     }
 
 
+def latency_summary(durations: list[float]) -> dict[str, Any] | None:
+    """Nearest-rank percentiles: the value at rank ceil(p/100 * n) of the sorted samples."""
+    if not durations:
+        return None
+    ordered = sorted(durations)
+
+    def at(percent: int) -> float:
+        return ordered[max(1, math.ceil(percent * len(ordered) / 100)) - 1]
+
+    return {"count": len(ordered), "p50": at(50), "p95": at(95), "max": ordered[-1]}
+
+
 async def run_evaluation(
     application: Any, fixture_path: str | Path, access: AccessContext, *,
     generation: str | None = None, top_k: int = 5, output_path: str | Path | None = None,
@@ -86,10 +99,14 @@ async def run_evaluation(
     if snapshot is None:
         raise ValidationError("Evaluation requires a published snapshot")
     pinned = snapshot.generation
+    durations: list[float] = []
     for case in cases:
+        started = time.perf_counter()
         result = await application.query(QueryRequest(
             access, case["question"], sku=case.get("sku"), generation=pinned, top_k=top_k,
         ))
+        duration_ms = round((time.perf_counter() - started) * 1000, 3)
+        durations.append(duration_ms)
         gold_type = "chunk" if "gold_chunk_ids" in case else "document"
         gold = case.get("gold_chunk_ids", case.get("gold_document_ids", []))
         if gold_type == "document":
@@ -104,7 +121,7 @@ async def run_evaluation(
             "id": case["id"], "question": case["question"], "sku": case.get("sku"),
             "trace_id": result.trace_id, "generation": result.generation,
             "status": result.status, "gold_type": gold_type, "gold_ids": gold,
-            "retrieved_ids": retrieved, "metrics": None,
+            "retrieved_ids": retrieved, "metrics": None, "duration_ms": duration_ms,
             "model_calls": result.capabilities.get("usage", {}).get("model_calls", 0),
         }
         if gold:
@@ -119,10 +136,14 @@ async def run_evaluation(
     report = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "parameters": {"tenant_id": access.tenant_id, "subject_id": access.subject_id,
-                       "groups": list(access.groups), "generation": pinned, "top_k": top_k,
-                       "fixture_path": str(fixture_path)},
+                       "groups": list(access.groups),
+                       # None means unrestricted (the trusted local entry); a list is the scoped identity that was evaluated.
+                       "data_domains": None if access.data_domains is None else list(access.data_domains),
+                       "generation": pinned, "top_k": top_k, "fixture_path": str(fixture_path)},
         "capabilities": application.capabilities(),
         "model_calls": sum(row.get("model_calls", 0) for row in rows),
+        "latency_ms": latency_summary(durations),
+        "latency_basis": "wall clock of application.query per case, in milliseconds; nearest-rank percentiles",
         "case_count": len(rows), "positive_case_count": len(positive),
         "unlabelled_case_count": unlabelled_count,
         "metrics": {name: sum(item[name] for item in positive) / len(positive) if positive else None

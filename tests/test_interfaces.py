@@ -16,6 +16,7 @@ from adaptive_rag.cli import main
 from adaptive_rag.config import Principal, Settings
 from adaptive_rag.domain import AccessContext, IngestRequest, QueryRequest, ValidationError
 from adaptive_rag.evaluation import load_cases, retrieval_metrics, run_evaluation
+from adaptive_rag.evaluation_reports import ReportStore
 from support import ADMIN_PASSWORD
 
 
@@ -152,7 +153,67 @@ class InterfaceTests(unittest.TestCase):
         self.assertEqual(report["retrieval_empty_rate"], 1.0)
         self.assertEqual(report["model_calls"], 0)
         self.assertEqual(report["parameters"]["generation"], generation)
+        self.assertIsNone(report["parameters"]["data_domains"])
         self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["case_count"], 2)
+        # Every case is timed, and the summary is computed from exactly those timings.
+        durations = [row["duration_ms"] for row in report["cases"]]
+        self.assertEqual(len(durations), 2)
+        self.assertTrue(all(isinstance(value, float) and value >= 0 for value in durations))
+        latency = report["latency_ms"]
+        self.assertEqual(latency["count"], 2)
+        self.assertEqual(latency["max"], max(durations))
+        self.assertEqual(latency["p50"], min(durations))
+        self.assertLessEqual(latency["p50"], latency["p95"])
+        self.assertIn("nearest-rank", report["latency_basis"])
+
+    def ingest_and_publish_through_the_cli(self, name, domain, word, generation):
+        source = self.root / f"{name}.md"
+        source.write_text(f"# {name}\nThe word {word} appears in this note.", encoding="utf-8")
+        code, out, err = self.invoke("ingest", "--tenant", "cli", "--document", name, "--version", "v1",
+                                     "--file", str(source), "--data-domain", domain)
+        self.assertEqual((code, err), (0, ""), err)
+        publish = ["publish", "--tenant", "cli", "--job", json.loads(out)["job_id"]]
+        if generation:
+            publish += ["--expected-generation", generation]
+        code, out, err = self.invoke(*publish)
+        self.assertEqual((code, err), (0, ""), err)
+        return json.loads(out)["generation"]
+
+    def test_cli_eval_saves_a_report_and_can_evaluate_as_a_limited_identity(self):
+        generation = self.ingest_and_publish_through_the_cli("ops-note", "operations", "bronzefinch", None)
+        self.ingest_and_publish_through_the_cli("fin-note", "finance", "cobaltheron", generation)
+        fixture = self.root / "cli-eval.jsonl"
+        fixture.write_text(
+            json.dumps({"id": "ops", "question": "bronzefinch", "gold_document_ids": ["ops-note"]}) + "\n" +
+            json.dumps({"id": "fin", "question": "cobaltheron", "gold_document_ids": ["fin-note"]}) + "\n",
+            encoding="utf-8")
+        store = ReportStore(self.root / "cli-data")
+
+        code, out, err = self.invoke("eval", "--tenant", "cli", "--fixture", str(fixture))
+        self.assertEqual((code, err), (0, ""), err)
+        unrestricted = json.loads(out)
+        self.assertEqual(unrestricted["kind"], "retrieval")
+        self.assertEqual(unrestricted["metrics"]["hit_at_k"], 1.0)
+        self.assertIsNone(unrestricted["parameters"]["data_domains"])
+        self.assertEqual(store.get("cli", unrestricted["report_id"]), unrestricted)
+
+        copy = self.root / "limited.json"
+        code, out, err = self.invoke("eval", "--tenant", "cli", "--fixture", str(fixture),
+                                     "--data-domain", "operations", "--output", str(copy))
+        self.assertEqual((code, err), (0, ""), err)
+        limited = json.loads(out)
+        self.assertNotEqual(limited["report_id"], unrestricted["report_id"])
+        self.assertEqual(limited["parameters"]["data_domains"], ["operations"])
+        # The finance note is out of reach for this identity, so only one of the two cases can hit.
+        self.assertEqual(limited["metrics"]["hit_at_k"], 0.5)
+        self.assertEqual(json.loads(copy.read_text(encoding="utf-8")), limited)
+        self.assertEqual({item["report_id"] for item in store.list("cli")},
+                         {unrestricted["report_id"], limited["report_id"]})
+
+        code, out, err = self.invoke("eval", "--tenant", "cli", "--fixture", str(fixture), "--data-domain", "nonsense")
+        self.assertEqual((code, out), (2, ""))
+        self.assertEqual(json.loads(err)["error"]["code"], "validation_error")
+        self.assertEqual(len(store.list("cli")), 2)
 
     def test_evaluation_rejects_malformed_gold_and_has_correct_ranking_math(self):
         fixture = self.root / "bad.jsonl"

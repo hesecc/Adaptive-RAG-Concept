@@ -11,7 +11,9 @@ from .app import RagApplication
 from .config import load_settings
 from .domain import AccessContext, IngestRequest, QueryRequest, RagError, ValidationError
 from .evaluation import run_evaluation
+from .evaluation_reports import ReportStore
 from .environment import apply_environment, pdf_settings, read_environment
+from .permission_matrix import failures, run_permission_matrix
 
 
 class JsonArgumentParser(argparse.ArgumentParser):
@@ -82,13 +84,16 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--allow", action="append", default=[])
     command.add_argument("--revoked", action="store_true")
 
-    command = tenant_command("eval")
+    command = tenant_command("eval", help="Retrieval metrics on a gold fixture; the report is saved for the evaluation page")
     command.add_argument("--fixture", required=True, type=Path)
-    command.add_argument("--output", required=True, type=Path)
+    command.add_argument("--output", type=Path, help="Also write a copy of the report here")
     command.add_argument("--generation")
     command.add_argument("--top-k", type=int, default=5)
     command.add_argument("--subject", default="local")
     command.add_argument("--group", action="append", default=[])
+    command.add_argument("--data-domain", action="append", default=[], help="Evaluate as an identity limited to these data classifications; repeat for several. Without it the run is unrestricted, like the other local commands")
+    command = tenant_command("eval-permissions", help="Check which documents each identity can retrieve, on a synthetic corpus with no model calls; exits 3 on any leak or miss")
+    command.add_argument("--output", type=Path, help="Also write a copy of the full report here")
     commands.add_parser("serve")
     command = tenant_command("assets-index", help="Process durable image-description indexing tasks")
     command.add_argument("--limit", type=int, default=10)
@@ -96,7 +101,19 @@ def parser() -> argparse.ArgumentParser:
 
 
 def _access(args) -> AccessContext:
-    return AccessContext(args.tenant, args.subject, tuple(args.group))
+    # Only the eval command takes --data-domain; the other local commands stay unrestricted.
+    domains = getattr(args, "data_domain", None)
+    return AccessContext(args.tenant, args.subject, tuple(args.group), tuple(domains) if domains else None)
+
+
+def _save_report(settings, report, kind, output):
+    saved = ReportStore(settings.data_dir).save(report, kind)
+    if output is not None:
+        try:
+            output.write_text(json.dumps(saved, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            raise ValidationError("Cannot write evaluation output") from exc
+    return saved
 
 
 def dispatch(args):
@@ -126,6 +143,14 @@ def dispatch(args):
         api = create_api(settings)
         uvicorn.run(api, host=settings.host, port=settings.port, access_log=False)
         return {"status": "stopped"}
+    if args.command == "eval-permissions":
+        # The matrix builds its own model-free application on a synthetic corpus and never
+        # the one the environment configures, so it cannot spend model calls.
+        with ReportStore(settings.data_dir).scratch() as work_dir:
+            report = asyncio.run(run_permission_matrix(args.tenant, work_dir))
+        saved = _save_report(settings, report, "permissions", args.output)
+        return {"report_id": saved["report_id"], "kind": "permissions", "passed": saved["summary"]["passed"],
+                "summary": saved["summary"], "failures": failures(saved)}
     application = RagApplication(settings)
     if args.command == "assets-index":
         return asyncio.run(application.assets.process_pending(args.tenant, args.limit))
@@ -172,7 +197,8 @@ def dispatch(args):
         application.set_access(args.tenant, args.document, tuple(args.allow), args.revoked)
         return {"status": "updated"}
     if args.command == "eval":
-        return asyncio.run(run_evaluation(application, args.fixture, _access(args), generation=args.generation, top_k=args.top_k, output_path=args.output))
+        report = asyncio.run(run_evaluation(application, args.fixture, _access(args), generation=args.generation, top_k=args.top_k))
+        return _save_report(settings, report, "retrieval", args.output)
     raise ValidationError("Unknown command")
 
 
@@ -180,7 +206,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = dispatch(parser().parse_args(argv))
         print(json.dumps(asdict(result) if is_dataclass(result) else result, ensure_ascii=False))
-        return 0
+        # 3: the run finished but a check failed (eval-permissions found a leak or a miss).
+        return 3 if isinstance(result, dict) and result.get("passed") is False else 0
     except RagError as exc:
         print(json.dumps({"error": {"code": exc.code, "message": str(exc)}}, ensure_ascii=False), file=sys.stderr)
         return 2

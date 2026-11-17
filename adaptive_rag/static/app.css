@@ -53,6 +53,7 @@
 .login-card,
 .evidence-card,
 .knowledge-document,
+.evaluation-sheet,
 .image-card,
 #source-dialog {
   color-scheme: light;
@@ -2496,6 +2497,16 @@ pre {
 @media (max-width: 660px) {
   .brand {
     font-size: 15px;
+  }
+
+  /* An administrator sees four tabs; keep them in one row so the current page stays visible. */
+  .tabs {
+    gap: 2px;
+  }
+
+  .tab {
+    padding: 0 10px;
+    font-size: 13px;
   }
 
   .topnav {

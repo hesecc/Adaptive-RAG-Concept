@@ -258,6 +258,7 @@ function showLogin(message = "") {
   $("#account-role").textContent = "";
   $("#users-open").hidden = true;
   $("#knowledge-open").hidden = true;
+  $("#evaluation-open").hidden = true;
   $("#account-domains").textContent = "";
   $("#app-shell").hidden = true;
   $("#login-page").hidden = false;
@@ -276,6 +277,7 @@ function acceptSession(session) {
   $("#account-role").textContent = session.admin ? "管理员" : "成员";
   $("#users-open").hidden = !session.admin;
   $("#knowledge-open").hidden = !session.admin;
+  $("#evaluation-open").hidden = !session.admin;
   $("#account-domains").textContent = `数据权限：${RagDomains.text(session.data_domains)}`;
   RagDomains.load().then(() => {
     if (state.user !== session) return;

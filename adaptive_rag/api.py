@@ -20,7 +20,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from .app import RagApplication
 from .auth import AccountStore, AuthenticationError, COOKIE_NAME, SESSION_SECONDS
 from .config import Principal, Settings, load_settings
-from .domain import IngestRequest, QueryRequest, RagError, safe_error
+from .domain import IngestRequest, NotFoundError, QueryRequest, RagError, safe_error
+from .evaluation_reports import ReportStore
 
 
 class Input(BaseModel):
@@ -155,6 +156,10 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     def knowledge_workbench():
         return FileResponse(static / "knowledge.html")
 
+    @api.get("/evaluation", include_in_schema=False)
+    def evaluation_workbench():
+        return FileResponse(static / "evaluation.html")
+
     def authenticate(request: Request) -> Principal:
         header = request.headers.get("authorization", "")
         scheme, separator, token = header.partition(" ")
@@ -283,6 +288,20 @@ def create_api(settings: Settings | None = None) -> FastAPI:
         snapshot = application.store.open_snapshot(principal.tenant_id)
         return {"documents": application.store.list_documents(principal.tenant_id),
                 "generation": snapshot.generation if snapshot is not None else None}
+
+    reports = ReportStore(settings.data_dir)
+
+    @api.get("/evaluation/reports")
+    def evaluation_reports(principal: Admin):
+        return {"reports": reports.list(principal.tenant_id)}
+
+    @api.get("/evaluation/reports/{report_id}")
+    def evaluation_report(report_id: str, principal: Admin):
+        # A missing report, a malformed ID, and another tenant's report all look the same.
+        report = reports.get(principal.tenant_id, report_id)
+        if report is None:
+            raise NotFoundError("evaluation report not found")
+        return report
 
     @api.post("/publish")
     def publish(body: PublishInput, principal: Admin):

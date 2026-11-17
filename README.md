@@ -158,6 +158,7 @@ uv run adaptive-rag --env-file .env serve
 | POST | `/query/stream` | 登录用户的实时阶段事件，完成后返回结果与授权 Trace |
 | GET | `/jobs/{id}` | 管理员作业读取 |
 | GET | `/traces/{id}` | 同租户链路诊断，按当前源权限复核 |
+| GET | `/evaluation`、`/evaluation/reports`、`/evaluation/reports/{id}` | 评测页面；管理员读取已保存的评测报告（只读，按租户隔离） |
 | GET | `/evidence/{generation}/{evidence_id}` | 按快照回源并复核实时 ACL |
 | POST | `/access`、`/documents/delete`、`/rollback` | 撤权、删除、回滚 |
 
@@ -169,7 +170,7 @@ uv run adaptive-rag --env-file .env serve
 
 页面显示真实执行时间线、各步状态与服务端耗时，并可查看结构化返回、最终回答、逐条引用、证据回源、模型调用及平台返回的 Token 用量。实时事件先展示阶段元数据，结果经最终权限检查与 Trace 持久化后再展示内容；未启用或因预算跳过的步骤会明确标记。按 Trace ID 可重新加载历史记录并复核当前权限，也可下载本次运行 JSON。会话列表仅保留在当前页面；下载文件包含问题与证据，应按知识库数据管理。
 
-当前页面用于已有知识库的检索与诊断。管理员可在「知识管理」页（`/knowledge`）导入文本、Markdown、HTML 资料并选择数据分类，暂存、发布和调整分类；PDF 导入、撤权和回滚仍使用现有 CLI 或 HTTP 接口。详细操作与事件契约见 [检索工作台说明](docs/workbench.md)。
+当前页面用于已有知识库的检索与诊断。管理员可在「知识管理」页（`/knowledge`）导入文本、Markdown、HTML 资料并选择数据分类，暂存、发布和调整分类；PDF 导入、撤权和回滚仍使用现有 CLI 或 HTTP 接口。管理员还可以点击顶栏的「评测」（`/evaluation`）只读查看已保存的评测报告，见[评测](docs/evaluation.md)。详细操作与事件契约见 [检索工作台说明](docs/workbench.md)。
 
 ## 数据分类与鉴权
 
@@ -196,7 +197,9 @@ uv run adaptive-rag --env-file .env serve
 
 ## 评测与下一阶段准入
 
-`eval` 固定快照，只对非空 gold 题计算 Hit@K、Recall@K、MRR@K、NDCG@K；无 gold 的题单列空检索率，不能当作拒答准确率。支持 `gold_document_ids` 或 `gold_chunk_ids`，不混用。示例集很小，只验证流程，不代表真实业务质量。
+`eval` 固定快照，只对非空 gold 题计算 Hit@K、Recall@K、MRR@K、NDCG@K，并汇总每题耗时的 p50、p95；无 gold 的题单列空检索率，不能当作拒答准确率。支持 `gold_document_ids` 或 `gold_chunk_ids`，不混用。可用 `--data-domain` 以受限身份评测。示例集很小，只验证流程，不代表真实业务质量。
+
+`eval-permissions` 用一份合成语料检查每种身份能检索到哪些文档，不调用模型；发现越权或缺失时退出码为 3。两个命令的报告都保存在数据目录的 `evaluations/` 下，管理员在 `/evaluation` 查看。用法、报告格式和边界见 [评测](docs/evaluation.md)，分层方案和工具选型见[评测方案](docs/research/evaluation-tooling-assessment.md)。
 
 已接入的三个模型均走云平台 API Key，默认仍关闭；查询增强和质量审查复用生成模型，不增加本地模型部署。HTTP 429/5xx 最多重试一次，鉴权错误、重定向和超时不自动重试；向量缓存按模型及维度配置隔离。检索指标不验证生成答案、审查器判定或整体拒答质量。下一步用业务标注集评测答案、解析和检索质量，对增强开关做消融，再决定配额、生产索引及扩容；Laya 决策模型后续单独部署与微调，本阶段不启用。原专题分析见 [RAG 流程与实现实践报告](docs/research/RAG流程与实现实践报告.md)。
 

@@ -9,6 +9,30 @@
   const close = modal => modal.querySelector("[data-close]").click();
   const detail = async () => { btn(id("file-list"), "Guide").click(); await until(()=>one("#detail-body pre"), "preview"); };
   const select = (name, value) => { id(name).value = value; id(name).dispatchEvent(new Event("change")); };
+  // Use the browser's resolved colors, including alpha blending on the paper.
+  function assertReadable(dialog, selectors) {
+    const ctx = document.createElement("canvas").getContext("2d");
+    const paint = color => { ctx.fillStyle = color; ctx.fillRect(0, 0, 1, 1); };
+    const luminance = () => {
+      const rgb = Array.from(ctx.getImageData(0, 0, 1, 1).data).slice(0, 3).map(byte => {
+        const v = byte / 255;
+        return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+      });
+      return .2126 * rgb[0] + .7152 * rgb[1] + .0722 * rgb[2];
+    };
+    for (const selector of selectors) {
+      const node = dialog.querySelector(selector);
+      const layers = [];
+      for (let el = node; el !== dialog.parentElement; el = el.parentElement) layers.unshift(getComputedStyle(el).backgroundColor);
+      layers.forEach(paint);
+      const bg = luminance();
+      paint(getComputedStyle(node).color);
+      const fg = luminance(), ratio = (Math.max(bg, fg) + .05) / (Math.min(bg, fg) + .05);
+      assert(ratio >= 4.5, `${dialog.id} ${selector} text contrast: ${ratio.toFixed(2)}`);
+    }
+    assert(getComputedStyle(dialog).colorScheme === "light", "native controls on paper");
+    assert(getComputedStyle(document.body).colorScheme === "dark", "desk palette stays dark");
+  }
   async function submit(url) {
     const n = writes.length;
     id("editor-form").requestSubmit();
@@ -31,6 +55,7 @@
     assert(reads.includes("/files/image/pic/content?revision=r2") && !reads.includes("/files/image/pic/content?revision=r1"), "current image revision only");
     close(id("file-detail"));
     await detail();
+    assertReadable(id("file-detail"), ["h2", "pre", "select"]);
     assert(one("#detail-body pre").textContent === "<b>plain text</b>" && !one("#detail-body pre b"), "inert text preview");
     const rev = one("#detail-body select"); rev.value = "r1"; rev.dispatchEvent(new Event("change"));
     // Capture the final download handoff without writing into the browser user's Downloads.
@@ -52,6 +77,7 @@
     } else {
       assert(!btn(id("detail-body"), "保存分类"), "member access controls"); close(id("file-detail"));
       id("file-add").click();
+      assertReadable(id("file-editor"), ["h2", "label", "#editor-hint", "#editor-title", "#editor-kind", "#editor-content", "legend", "#editor-save"]);
       assert(id("editor-domains").querySelectorAll("input").length === 1 && !one("#editor-domains input:checked"), "member classifications");
       id("editor-title").value = "New"; id("editor-content").value = "Text";
       const doc = await submit("/files/documents"); assert(!("data_domains" in doc || "allowed_subjects" in doc), "default unclassified");

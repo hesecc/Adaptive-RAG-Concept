@@ -31,7 +31,12 @@ ids=()
 for service in "${writers[@]}"; do
   short=$("${compose[@]}" ps --status running -q "$service")
   [[ "$short" =~ ^[0-9a-f]{12,64}$ ]] || exit 1
-  expected=$("${compose[@]}" config --hash "$service")
+  # Compose v2 can hash the env_file declaration rather than the effective
+  # container environment. Pipe the resolved model directly; never log it.
+  expected=$("${compose[@]}" config --format json 2>/dev/null |
+    docker compose -p "$RAG_PROJECT" --project-directory "$(dirname "$RAG_COMPOSE_FILE")" \
+      -f - config --no-interpolate --hash "$service" 2>/dev/null) || {
+    echo 'Cannot verify resolved configuration: refusing maintenance' >&2; exit 1; }
   actual=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.config-hash"}}' "$short")
   [[ "$actual" =~ ^[a-f0-9]{64}$ && "$expected" == "$service $actual" ]] || {
     echo 'Configuration changed since deployment: refusing maintenance' >&2; exit 1; }

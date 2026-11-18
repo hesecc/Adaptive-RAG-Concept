@@ -2,9 +2,10 @@
 
 import base64
 import binascii
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import BoundedSemaphore
 from typing import Annotated, Literal
 
 from fastapi import Depends, Request
@@ -13,7 +14,9 @@ from pydantic import Field
 
 from .http_inputs import AssetInput, AssetUpdate, DocumentInput, Input
 from .config import Principal
-from .domain import ConflictError, ForbiddenError, IngestRequest, NotFoundError, ValidationError
+from .domain import CapabilityError, ConflictError, ForbiddenError, IngestRequest, NotFoundError, ValidationError, identifier, nonempty
+from .data_access import normalize_data_domains
+from .mineru_formats import ORIGINAL_MIME
 from .pdf import PdfSettings
 
 
@@ -33,6 +36,11 @@ class PdfUpload(Input):
     title: str
     data_domains: list[str] = Field(default_factory=list, max_length=6)
     content_base64: str = Field(min_length=1, max_length=13_333_336)
+
+
+class ParsedUpload(PdfUpload):
+    extension: Literal['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx']
+    cloud_consent: bool = Field(strict=True)
 
 
 def _decode(value):
@@ -68,9 +76,10 @@ def _image_fields(body):
     return values
 
 
-def register_files(api, application, authenticate):
+def register_files(api, application, authenticate, *, mineru_settings=None):
     User = Annotated[Principal, Depends(authenticate)]
     Kind = Literal['document', 'image']
+    parse_slots = BoundedSemaphore(2)
 
     def decorate(tenant, rows):
         attrs = {'owner_id': 'owner_name', 'updated_by': 'updated_by_name', 'deleted_by': 'deleted_by_name'}
@@ -114,6 +123,40 @@ def register_files(api, application, authenticate):
                 pdf_settings=PdfSettings(max_input_bytes=10_000_000, max_text_bytes=2_000_000),
                 tenant_id=principal.tenant_id, **metadata))
 
+    @api.post('/files/parse', status_code=201)
+    def parse_document(body: ParsedUpload, request: Request, principal: User):
+        if not body.cloud_consent:
+            raise ValidationError('请先确认将此原文件发送至 MinerU 在线服务。')
+        metadata = _document_fields(body.model_dump(exclude={'extension', 'cloud_consent', 'content_base64'}), principal)
+        identifier(body.document_id, 'document_id')
+        identifier(body.version, 'version')
+        nonempty(body.title, 'title', 300)
+        normalize_data_domains(metadata['data_domains'])
+
+        def authorize_stage():
+            if authenticate(request) != principal:
+                raise ConflictError('账号或权限已改变，请刷新文件中心。')
+            application.store.check_stage_owner(principal, body.document_id)
+
+        authorize_stage()
+        if not mineru_settings or not mineru_settings.api_key:
+            raise CapabilityError('未配置 MinerU 在线解析。文件未发送，也未暂存。')
+        if not parse_slots.acquire(blocking=False):
+            raise CapabilityError('解析任务已满，请稍后重试。文件未发送。')
+        try:
+            content = _decode(body.content_base64)
+            # Leave time for archive validation and staging inside the 150 s proxy deadline.
+            settings = replace(mineru_settings, max_input_bytes=10_000_000, max_text_bytes=2_000_000,
+                               max_download_bytes=32_000_000, timeout_seconds=20, max_wait_seconds=100)
+            with TemporaryDirectory(prefix='rag-parse-') as directory:
+                source = Path(directory) / ('upload.' + body.extension)
+                source.write_bytes(content)
+                result = application.ingest_mineru(source, pdf_settings=settings, principal=principal,
+                    before_stage=authorize_stage, tenant_id=principal.tenant_id, **metadata)
+                return asdict(result)
+        finally:
+            parse_slots.release()
+
     @api.post('/files/images', status_code=201)
     def new_image(body: AssetInput, principal: User):
         return application.assets.managed_create(principal, content=_decode(body.content_base64), **_image_fields(body))
@@ -148,9 +191,9 @@ def register_files(api, application, authenticate):
             content = application.objects.get(source[0])
             if lookup(authenticate(request), file_id, revision, original=original) != source:
                 raise ConflictError('document changed during read')
-            media_type = 'application/pdf' if source[1] == 'application/pdf' else 'text/plain'
+            media_type = source[1] if source[1] in ORIGINAL_MIME.values() else 'text/plain'
         # Never render uploaded HTML as an active same-origin document.
-        disposition = 'attachment' if media_type == 'application/pdf' else 'inline'
+        disposition = 'attachment' if media_type in ORIGINAL_MIME.values() else 'inline'
         return Response(content, media_type=media_type, headers={'Content-Disposition': disposition})
 
     @api.post('/files/{kind}/{file_id}/trash')

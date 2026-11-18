@@ -175,7 +175,7 @@ def dispatch(args):
     if args.command == "serve":
         from .api import create_api
         import uvicorn
-        api = create_api(settings)
+        api = create_api(settings, mineru_settings=pdf_settings(environment))
         uvicorn.run(api, host=settings.host, port=settings.port, access_log=False)
         return {"status": "stopped"}
     if args.command == "eval-permissions":

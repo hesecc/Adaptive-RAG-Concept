@@ -46,19 +46,33 @@ class RagApplication:
     def ingest_pdf(self, path, *, backend="local", pdf_settings=None, pdf_checkpoint=None, principal=None, **metadata):
         from pathlib import Path
         from hashlib import sha256
-        from .domain import IngestRequest
+        from .mineru_formats import ARCHIVE_INPUT_LIMIT, read_source
         from .pdf import parse_pdf
         source = Path(path)
         parsed = parse_pdf(source, backend, pdf_settings,
                            **({"checkpoint_path": pdf_checkpoint} if pdf_checkpoint is not None else {}))
-        try:
-            if source.stat().st_size > 50_000_000:
-                raise ValidationError("PDF source changed or exceeds the archive size limit")
-            raw = source.read_bytes()
-        except OSError:
-            raise ValidationError("cannot read PDF source for archival") from None
+        raw = read_source(source, ARCHIVE_INPUT_LIMIT, "PDF")
         if sha256(raw).hexdigest() != parsed.metadata.get("source_sha256"):
             raise ValidationError("PDF source changed during parsing; retry with a stable source")
+        return self._stage_parsed(parsed, raw, principal, metadata)
+
+    def ingest_mineru(self, path, *, pdf_settings, principal=None, before_stage=None, **metadata):
+        """Upload once. A synchronous authorization callback must return None or raise."""
+        from .pdf import MinerUPdfParser
+        if before_stage is not None and not callable(before_stage):
+            raise ValidationError("before_stage must be a callable")
+        parsed, raw = MinerUPdfParser(pdf_settings).parse_original(path)
+        if before_stage is not None:
+            authorization = before_stage()
+            if authorization is not None:
+                from inspect import iscoroutine
+                if iscoroutine(authorization):
+                    authorization.close()
+                raise ValidationError("before_stage must return None synchronously or raise")
+        return self._stage_parsed(parsed, raw, principal, metadata)
+
+    def _stage_parsed(self, parsed, raw, principal, metadata):
+        from .domain import IngestRequest
         raw_key = self.objects.put(raw)
         # Figures are stored before the document, so a stored document never points at a missing picture.
         markdown, figures, validated_keys = attach_figures(parsed.markdown, parsed.figures, self.objects.put)

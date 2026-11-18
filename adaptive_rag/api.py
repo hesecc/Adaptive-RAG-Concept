@@ -28,7 +28,7 @@ from .http_inputs import (AccessInput, AccountDomainsInput, AccountInput, AssetI
 from .evaluation_reports import ReportStore
 
 
-def create_api(settings: Settings | None = None) -> FastAPI:
+def create_api(settings: Settings | None = None, *, mineru_settings=None) -> FastAPI:
     settings = settings or load_settings()
     application = RagApplication(settings)
     admin_tenants = {principal.tenant_id for principal in settings.api_tokens.values() if principal.admin}
@@ -447,5 +447,5 @@ def create_api(settings: Settings | None = None) -> FastAPI:
         application.assets.delete(principal, asset_id, expected_revision)
         return Response(status_code=204)
 
-    register_files(api, application, authenticate)
+    register_files(api, application, authenticate, mineru_settings=mineru_settings)
     return api

@@ -2,8 +2,9 @@
 
 from .api import create_api
 from .config import load_settings
-from .environment import apply_environment, read_environment
+from .environment import apply_environment, pdf_settings, read_environment
 
 
 def create():
-    return create_api(apply_environment(load_settings(), read_environment()))
+    values = read_environment()
+    return create_api(apply_environment(load_settings(), values), mineru_settings=pdf_settings(values))

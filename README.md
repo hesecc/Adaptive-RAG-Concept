@@ -71,7 +71,9 @@ uv run adaptive-rag --env-file .env trace --tenant demo --id $result.trace_id
 
 容器可由部署系统显式注入相同环境变量，进程环境优先于指定的本地文件。`.env` 和带凭证的配置不进入 Git、镜像或公开日志；模型 Key 与本项目 HTTP 的 Bearer token 分开生成和保存。
 
-## PDF 解析与对比
+## CLI：PDF 解析与对比
+
+命令行入库仍只接受 PDF、纯文本、Markdown 和 HTML。下文的 PDF 命令不接受 Office 文件；Office 原件请使用网页文件中心。
 
 本地解析无需 Key；MinerU 需要本机 `.env` 中的 `MINERU_API_KEY`，并会把所选 PDF 上传到 MinerU。可对同一 PDF 分别输出 Markdown，再比较页序、标题、表格、公式及文本完整性：
 
@@ -92,7 +94,7 @@ uv run adaptive-rag --env-file .env parse-pdf --file $pdf.FullName --backend min
 
 ```mermaid
 flowchart LR
-  A[文本 / Markdown / HTML / PDF] --> B[解析与保守清洗]
+  A[文本 / Markdown / HTML / PDF / 网页 Office] --> B[解析与保守清洗]
   B --> C[父子块 + 来源定位 + 哈希]
   C --> D[内容寻址原文 / SQLite 暂存]
   D --> E[事务 CAS 发布不可变快照]
@@ -178,7 +180,7 @@ uv run adaptive-rag --env-file .env serve
 
 页面展示实际执行时间、逐条引用、证据回源、模型调用和 Token 用量。实时事件先展示阶段元数据，终态通过权限检查后才展示回答。回看不会重新调用模型，也不需要复制 Trace ID；下载的诊断 JSON 包含问题与证据，应按知识库数据管理。
 
-检索工作台用于问答和诊断。[知识文件管理](docs/file-center.md)（`/knowledge`）将文档、独立图片和回收站放在一个入口。管理员可管理本租户资料；普通成员可上传和管理自己的文件，文档需管理员发布才参与问答。网页支持文本、Markdown、HTML 和带文字层的 PDF；MinerU 插图解析继续走 CLI。另见[评测](docs/evaluation.md)与[工作台说明](docs/workbench.md)。
+检索工作台用于问答和诊断。[文件中心](docs/file-center.md)（`/knowledge`）支持粘贴正文、读取文本 / Markdown / HTML，以及单独上传图片。PDF、Word（doc/docx）、Excel（xls/xlsx）和 PowerPoint（ppt/pptx）共用一个入口：先确认允许把完整原件发送给外部 MinerU，再提交解析。新文档和更新版本都先暂存，由管理员发布后才参与问答。另见[评测](docs/evaluation.md)与[工作台说明](docs/workbench.md)。
 
 ## 数据分类与鉴权
 

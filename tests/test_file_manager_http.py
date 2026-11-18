@@ -3,21 +3,27 @@ import base64
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 from adaptive_rag.api import create_api
 from adaptive_rag.config import Settings
+from adaptive_rag.mineru_formats import ORIGINAL_MIME
+from adaptive_rag.pdf import ParsedPdf, PdfSettings
 from support import ADMIN_PASSWORD
 from test_assets import picture
 from test_pdf import pdf_bytes
 
 
 class FileCenterHTTPTests(unittest.TestCase):
+    parser_settings = None
+
     def setUp(self):
         work = tempfile.TemporaryDirectory()
         self.addCleanup(work.cleanup)
-        self.api = create_api(Settings(data_dir=Path(work.name), admin_password=ADMIN_PASSWORD))
+        self.api = create_api(Settings(data_dir=Path(work.name), admin_password=ADMIN_PASSWORD),
+                              mineru_settings=self.parser_settings)
         self.admin = self.login('ragadmin', ADMIN_PASSWORD)
         self.alice = self.member('alice')
         self.bob = self.member('bobby')
@@ -152,3 +158,80 @@ class FileCenterHTTPTests(unittest.TestCase):
         body=self.body() | {'media_type':'text/html','content':'<p>new branch</p>'}
         self.assertEqual(self.alice.post('/files/documents',json=body).status_code,201)
         self.assertTrue(self.alice.get('/files/document/handbook/content').headers['content-type'].startswith('text/plain'))
+
+    def test_cloud_parse_without_credentials_never_sends(self):
+        with patch('adaptive_rag.pdf.MinerUPdfParser.parse_original') as call:
+            result = self.alice.post('/files/parse', json=cloud_body())
+            self.assertEqual(result.status_code, 503, result.text)
+            call.assert_not_called()
+
+
+def cloud_body():
+    return dict(document_id='prices', title='Service prices', version='v1', extension='xlsx',
+                data_domains=['public'], content_base64=base64.b64encode(b'test workbook').decode(),
+                cloud_consent=True)
+
+
+class CloudFileHTTPTests(unittest.TestCase):
+    setUp = FileCenterHTTPTests.setUp
+    login = FileCenterHTTPTests.login
+    member = FileCenterHTTPTests.member
+    parser_settings = PdfSettings(api_key='unit-test-only')
+    parsed = ParsedPdf('| service | fee |\n|---|---|\n| copperlime | 728 |', None, 'mineru:xlsx', 0)
+
+    def test_denied_uploads_do_not_call_parser(self):
+        body = cloud_body()
+        with patch('adaptive_rag.pdf.MinerUPdfParser.parse_original') as call, TestClient(self.api) as anon:
+            for client, changes, expected in ((anon, {}, 401), (self.alice, {'cloud_consent':False}, 400),
+                    (self.alice, {'extension':'csv'}, 422), (self.alice, {'data_domains':['finance']}, 403)):
+                with self.subTest(changes=changes):
+                    result = client.post('/files/parse', json=body | changes)
+                    self.assertEqual(result.status_code, expected, result.text)
+            self.assertEqual(self.bob.post('/files/documents', json=FileCenterHTTPTests.body() | {'document_id':'prices'}).status_code, 201)
+            self.assertEqual(self.alice.post('/files/parse', json=body).status_code, 409)
+            self.assertEqual(self.bob.post('/files/document/prices/trash', json={}).status_code, 200)
+            self.assertEqual(self.bob.post('/files/parse', json=body).status_code, 409)
+            call.assert_not_called()
+
+    def test_permissions_change_during_cloud_parse(self):
+        def change_permissions(path):
+            changed = self.admin.patch('/admin/users/alice/domains', json={'data_domains':['operations']})
+            self.assertEqual(changed.status_code, 200, changed.text)
+            return self.parsed, path.read_bytes()
+        with patch('adaptive_rag.pdf.MinerUPdfParser.parse_original', side_effect=change_permissions), \
+                patch.object(self.api.state.application.objects, 'put') as persist:
+            result = self.alice.post('/files/parse', json=cloud_body())
+            self.assertIn(result.status_code, (401, 409), result.text)
+            persist.assert_not_called()
+        self.assertFalse(self.admin.get('/files?view=all').json()['files'])
+
+    def test_parsed_table_stage_publish_download_trash_restore(self):
+        body = cloud_body()
+        raw = base64.b64decode(body['content_base64'])
+        with patch('adaptive_rag.pdf.MinerUPdfParser.parse_original', return_value=(self.parsed, raw)):
+            job = self.alice.post('/files/parse', json=body)
+        self.assertEqual(job.status_code, 201, job.text)
+        path = '/files/document/prices'
+        detail = self.alice.get(path).json()
+        self.assertEqual(detail['source_extension'], 'xlsx')
+        self.assertEqual(detail['versions'][0]['source_extension'], 'xlsx')
+        original = self.alice.get(path + '/content?original=true')
+        self.assertEqual(original.content, raw)
+        self.assertEqual(original.headers['content-type'], ORIGINAL_MIME['xlsx'])
+        self.assertEqual(original.headers['content-disposition'], 'attachment')
+        self.assertIn(self.bob.get(path + '/content?original=true').status_code, (403, 404))
+        preview = self.alice.get(path + '/content')
+        self.assertTrue(preview.headers['content-type'].startswith('text/plain'))
+        self.assertIn('728', preview.text)
+        def evidence():
+            return self.bob.post('/query', json={'question':'copperlime'}).json()['evidence']
+        self.assertFalse(evidence())
+        gen = self.admin.post('/publish', json={'job_id':job.json()['job_id']}).json()['generation']
+        self.assertIn('728', evidence()[0]['text'])
+        self.assertEqual(self.alice.post(path + '/trash', json={'expected_generation':gen}).status_code, 200)
+        self.assertFalse(evidence())
+        trash = self.alice.get('/files?view=trash').json()
+        restored = self.alice.post(path + '/restore', json={'expected_generation':trash['generation'],
+                                   'trash_id':trash['files'][0]['trash_id']})
+        self.assertEqual(restored.status_code, 200, restored.text)
+        self.assertIn('728', evidence()[0]['text'])

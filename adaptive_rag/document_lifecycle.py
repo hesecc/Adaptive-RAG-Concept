@@ -7,6 +7,19 @@ from uuid import uuid4
 
 from .config import Principal
 from .domain import ConflictError, ForbiddenError, NotFoundError, ValidationError, identifier
+from .mineru_formats import ORIGINAL_MIME
+
+
+def _source_extension(meta):
+    if not meta.get('source_object_key'):
+        return None
+    parser = meta.get('source_parser') or ''
+    if parser.startswith('mineru:'):
+        ext = parser.partition(':')[2]
+        if ext not in ORIGINAL_MIME:
+            raise ValidationError('unknown archived document format')
+        return ext
+    return 'pdf'  # Prior releases archived PDF originals only.
 
 
 LIFECYCLE_SCHEMA = """
@@ -68,6 +81,10 @@ class DocumentLifecycle:
             row = conn.execute(self._sql("SELECT epoch FROM document_access_epochs WHERE tenant_id=?"), (tenant,)).fetchone()
             return row["epoch"] if row else 0
 
+    def check_stage_owner(self, principal, doc):
+        with self._snapshot_read() as conn:
+            self._stage_owner(conn, _principal(principal).tenant_id, identifier(doc, 'document_id'), principal)
+
     def _stage_owner(self, conn, tenant, doc, principal):
         if principal is not None:
             _principal(principal, tenant)
@@ -121,7 +138,8 @@ class DocumentLifecycle:
                         published=row["current_revision_id"] is not None, admin_hold=bool(row["admin_hold"]),
                         can_restore=trash and now < datetime.fromisoformat(row["purge_after"]) and
                         (principal.admin or (not row["admin_hold"] and row["deleted_by"] == principal.subject_id)))
-            item.update(kind="document", id=doc_id, updated_at=row["updated_at"] or history[0]["created_at"],
+            item.update(kind="document", id=doc_id, source_extension=_source_extension(json.loads(row['metadata_json'])),
+                        updated_at=row["updated_at"] or history[0]["created_at"],
                         updated_by=row["updated_by"], allowed_subjects=json.loads(row["allowed_subjects"]),
                         data_domains=json.loads(row["data_domains"]),
                         status=("trashed" if trash else "revoked" if item["revoked"] else
@@ -135,6 +153,7 @@ class DocumentLifecycle:
                 authors = {e["revision_id"]: e["actor_id"] for e in item["events"] if e["action"] == "stage"}
                 item["versions"] = [{"revision_id": r["revision_id"], "version": r["version"], "state": r["state"],
                                      "created_by": authors.get(r["revision_id"]),
+                                     "source_extension": _source_extension(json.loads(r['metadata_json'])),
                                      "created_at": r["created_at"], "title": json.loads(r["metadata_json"])["title"]}
                                     for r in history]
             result.append(item)
@@ -195,7 +214,7 @@ class DocumentLifecycle:
                 raise NotFoundError("document revision not found")
             meta = json.loads(row["metadata_json"])
             if original and meta.get("source_object_key"):
-                return meta["source_object_key"], "application/pdf", revision
+                return meta["source_object_key"], ORIGINAL_MIME[_source_extension(meta)], revision
             return row["raw_key"], meta["media_type"], revision
 
     def _trash(self, conn, tenant, doc, expected, *, actor, admin, published_only=False):

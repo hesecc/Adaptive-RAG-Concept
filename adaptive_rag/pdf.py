@@ -26,6 +26,7 @@ import httpx
 
 from .domain import CapabilityError, ValidationError
 from .figures import ARCHIVE_REFERENCE, Figure
+from .mineru_formats import ARCHIVE_INPUT_LIMIT, ORIGINAL_MIME, read_source, validate_office
 
 # Pictures MinerU exports next to full.md. Over the limits a picture is skipped, not the document.
 MAX_FIGURES = 200
@@ -193,21 +194,15 @@ def _https_url(value: str) -> str:
 
 
 def _input(path: str | Path, settings: PdfSettings) -> tuple[Path, bytes]:
-    try:
-        source = Path(path)
-        if source.suffix.lower() != ".pdf" or not source.is_file():
-            raise ValidationError("source must be an existing PDF file")
-        if not 1 <= source.stat().st_size <= settings.max_input_bytes:
-            raise ValidationError("PDF exceeds the configured input size limit")
-        raw = source.read_bytes()
-    except OSError:
-        raise ValidationError("cannot read PDF source") from None
-    if len(raw) > settings.max_input_bytes or not raw[:1024].lstrip().startswith(b"%PDF-"):
-        raise ValidationError("invalid PDF header or input size")
-    return source, raw
+    source = Path(path)
+    if source.suffix.lower() != ".pdf":
+        raise ValidationError("source must be an existing PDF file")
+    return source, read_source(source, settings.max_input_bytes, "PDF")
 
 
 def _reader(raw: bytes, settings: PdfSettings):
+    if not raw[:1024].lstrip().startswith(b"%PDF-"):
+        raise ValidationError("invalid PDF header or input size")
     try:
         from pypdf import PdfReader
     except ImportError:
@@ -280,9 +275,28 @@ class MinerUPdfParser:
 
     def parse(self, path: str | Path, *, checkpoint_path: str | Path | None = None) -> ParsedPdf:
         started = self.clock()
-        deadline = started + self.settings.max_wait_seconds
         source, raw = _input(path, self.settings)
         pages = len(_reader(raw, self.settings).pages)
+        return self._parse_validated(source, raw, pages, started, "mineru", checkpoint_path)
+
+    def parse_original(self, path: str | Path) -> tuple[ParsedPdf, bytes]:
+        """Parse a supported original and return the exact validated bytes uploaded."""
+        started = self.clock()
+        source = Path(path)
+        ext = source.suffix[1:].lower()
+        if ext not in ORIGINAL_MIME:
+            raise ValidationError("unsupported MinerU source format")
+        raw = read_source(source, min(self.settings.max_input_bytes, ARCHIVE_INPUT_LIMIT), ext.upper())
+        if ext == "pdf":
+            pages, parser = len(_reader(raw, self.settings).pages), "mineru"
+        else:
+            validate_office(raw, ext)
+            pages, parser = None, f"mineru:{ext}"
+        # v4 uses the extension to select conversion. Don't disclose the local filename.
+        return self._parse_validated(Path(f"upload.{ext}"), raw, pages, started, parser), raw
+
+    def _parse_validated(self, source, raw, pages, started, parser, checkpoint_path=None):
+        deadline = started + self.settings.max_wait_seconds
         if not self.settings.api_key:
             raise CapabilityError("MinerU API key is not configured")
         data_id = sha256(raw).hexdigest()
@@ -390,7 +404,7 @@ class MinerUPdfParser:
                 raise CapabilityError("MinerU result download failed or archive exceeds the configured size limit") from None
             markdown, figures, archive_metadata = self._markdown(archive)
             checkpoint.save("complete", batch_id)
-            return ParsedPdf(markdown, pages, "mineru", round(self.clock() - started, 4), {
+            return ParsedPdf(markdown, pages, parser, round(self.clock() - started, 4), {
                 "source_sha256": data_id, "model_version": self.settings.model_version,
                 "batch_id": batch_id, "resumed_from_checkpoint": saved is not None,
                 "states": states, "network_calls": calls,
@@ -441,7 +455,7 @@ class MinerUPdfParser:
                     "formula_blocks": len(re.findall(r"\$\$[\s\S]*?\$\$", markdown)),
                     "html_tables": len(re.findall(r"<table(?:\s|>)", markdown, re.I)),
                     **figure_metadata}
-        except (BadZipFile, UnicodeError, OSError, RuntimeError):
+        except (UnicodeError, *_ARCHIVE_READ_ERRORS):
             raise CapabilityError("MinerU returned an invalid result archive") from None
 
 

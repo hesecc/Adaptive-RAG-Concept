@@ -30,7 +30,7 @@ uv run adaptive-rag ingest --tenant company --document ops-manual --version v1 -
 
 分类属于资料本身，不属于某个版本。更新文件不改变分类，命令行的 `--data-domain` 同样不会改动已有分类。未分类资料不会出现在成员检索结果里。例外仅针对管理预览：新建的未分类草稿从未发布且未调整权限时，上传人可以预览自己提交的修订，不因此获得其他版本的读取权。
 
-文件中心可在本地解析网页上传的 PDF 文字层（`POST /files/pdf`）；需要 MinerU 时仍使用可信 CLI。文件管理权和已发布内容的检索权限不是同一件事，参见[文件中心](file-center.md)。
+**外部解析同意与访问权限分开。** 网页提交 PDF 或 Office 时，上传人须确认该原件允许发送给外部 MinerU；即使资料分类为 `public`，也不能跳过本次同意。勾选只授权本次外发，不改变分类、ACL 或发布状态。不能外发的 PDF 可显式调用原有本地接口 `POST /files/pdf` 提取文字层。参见[文件中心](file-center.md)。
 
 **调整已有资料的分类。** 在 `/knowledge` 的资料卡片上修改并保存分类，或调用 `POST /documents/access`，只传 `data_domains` 时不会改动个人 ACL 和撤销状态。分类改动立即生效，包括历史快照。重新入库、发布新版本、回滚都不会恢复旧分类、清除 ACL 或撤销状态。升级前的未分类资料需要管理员逐份分类后，普通账号才能读到。
 
@@ -65,5 +65,5 @@ SQLite 与 PostgreSQL 在启动时幂等地添加分类字段：旧资料的分�
 ## 边界
 
 - 分类是固定的六类，增减分类需要修改 `adaptive_rag/data_access.py` 中的目录。
-- 本文描述的实现已于 2026-11-17 随 `rag-20261117T041936Z` 上线，线上仍使用 SQLite 与本地文件；PostgreSQL、Milvus、S3 只在本地验证过。`docs/image-library.md` 与 `deploy/STORAGE.md` 中的存储部署缺口仍然有效。
+- 数据分类的历史部署情况见[服务器部署记录](deployment-server.md)。该记录不是本次网页 PDF / Office 解析的生产验收记录。
 - 权限覆盖的是本项目 HTTP 与页面入口。直接读取数据目录、数据库或对象存储的人不受这些检查约束，需要用操作系统和云平台的权限另行保护。

@@ -3,15 +3,23 @@
 const fileDetail = (() => {
   const {byId, element, state, path, json, response, contentPath, revision, time, action} = fileCenter;
   const modal = byId("file-detail"), root = byId("detail-body");
+  const downloadTypes = new Map([
+    ["text/plain", "txt"], ["application/pdf", "pdf"], ["application/msword", "doc"],
+    ["application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx"],
+    ["application/vnd.ms-excel", "xls"], ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx"],
+    ["application/vnd.ms-powerpoint", "ppt"], ["application/vnd.openxmlformats-officedocument.presentationml.presentation", "pptx"],
+    ["image/png", "png"], ["image/webp", "webp"], ["image/jpeg", "jpg"],
+  ]);
   let request, previewRequest;
   function stop() { request?.abort(); previewRequest?.abort(); root.replaceChildren(); }
   modal.addEventListener("close", () => { if (!modal.open) stop(); });
 
   function download(label, path, id, signal) {
     return action(label, async () => {
-      const blob = await (await response(path, {signal})).blob();
-      const extension = {"text/plain": "txt", "application/pdf": "pdf", "image/png": "png", "image/webp": "webp", "image/jpeg": "jpg"}[blob.type.split(";")[0]];
+      const res = await response(path, {signal});
+      const extension = downloadTypes.get(res.headers.get("Content-Type")?.split(";")[0].trim().toLowerCase());
       if (!extension) throw Error("无法下载此内容类型。");
+      const blob = await res.blob();
       if (signal.aborted) return;
       pageOwner.assertActive();
       const link = element("a");

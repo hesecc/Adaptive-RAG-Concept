@@ -4,22 +4,26 @@ const fileEditor = (() => {
   const {byId, state, json, path, response, contentPath, revision, mayManage} = fileCenter;
   const field = name => byId("editor-" + name);
   const modal = byId("file-editor");
+  const extensions = ["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx"];
   let editing = null;
   let request;
 
   function configure() {
     const kind = field("kind").value;
     const image = kind === "image";
+    const parse = kind === "parse";
     field("upload-label").hidden = image && !!editing;
-    field("upload").required = kind === "pdf" || (image && !editing);
-    field("upload").accept = image ? "image/png,image/jpeg,image/webp" : kind === "pdf" ? ".pdf,application/pdf" : ".md,.markdown,.txt,.html,.htm";
+    field("upload").required = parse || (image && !editing);
+    field("upload").accept = image ? "image/png,image/jpeg,image/webp" : parse ? extensions.map(e => "." + e).join(",") : ".md,.markdown,.txt,.html,.htm";
+    field("notice").hidden = !parse;
+    field("consent").required = parse;
     field("version-label").hidden = image;
     field("version").required = !image;
     field("text-fields").hidden = kind !== "document";
     field("content").required = kind === "document";
     field("image-fields").hidden = !image;
     field("domain-fields").hidden = !!editing || (image && !state.session.admin);
-    field("hint").textContent = kind === "pdf" ? "PDF 最大 10 MB，仅本地解析文本，不调用云服务或 OCR。" : image ?
+    field("hint").textContent = parse ? "PDF、Word、Excel 或 PowerPoint，最大 10 MB。" : image ?
       (editing ? "更新图片说明，不替换原图或访问权限。" : "PNG、JPEG 或 WebP，最大 10 MB。") : "支持粘贴正文或读取不超过 2 MB 的文本、Markdown、HTML。";
     field("save").textContent = image ? "保存图片" : "暂存文档";
   }
@@ -63,9 +67,14 @@ const fileEditor = (() => {
     }
     const file = field("upload").files[0];
     if (!file || !file.size || file.size > 10_000_000) throw Error("请选择非空且不超过 10 MB 的文件。");
-    if (kind === "pdf" && !/\.pdf$/i.test(file.name)) throw Error("请选择 PDF 文件。");
+    if (kind === "parse") {
+      const extension = /\.([a-z0-9]+)$/i.exec(file.name)?.[1].toLowerCase();
+      if (!extensions.includes(extension)) throw Error("请选择支持的 PDF 或 Office 文件。");
+      if (!field("consent").checked) throw Error("请先确认同意外部解析。");
+      Object.assign(body, {extension, cloud_consent: true});
+    }
     body.content_base64 = await base64(file);
-    return [kind === "pdf" ? "/files/pdf" : "/files/images", "POST", body];
+    return [kind === "parse" ? "/files/parse" : "/files/images", "POST", body];
   }
   async function open(file = null) {
     if (state.busy || (file && !mayManage(file))) return;
@@ -98,6 +107,8 @@ const fileEditor = (() => {
         field("description").value = editing.description || "";
         field("ocr").value = editing.ocr_text || "";
         field("tags").value = (editing.tags || []).join(", ");
+      } else if (extensions.includes(editing.source_extension)) {
+        field("kind").value = "parse";
       } else {
         try {
           const res = await response(contentPath(file, revision(editing)), {signal});
@@ -109,11 +120,11 @@ const fileEditor = (() => {
             field("format").value = ["text/plain", "text/html", "text/markdown"].includes(editing.media_type) ? editing.media_type : "text/plain";
           } else if (type === "application/pdf") {
             if (signal.aborted) return;
-            field("kind").value = "pdf";
+            field("kind").value = "parse";
           }
         } catch (error) {
           if (signal.aborted) return;
-          field("error").textContent = "未能读取原正文。可提交新的文本或 PDF。" + error.message;
+          field("error").textContent = "未能读取原正文。可提交新的文本、PDF 或 Office 文件。";
         }
       }
       if (signal.aborted) return;
@@ -124,11 +135,13 @@ const fileEditor = (() => {
   modal.addEventListener("close", () => {
     if (modal.open) return;
     request?.abort();
+    byId("editor-form").reset();
     field("fields").disabled = field("save").disabled = false;
   });
-  field("kind").addEventListener("change", () => { field("upload").value = ""; field("error").textContent = ""; configure(); });
+  field("kind").addEventListener("change", () => { field("upload").value = ""; field("consent").checked = false; field("error").textContent = ""; configure(); });
   field("upload").addEventListener("change", async () => {
     const input = field("upload"), file = input.files[0];
+    field("consent").checked = false;
     if (!file) return;
     try {
       field("error").textContent = "";
@@ -145,16 +158,24 @@ const fileEditor = (() => {
   function bind(saved) {
     byId("editor-form").addEventListener("submit", async event => {
       event.preventDefault();
-      if (state.busy) return;
+      if (state.busy || field("fields").disabled) return;
       state.busy = true;
       field("fields").disabled = field("save").disabled = true;
+      field("error").textContent = "";
+      if (field("kind").value === "parse") field("status").textContent = "正在提交文件并等待 MinerU 解析，请稍候…";
       try {
         const args = await payload();
-        await json(...args);
+        try { await json(...args); }
+        catch (error) {
+          if (args[0] !== "/files/parse") throw error;
+          // Provider errors may quote document content or include private URLs.
+          field("consent").checked = false;
+          throw Error("未能完成外部解析。请刷新核对版本后重试，或联系管理员。");
+        }
         modal.close();
         await saved(args[0].startsWith("/files/images") ? "图片已保存。" : "文档已暂存，等待管理员发布。");
       } catch (error) { field("error").textContent = error.message; }
-      finally { state.busy = false; field("fields").disabled = field("save").disabled = false; }
+      finally { field("status").textContent = ""; state.busy = false; field("fields").disabled = field("save").disabled = false; }
     });
   }
   return {open, bind};

@@ -51,7 +51,7 @@ class PageShellTests(unittest.TestCase):
     def test_every_page_carries_the_same_four_navigation_tabs(self):
         # The image library once shipped with only two tabs, so the other two vanished until the user went back.
         expected = [("/", "检索工作台"), ("/images", "图片资料库"),
-                    ("/knowledge", "知识入库与权限"), ("/evaluation", "评测")]
+                    ("/knowledge", "文件中心"), ("/evaluation", "评测")]
         own = {"index.html": "/", "images.html": "/images", "knowledge.html": "/knowledge", "evaluation.html": "/evaluation"}
         for page in PAGES:
             text = (STATIC / page).read_text(encoding="utf-8")
@@ -63,14 +63,16 @@ class PageShellTests(unittest.TestCase):
             current = [re.search(r'href="([^"]*)"', attrs).group(1) for attrs, _ in links if "aria-current" in attrs]
             self.assertEqual(current, [own[page]], page)
 
-    def test_pages_that_reveal_the_administrator_tabs_start_with_them_hidden(self):
-        # Members never see these two tabs on the workbench, so the image library must not show them either.
+    def test_members_get_file_center_but_not_evaluation_navigation(self):
         for page, script in (("index.html", "app.js"), ("images.html", "images.js")):
             shell = tags(page)
             source = (STATIC / script).read_text(encoding="utf-8")
             for identifier in ("knowledge-open", "evaluation-open"):
                 self.assertIn("hidden", shell.with_id(identifier), (page, identifier))
-                self.assertRegex(source, rf'["#]{identifier}["\']?\)?\.hidden\s*=\s*!', (script, identifier))
+            self.assertIn('knowledge-open").hidden = false', source)
+            self.assertIn('evaluation-open").hidden = !session.admin', source)
+        for page in ("knowledge.html", "evaluation.html"):
+            self.assertIn("hidden", tags(page).with_id("evaluation-open"))
 
     def test_brand_marks_have_a_size_without_the_stylesheet(self):
         # An inline SVG that only has a viewBox grows to the width of the page when app.css is missing.

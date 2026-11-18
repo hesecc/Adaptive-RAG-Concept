@@ -38,10 +38,10 @@ class RagApplication:
             self._assets = build_assets(self.settings, self.objects)
         return self._assets
 
-    def ingest(self, request):
-        return self.ingestion.ingest(request)
+    def ingest(self, request, *, principal=None):
+        return self.ingestion.ingest(request, **({"principal": principal} if principal is not None else {}))
 
-    def ingest_pdf(self, path, *, backend="local", pdf_settings=None, pdf_checkpoint=None, **metadata):
+    def ingest_pdf(self, path, *, backend="local", pdf_settings=None, pdf_checkpoint=None, principal=None, **metadata):
         from pathlib import Path
         from hashlib import sha256
         from .domain import IngestRequest
@@ -64,24 +64,24 @@ class RagApplication:
             source_object_key=raw_key, source_parser=parsed.backend, **metadata)
         if validated_keys:
             request = ParsedFigureRequest(**asdict(request), parser_figure_keys=validated_keys)
-        result = self.ingest(request)
+        result = self.ingest(request, **({"principal": principal} if principal is not None else {}))
         # A retry recreates missing entries, even for a duplicate job.
         for key in validated_keys:
             entry = figure_binding(request.tenant_id, request.document_id, request.version, result.revision_id, key)
             self.objects.put(entry)
         return PdfIngestResult(**asdict(result), figures=figures)
 
-    def publish(self, tenant_id, job_id, expected_generation):
-        return self.store.publish(tenant_id, job_id, expected_generation)
+    def publish(self, tenant_id, job_id, expected_generation, *, principal=None):
+        return self.store.publish(tenant_id, job_id, expected_generation, principal=principal)
 
-    def delete_document(self, tenant_id, document_id, expected_generation):
-        return self.store.delete_document(tenant_id, document_id, expected_generation)
+    def delete_document(self, tenant_id, document_id, expected_generation, *, principal=None):
+        return self.store.delete_document(tenant_id, document_id, expected_generation, principal=principal)
 
     def rollback(self, tenant_id, generation, expected_generation):
         return self.store.rollback(tenant_id, generation, expected_generation)
 
-    def set_access(self, tenant_id, document_id, allowed_subjects=None, revoked=None, data_domains=None):
-        return self.store.set_access(tenant_id, document_id, allowed_subjects, revoked, data_domains)
+    def set_access(self, tenant_id, document_id, allowed_subjects=None, revoked=None, data_domains=None, *, principal=None):
+        return self.store.set_access(tenant_id, document_id, allowed_subjects, revoked, data_domains, principal=principal)
 
     async def query(self, request, observer=None):
         return await self.pipeline.run(request, self.capabilities(), observer)

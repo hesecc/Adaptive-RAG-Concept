@@ -1,177 +1,105 @@
 "use strict";
 
-const knowledgeById = id => document.getElementById(id);
-let knowledgeGeneration = null;
-let knowledgeBusy = false;
-
-function knowledgeElement(tag, text, className) {
-  const node = document.createElement(tag);
-  if (text !== undefined) node.textContent = text;
-  if (className) node.className = className;
-  return node;
-}
-
-async function knowledgeApi(path, options = {}) {
-  let response;
-  try {
-    response = await fetch(path, {credentials: "same-origin", cache: "no-store", ...options,
-      headers: {"Content-Type": "application/json", ...options.headers}});
-  } catch { throw Error("无法连接服务，请检查网络或服务状态后重试。"); }
-  if (response.status === 401) { location.href = "/"; throw Error("请先登录工作台。"); }
-  if (response.status === 429) throw Error("请求过于频繁，请稍后重试。");
-  let value;
-  try { value = response.status === 204 ? null : await response.json(); }
-  catch { throw Error(`服务返回格式错误（HTTP ${response.status}），请稍后重试。`); }
-  if (!response.ok) throw Error(response.status === 403 ? "只有管理员可以管理知识和数据分类。" : value?.error?.message || `请求失败（HTTP ${response.status}）`);
-  return value;
-}
-
-function knowledgeNotice(message, error = false) {
-  const node = knowledgeById("knowledge-notice");
-  node.textContent = message;
-  node.hidden = !message;
-  node.classList.toggle("error", error);
-}
-
-function resetKnowledgeForm() {
-  knowledgeById("knowledge-ingest-form").reset();
-  knowledgeById("knowledge-id").value = `doc-${crypto.randomUUID()}`;
-  RagDomains.render(knowledgeById("knowledge-data-domains"), []);
-}
-
-function documentAction(label, callback, errorNode) {
-  const button = knowledgeElement("button", label);
-  button.type = "button";
-  button.addEventListener("click", async () => {
-    if (knowledgeBusy) { errorNode.textContent = "另一项资料变更正在执行，请稍候再试。"; return; }
-    knowledgeBusy = true;
-    button.disabled = true;
-    errorNode.textContent = "";
-    try { await callback(); }
-    catch (error) { errorNode.textContent = error.message; knowledgeNotice(error.message, true); }
-    finally { knowledgeBusy = false; button.disabled = false; }
-  });
-  return button;
-}
-
-function renderKnowledgeDocuments(items) {
-  const root = knowledgeById("knowledge-documents");
-  root.replaceChildren();
-  knowledgeById("knowledge-count").textContent = `${items.length} 份资料`;
-  if (!items.length) { root.append(knowledgeElement("div", "暂无资料。先在左侧暂存一份资料，再发布进入知识库。", "plain-empty")); return; }
-  for (const item of items) {
-    const card = knowledgeElement("article", undefined, "knowledge-document");
-    const header = knowledgeElement("div", undefined, "knowledge-document-header");
-    const title = knowledgeElement("div");
-    title.append(knowledgeElement("h3", item.title || item.document_id),
-      knowledgeElement("p", `ID：${item.document_id} · 版本：${item.version || "—"}`, "knowledge-document-meta"));
-    const pending = Array.isArray(item.staged_jobs) ? item.staged_jobs : [];
-    const state = item.revoked ? "访问已撤销"
-      : item.published ? (pending.length ? `已发布 · ${pending.length} 个新版本待发布` : "已发布") : "待发布";
-    header.append(title, knowledgeElement("span", state, `knowledge-publish-state${item.revoked ? " revoked" : ""}`));
-    card.append(header, knowledgeElement("p", `数据分类：${RagDomains.text(item.data_domains)}`, "knowledge-document-meta"));
-    if (item.allowed_subjects?.length) card.append(knowledgeElement("p", "本资料还设有额外的账号/分组权限，分类调整会保留这些限制。", "knowledge-document-meta"));
-    const choices = knowledgeElement("div");
-    choices.setAttribute("role", "group");
-    choices.setAttribute("aria-label", `${item.title || item.document_id} 的数据分类`);
-    RagDomains.render(choices, item.data_domains || []);
-    const actions = knowledgeElement("div", undefined, "knowledge-document-actions");
-    const error = knowledgeElement("div", "", "knowledge-document-error");
-    error.setAttribute("role", "alert");
-    actions.append(documentAction("保存分类", async () => {
-      const dataDomains = RagDomains.values(choices);
-      if (!dataDomains.length) throw Error("请至少选择一个数据分类。未分类的历史资料会继续仅管理员可见。");
-      await knowledgeApi("/documents/access", {method: "POST", body: JSON.stringify({document_id: item.document_id, data_domains: dataDomains})});
-      await refreshKnowledgeDocuments();
-      knowledgeNotice(`“${item.title || item.document_id}”的分类已更新，后续检索和引用将按新分类鉴权。`);
-    }, error));
-    // The backend lists every unpublished revision in `staged_jobs` (newest first), so a
-    // document can have several versions waiting; each one gets its own publish action.
-    for (const job of pending) {
-      const versionLabel = job.version || job.revision_id.slice(0, 8);
-      const label = item.published || pending.length > 1 ? `发布版本 ${versionLabel}` : "发布资料";
-      actions.append(documentAction(label, async () => {
-        await knowledgeApi("/publish", {method: "POST", body: JSON.stringify({job_id: job.job_id, expected_generation: knowledgeGeneration})});
-        await refreshKnowledgeDocuments();
-        knowledgeNotice(`“${job.title || item.title || item.document_id}”版本 ${versionLabel} 已发布。若需调整分类，可直接在本卡片保存。`);
-      }, error));
+(() => {
+  const {byId, element, state, json, path, revision, mayManage, time, kinds, statuses, action, notice} = fileCenter;
+  let listRequest;
+  function render() {
+    const root = byId("file-list");
+    const query = byId("file-query").value.trim().toLowerCase();
+    const kind = byId("file-kind").value, status = byId("file-status").value;
+    const files = state.files.filter(f => (!kind || f.kind === kind) && (!status || f.status === status) &&
+      [f.title, f.id, f.owner_name, f.owner_id].some(v => String(v || "").toLowerCase().includes(query)));
+    root.replaceChildren();
+    byId("knowledge-count").textContent = files.length + " 个文件";
+    const generation = state.generation;
+    for (const file of files) {
+      const row = element("article", null, "file-row");
+      const identity = element("div"), title = element("h3");
+      if (state.view === "trash") {
+        title.textContent = file.title || file.id;
+      } else {
+        const name = action(file.title || file.id, () => fileDetail.open(file, mutate));
+        name.className = "file-name";
+        title.append(name);
+      }
+      identity.append(title, element("p", kinds[file.kind] + " · " + file.id, "file-meta"));
+      const metadata = element("div");
+      metadata.append(element("p", [statuses[file.status] || file.status, file.version || revision(file)?.slice(0, 12)].filter(Boolean).join(" · ")),
+        element("p", "所有者：" + (file.owner_name || file.owner_id || "—"), "file-meta"));
+      const changed = element("div"), actions = element("div", null, "file-actions");
+      if (state.view === "trash") {
+        changed.append(element("p", "删除：" + (file.deleted_by_name || file.deleted_by || "—") + " · " + time(file.deleted_at), "file-meta"),
+          element("p", "恢复截止：" + time(file.purge_after), "file-meta"));
+        identity.append(element("p", "回收记录：" + file.trash_id, "file-meta"));
+        if (file.can_restore && file.trash_id) actions.append(action("还原", () => mutate(path(file) + "/restore",
+          {trash_id: file.trash_id, expected_generation: generation}, "文件已还原。")));
+      } else {
+        changed.append(element("p", time(file.updated_at)), element("p", "更新人：" + (file.updated_by_name || file.updated_by || "—"), "file-meta"));
+        if (mayManage(file)) actions.append(action("更新", () => fileEditor.open(file)), action("移入回收站", () => {
+          if (!revision(file)) throw Error("缺少文件版本，请刷新后重试。");
+          if (window.confirm("将“" + (file.title || file.id) + "”移入回收站？")) return mutate(path(file) + "/trash",
+            {expected_generation: generation, expected_revision: revision(file)}, "文件已移入回收站。");
+        }));
+      }
+      row.append(identity, metadata, changed, actions);
+      root.append(row);
     }
-    if (item.revoked) card.append(knowledgeElement("p", "此资料当前已撤销访问；保存分类不会自动恢复访问。", "knowledge-document-meta"));
-    card.append(choices, actions, error);
-    root.append(card);
+    if (!files.length) root.append(element("p", query || kind || status ? "没有符合筛选条件的文件。" : state.view === "trash" ? "回收站为空。" : "暂无文件。", "plain-empty"));
   }
-}
-
-async function refreshKnowledgeDocuments() {
-  const value = await knowledgeApi("/documents");
-  knowledgeGeneration = value.generation ?? null;
-  knowledgeById("knowledge-generation").textContent = knowledgeGeneration ? `当前快照：${knowledgeGeneration}` : "尚无已发布知识快照";
-  const documents = value.documents || [];
-  renderKnowledgeDocuments(documents);
-  return documents;
-}
-
-knowledgeById("knowledge-file").addEventListener("change", async () => {
-  const file = knowledgeById("knowledge-file").files[0];
-  if (!file) return;
-  const errorNode = knowledgeById("knowledge-form-error");
-  errorNode.textContent = "";
-  try {
-    if (file.size > 2_000_000 || !/\.(md|markdown|txt|html|htm)$/i.test(file.name)) throw Error("请选择不超过 2MB 的 .md、.txt 或 .html 文件。PDF 请先通过现有解析入口处理。");
-    knowledgeById("knowledge-content").value = await file.text();
-    if (!knowledgeById("knowledge-title").value.trim()) knowledgeById("knowledge-title").value = file.name.slice(0, 300);
-    knowledgeById("knowledge-format").value = /\.html?$/i.test(file.name) ? "text/html" : /\.txt$/i.test(file.name) ? "text/plain" : "text/markdown";
-  } catch (error) { errorNode.textContent = error.message; knowledgeById("knowledge-file").value = ""; }
-});
-
-knowledgeById("knowledge-ingest-form").addEventListener("submit", async event => {
-  event.preventDefault();
-  if (knowledgeBusy) { knowledgeById("knowledge-form-error").textContent = "另一项资料变更正在执行，请稍候再试。"; return; }
-  const button = knowledgeById("knowledge-ingest");
-  knowledgeBusy = true; button.disabled = true;
-  knowledgeById("knowledge-form-error").textContent = "";
-  try {
-    const dataDomains = RagDomains.values(knowledgeById("knowledge-data-domains"));
-    if (!dataDomains.length) throw Error("请选择资料的数据分类，再进行暂存。");
-    const title = knowledgeById("knowledge-title").value.trim();
-    const documentId = knowledgeById("knowledge-id").value.trim();
-    const value = await knowledgeApi("/documents", {method: "POST", body: JSON.stringify({
-      document_id: documentId, version: knowledgeById("knowledge-version").value.trim(),
-      title, content: knowledgeById("knowledge-content").value,
-      media_type: knowledgeById("knowledge-format").value, data_domains: dataDomains,
-    })});
-    resetKnowledgeForm();
-    const documents = await refreshKnowledgeDocuments();
-    // Classification belongs to the document, not to a version. When this id already existed the
-    // server keeps its current classification, so say so instead of letting the choice vanish.
-    const live = documents.find(item => item.document_id === documentId);
-    const sameDomains = (left, right) => [...left].sort().join(",") === [...right].sort().join(",");
-    if (live && !sameDomains(live.data_domains || [], dataDomains)) {
-      knowledgeNotice(`“${title}”已暂存，尚未发布。注意：这份资料已存在，数据分类属于资料本身、不随版本变化，仍为“${RagDomains.text(live.data_domains)}”，本次勾选的分类没有生效。如需调整，请在下方资料卡片修改并保存分类。任务 ID：${value.job_id}`, true);
-    } else {
-      knowledgeNotice(`“${title}”已暂存，尚未发布。请在资料卡片上点击发布按钮。任务 ID：${value.job_id}`);
+  async function refresh(view = state.view) {
+    listRequest?.abort();
+    listRequest = new AbortController();
+    const {signal} = listRequest;
+    state.view = view;
+    state.files = []; state.generation = null;
+    for (const b of document.querySelectorAll("[data-view]")) b.setAttribute("aria-pressed", String(b.dataset.view === view));
+    byId("knowledge-count").textContent = byId("knowledge-generation").textContent = "";
+    byId("file-list").textContent = "正在读取文件…";
+    try {
+      const value = await json("/files?view=" + view, "GET", undefined, signal);
+      if (signal.aborted) return;
+      if (!Array.isArray(value.files)) throw Error("文件列表格式错误。");
+      state.files = value.files.map(fileCenter.normalize);
+      state.generation = value.generation ?? null;
+      const select = byId("file-status"), selected = select.value;
+      select.replaceChildren(new Option("全部状态", ""));
+      for (const s of new Set(state.files.map(f => f.status).filter(Boolean))) select.add(new Option(statuses[s] || s, s));
+      if ([...select.options].some(o => o.value === selected)) select.value = selected;
+      byId("knowledge-generation").textContent = state.generation ? "当前快照：" + state.generation : "尚无已发布快照";
+      render();
+    } catch (error) {
+      if (signal.aborted) return;
+      byId("file-list").textContent = "未能读取文件。请刷新重试。";
+      throw error;
     }
-  } catch (error) { knowledgeById("knowledge-form-error").textContent = error.message; }
-  finally { knowledgeBusy = false; button.disabled = false; }
-});
-
-knowledgeById("knowledge-refresh").addEventListener("click", async () => {
-  const button = knowledgeById("knowledge-refresh");
-  button.disabled = true;
-  try { await refreshKnowledgeDocuments(); knowledgeNotice("已读取最新资料和分类。"); }
-  catch (error) { knowledgeNotice(error.message, true); }
-  finally { button.disabled = false; }
-});
-
-(async () => {
-  try {
-    const session = await knowledgeApi("/console/session");
-    knowledgeById("knowledge-account").textContent = session.username;
-    if (!session.admin) throw Error("只有管理员可以管理知识入库与分类。请返回知识库对话，按当前权限检索资料。");
+  }
+  async function saved(message) {
+    try { await refresh(); notice(message); }
+    catch (error) { notice(message + " 列表未刷新：" + error.message, true); }
+  }
+  async function mutate(url, body, message, onSuccess) {
+    if (state.busy) throw Error("另一项变更正在进行。");
+    state.busy = true;
+    try { await json(url, "POST", body); onSuccess?.(); await saved(message); }
+    finally { state.busy = false; }
+  }
+  function load(view) { notice(""); refresh(view).catch(e => notice(e.message, true)); }
+  for (const b of document.querySelectorAll("[data-view]")) b.addEventListener("click", () => { byId("file-status").value = ""; load(b.dataset.view); });
+  for (const id of ["file-kind", "file-status", "file-query"]) byId(id).addEventListener("input", render);
+  byId("knowledge-refresh").addEventListener("click", () => load(state.view));
+  byId("file-add").addEventListener("click", () => fileEditor.open());
+  for (const b of document.querySelectorAll("[data-close]")) b.addEventListener("click", () => { if (!state.busy) b.closest("dialog").close(); });
+  for (const d of document.querySelectorAll("dialog")) d.addEventListener("cancel", e => { if (state.busy) e.preventDefault(); });
+  fileEditor.bind(saved);
+  (async () => {
+    state.session = await json("/console/session");
+    byId("knowledge-account").textContent = state.session.username || state.session.subject_id;
+    byId("evaluation-open").hidden = !state.session.admin;
+    document.querySelector('[data-view="all"]').hidden = !state.session.admin;
+    state.view = state.session.admin ? "all" : "mine";
     await RagDomains.load();
-    knowledgeById("knowledge-domains").textContent = `数据权限：${RagDomains.text(session.data_domains)}`;
-    resetKnowledgeForm();
-    await refreshKnowledgeDocuments();
-    knowledgeById("knowledge-workspace").hidden = false;
-  } catch (error) { knowledgeNotice(error.message, true); }
+    byId("knowledge-domains").textContent = "数据权限：" + RagDomains.text(state.session.data_domains);
+    byId("knowledge-workspace").hidden = false;
+    await refresh();
+  })().catch(e => notice(e.message, true));
 })();

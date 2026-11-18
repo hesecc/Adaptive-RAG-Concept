@@ -277,7 +277,7 @@ byId("image-trace-form").addEventListener("submit", async event => {
   try {
     const session = await api("/console/session");
     // The page tabs do not depend on the domain catalogue, so reveal them before it loads.
-    byId("knowledge-open").hidden = !session.admin;
+    byId("knowledge-open").hidden = false;
     byId("evaluation-open").hidden = !session.admin;
     await RagDomains.load();
     imageAdmin = session.admin;

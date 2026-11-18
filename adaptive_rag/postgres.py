@@ -20,6 +20,8 @@ from .domain import (
     IngestResult, NotFoundError, ParentChunk, PreparedDocument, RagError,
     Snapshot, ValidationError, identifier, stable_id,
 )
+from .config import Principal
+from .document_lifecycle import LIFECYCLE_SCHEMA
 from .data_access import domains_allowed, normalize_data_domains
 from .storage import (
     SQLiteKnowledgeStore, SQLiteTraceSink, _CANDIDATE_SCHEMA, _SnapshotStore,
@@ -35,6 +37,7 @@ def validate_prepared_document(document: PreparedDocument) -> None:
 _TABLES = (
     "documents", "revisions", "parents", "children", "jobs", "snapshots",
     "snapshot_revisions", "current_snapshots", "traces", "candidate_snapshots", "candidate_revisions", "candidate_jobs",
+    "document_trash", "document_events", "retired_document_ids",
 )
 
 _SCHEMA = """
@@ -140,6 +143,10 @@ class _PostgresDatabase:
                 raise ConflictError("unsupported PostgreSQL storage schema version")
             connection.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS data_domains TEXT NOT NULL DEFAULT '[]'")
             connection.execute("ALTER TABLE revisions ADD COLUMN IF NOT EXISTS created_at TEXT NOT NULL DEFAULT ''")
+            connection.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS owner_id TEXT")
+            for statement in LIFECYCLE_SCHEMA.replace("CREATE VIEW IF NOT EXISTS", "CREATE OR REPLACE VIEW").split(";"):
+                if statement.strip():
+                    connection.execute(statement)
 
     def __repr__(self):
         return f"{type(self).__name__}(schema={self.schema!r}, dsn=<redacted>)"
@@ -172,7 +179,7 @@ class _PostgresDatabase:
 class PostgresKnowledgeStore(_SnapshotStore, _PostgresDatabase):
     """KnowledgeStore backed by tenant-serialized PostgreSQL write transactions."""
 
-    def stage(self, document: PreparedDocument) -> IngestResult:
+    def stage(self, document: PreparedDocument, *, principal: Principal | None = None) -> IngestResult:
         validate_prepared_document(document)
         request = document.request
         tenant, doc, revision = request.tenant_id, request.document_id, document.revision_id
@@ -190,6 +197,7 @@ class PostgresKnowledgeStore(_SnapshotStore, _PostgresDatabase):
         metadata = asdict(request)
         metadata.pop("content")
         with self._connection(tenant=tenant) as connection:
+            owner = self._stage_owner(connection, tenant, doc, principal)
             existing = connection.execute(
                 "SELECT payload_hash FROM revisions WHERE tenant_id=%s AND document_id=%s AND revision_id=%s",
                 (tenant, doc, revision),
@@ -198,8 +206,9 @@ class PostgresKnowledgeStore(_SnapshotStore, _PostgresDatabase):
                 if existing["payload_hash"] != payload_hash:
                     raise ConflictError("revision_id already belongs to different prepared content")
                 return self._ingest_result(self._job(connection, tenant, job_id), duplicate=True)
-            connection.execute("INSERT INTO documents(tenant_id,document_id,allowed_subjects,revoked,data_domains) VALUES (%s,%s,%s,0,%s) ON CONFLICT DO NOTHING",
-                               (tenant, doc, _json(request.allowed_subjects), _json(request.data_domains)))
+            connection.execute("INSERT INTO documents(tenant_id,document_id,allowed_subjects,revoked,data_domains,owner_id) "
+                               "VALUES (%s,%s,%s,0,%s,%s) ON CONFLICT(tenant_id,document_id) DO NOTHING",
+                               (tenant, doc, _json(request.allowed_subjects), _json(request.data_domains), owner))
             connection.execute("INSERT INTO revisions(tenant_id,document_id,revision_id,version,processing_fingerprint,content_hash,raw_key,metadata_json,payload_hash,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (tenant, doc, revision, request.version, document.processing_fingerprint,
                  document.content_hash, document.raw_key, _json(metadata), payload_hash, datetime.now(timezone.utc).isoformat()))
@@ -210,6 +219,7 @@ class PostgresKnowledgeStore(_SnapshotStore, _PostgresDatabase):
                     [(tenant, doc, revision, c.chunk_id, c.parent_id, _json(asdict(c))) for c in document.children])
             connection.execute("INSERT INTO jobs VALUES (%s,%s,%s,%s,'staged',%s,%s)",
                 (tenant, job_id, doc, revision, len(document.parents), len(document.children)))
+            self._event(connection, tenant, doc, "stage", owner, revision)
             return IngestResult(job_id, revision, doc, request.version, "staged", len(document.parents), len(document.children))
 
     @staticmethod
@@ -239,7 +249,7 @@ class PostgresKnowledgeStore(_SnapshotStore, _PostgresDatabase):
             generation = self._current(connection, tenant_id)
             rows = connection.execute(
                 "SELECT d.document_id,d.allowed_subjects,d.revoked,d.data_domains,r.revision_id,r.version,r.metadata_json,r.created_at,j.job_id,j.state "
-                "FROM documents d JOIN revisions r USING(tenant_id,document_id) "
+                "FROM active_documents d JOIN revisions r USING(tenant_id,document_id) "
                 "JOIN jobs j USING(tenant_id,document_id,revision_id) WHERE d.tenant_id=%s "
                 "ORDER BY d.document_id,r.created_at DESC,r.revision_id DESC", (tenant_id,),
             ).fetchall()
@@ -268,7 +278,9 @@ class PostgresKnowledgeStore(_SnapshotStore, _PostgresDatabase):
             raise ConflictError("current generation changed; reopen snapshot before retrying")
         return current
 
-    def publish(self, tenant_id: str, job_id: str, expected_generation: str | None) -> Snapshot:
+    def publish(self, tenant_id: str, job_id: str, expected_generation: str | None, *,
+                principal: Principal | None = None) -> Snapshot:
+        actor = self._admin_actor(principal, tenant_id)
         identifier(tenant_id, "tenant_id")
         identifier(job_id, "job_id")
         with self._connection(tenant=tenant_id) as connection:
@@ -282,6 +294,7 @@ class PostgresKnowledgeStore(_SnapshotStore, _PostgresDatabase):
             else:
                 revisions[job["document_id"]] = job["revision_id"]
                 snapshot = self._create_snapshot(connection, tenant_id, revisions)
+                self._event(connection, tenant_id, job["document_id"], "publish", actor, job["revision_id"])
             connection.execute("UPDATE jobs SET state='published' WHERE tenant_id=%s AND job_id=%s", (tenant_id, job_id))
             return snapshot
 
@@ -299,7 +312,7 @@ class PostgresKnowledgeStore(_SnapshotStore, _PostgresDatabase):
             actual = self._trusted_snapshot(connection, snapshot, access, allow_candidate=allow_candidate)
             rows = connection.execute("SELECT c.value_json,d.allowed_subjects,d.revoked,d.data_domains FROM children c "
                 f"JOIN {self._revision_source(allow_candidate)} s USING(tenant_id,document_id,revision_id) "
-                "JOIN documents d USING(tenant_id,document_id) WHERE s.tenant_id=%s AND s.generation=%s "
+                "JOIN active_documents d USING(tenant_id,document_id) WHERE s.tenant_id=%s AND s.generation=%s "
                 "ORDER BY c.document_id,c.chunk_id", (actual.tenant_id, actual.generation)).fetchall()
             chunks = []
             for row in rows:
@@ -319,7 +332,7 @@ class PostgresKnowledgeStore(_SnapshotStore, _PostgresDatabase):
         with self._snapshot_read() as connection:
             actual = self._trusted_snapshot(connection, snapshot, access, allow_candidate=allow_candidate)
             rows = connection.execute("SELECT p.value_json,p.parent_id,d.allowed_subjects,d.revoked,d.data_domains FROM parents p "
-                f"JOIN {self._revision_source(allow_candidate)} s USING(tenant_id,document_id,revision_id) JOIN documents d USING(tenant_id,document_id) "
+                f"JOIN {self._revision_source(allow_candidate)} s USING(tenant_id,document_id,revision_id) JOIN active_documents d USING(tenant_id,document_id) "
                 "WHERE s.tenant_id=%s AND s.generation=%s AND p.parent_id=ANY(%s)",
                 (actual.tenant_id, actual.generation, list(wanted))).fetchall()
             found = {}
@@ -330,17 +343,6 @@ class PostgresKnowledgeStore(_SnapshotStore, _PostgresDatabase):
                     found[row["parent_id"]] = ParentChunk(**value)
             return tuple(found[v] for v in wanted if v in found)
 
-    def delete_document(self, tenant_id: str, document_id: str, expected_generation: str | None) -> Snapshot:
-        identifier(tenant_id, "tenant_id")
-        identifier(document_id, "document_id")
-        with self._connection(tenant=tenant_id) as connection:
-            current = self._compare_generation(connection, tenant_id, expected_generation)
-            revisions = dict(self._snapshot(connection, tenant_id, current).revisions) if current else {}
-            if document_id not in revisions:
-                raise NotFoundError("document is not in the current snapshot")
-            del revisions[document_id]
-            connection.execute("UPDATE documents SET revoked=1 WHERE tenant_id=%s AND document_id=%s", (tenant_id, document_id))
-            return self._create_snapshot(connection, tenant_id, revisions)
 
     def rollback(self, tenant_id: str, generation: str, expected_generation: str | None) -> Snapshot:
         identifier(tenant_id, "tenant_id")
@@ -348,11 +350,12 @@ class PostgresKnowledgeStore(_SnapshotStore, _PostgresDatabase):
         with self._connection(tenant=tenant_id) as connection:
             self._compare_generation(connection, tenant_id, expected_generation)
             target = self._snapshot(connection, tenant_id, generation)
-            return self._create_snapshot(connection, tenant_id, dict(target.revisions))
+            return self._rollback_manifest(connection, target)
 
     def set_access(self, tenant_id: str, document_id: str, allowed_subjects: tuple[str, ...] | None = None,
                    revoked: bool | None = None,
-                   data_domains: tuple[str, ...] | None = None) -> None:
+                   data_domains: tuple[str, ...] | None = None, *, principal: Principal | None = None) -> None:
+        actor = self._admin_actor(principal, tenant_id)
         identifier(tenant_id, "tenant_id")
         identifier(document_id, "document_id")
         if ((allowed_subjects is not None and not isinstance(allowed_subjects, tuple))
@@ -372,6 +375,7 @@ class PostgresKnowledgeStore(_SnapshotStore, _PostgresDatabase):
                  _json(data_domains) if data_domains is not None else None, tenant_id, document_id))
             if result.rowcount != 1:
                 raise NotFoundError("document not found")
+            self._event(connection, tenant_id, document_id, "set_access", actor)
 
 
 class PostgresTraceSink(_PostgresDatabase):
@@ -434,7 +438,8 @@ def migrate_sqlite_to_postgres(source: Path, dsn: str, *, schema: str = "adaptiv
                 legacy = tables.isdisjoint(candidate_tables)
                 counts = {}
                 for table in _TABLES:
-                    if legacy and table in candidate_tables:
+                    if ((legacy and table in candidate_tables) or
+                            (table in {"document_trash", "document_events", "retired_document_ids"} and table not in tables)):
                         counts[table] = 0
                         continue
                     rows = original.execute(f'SELECT * FROM "{table}"').fetchall()

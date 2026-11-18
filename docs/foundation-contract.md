@@ -10,6 +10,8 @@
 
 同一原文+元数据+处理配置得到相同revision/job。相同source version改变处理配置可以重新构建。失败不能推进当前发布指针；所有SQLite操作使用独立连接和事务，不跨线程共享连接。
 
+文件回收站是实时访问约束，不等同于撤权或整库回滚。软删除期间，历史快照、候选查询及证据回源都不能显示该资料；单项恢复仅把删除前已发布的版本合入当前代，仍使用当前权限。保留期后的物理清理是不可变历史的明确例外：删除到期资料的历史映射与关联内容，不保证历史快照永久可回放。详见[文件中心](file-center.md)。
+
 ## Application公共接口（API/CLI调用）
 
 热更新增加仅供可信操作员使用的存储操作：`create_candidate_snapshot(tenant_id, job_ids, expected_generation)` 固定候选清单；`activate_candidate_snapshot(tenant_id, generation, expected_generation)` 在同一事务内校验基代并切换指针。未激活代不是历史发布代，普通 `open_snapshot/list_chunks/get_parents`、回滚目标及证据读取均不可使用。已激活代和先前发布代仍受实时 ACL 约束。

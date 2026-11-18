@@ -23,6 +23,8 @@ from .domain import (
     NotFoundError, ParentChunk, PreparedDocument, Snapshot, ValidationError,
     identifier, nonempty, stable_id,
 )
+from .config import Principal
+from .document_lifecycle import DocumentLifecycle, LIFECYCLE_SCHEMA
 from .data_access import domains_allowed, normalize_data_domains
 
 
@@ -253,11 +255,15 @@ class _Database:
             connection.execute("BEGIN IMMEDIATE")
             for table, column, definition in (
                 ("documents", "data_domains", "TEXT NOT NULL DEFAULT '[]'"),
+                ("documents", "owner_id", "TEXT"),
                 ("revisions", "created_at", "TEXT NOT NULL DEFAULT ''"),
             ):
                 columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
                 if column not in columns:
                     connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            for statement in LIFECYCLE_SCHEMA.split(";"):
+                if statement.strip():
+                    connection.execute(statement)
             connection.commit()
         finally:
             connection.close()
@@ -283,7 +289,7 @@ class _Database:
             connection.close()
 
 
-class _SnapshotStore:
+class _SnapshotStore(DocumentLifecycle):
     """Shared snapshot lifecycle. Each adapter serializes writes for a tenant."""
 
     _placeholder = "?"
@@ -373,7 +379,7 @@ class _SnapshotStore:
             actual = self._verify_manifest(connection, snapshot, allow_candidate=allow_candidate)
             source = self._revision_source(allow_candidate)
             rows = connection.execute(self._sql("SELECT c.value_json FROM children c "
-                f"JOIN {source} s USING(tenant_id,document_id,revision_id) JOIN documents d USING(tenant_id,document_id) "
+                f"JOIN {source} s USING(tenant_id,document_id,revision_id) JOIN active_documents d USING(tenant_id,document_id) "
                 "WHERE s.tenant_id=? AND s.generation=? AND d.revoked=0 ORDER BY c.document_id,c.chunk_id"),
                 (actual.tenant_id, actual.generation))
             chunks = []
@@ -398,7 +404,7 @@ class _SnapshotStore:
             for start in range(0, len(ids), 500):
                 batch = ids[start:start + 500]
                 markers = ",".join("?" for _ in batch)
-                rows = connection.execute(self._sql("SELECT allowed_subjects,data_domains,revoked FROM documents "
+                rows = connection.execute(self._sql("SELECT allowed_subjects,data_domains,revoked FROM active_documents "
                     f"WHERE tenant_id=? AND document_id IN ({markers})"), (tenant_id, *batch)).fetchall()
                 if len(rows) != len(batch) or any(row["revoked"] or (access is not None and not self._allowed(row, access))
                                                   for row in rows):
@@ -434,11 +440,14 @@ class _SnapshotStore:
             for start in range(0, len(ids), 500):
                 batch = ids[start:start + 500]
                 markers = ",".join("?" for _ in batch)
-                rows = connection.execute(self._sql("SELECT document_id,revision_id,state FROM jobs "
-                    f"WHERE tenant_id=? AND job_id IN ({markers})"), (tenant_id, *batch)).fetchall()
+                rows = connection.execute(self._sql("SELECT j.document_id,j.revision_id,j.state,t.trash_id FROM jobs j "
+                    "LEFT JOIN document_trash t USING(tenant_id,document_id) "
+                    f"WHERE j.tenant_id=? AND j.job_id IN ({markers})"), (tenant_id, *batch)).fetchall()
                 if len(rows) != len(batch):
                     raise NotFoundError("ingestion job not found")
                 for row in rows:
+                    if row["trash_id"]:
+                        raise ConflictError("restore document before creating a candidate")
                     if row["state"] != "staged":
                         raise ConflictError("candidate requires staged jobs")
                     if row["document_id"] in changes:
@@ -457,8 +466,10 @@ class _SnapshotStore:
                                    [(tenant_id, generation, job_id) for job_id in ids])
             return Snapshot(tenant_id, generation, entries, created_at)
 
-    def activate_candidate_snapshot(self, tenant_id: str, generation: str, expected_generation: str | None) -> Snapshot:
+    def activate_candidate_snapshot(self, tenant_id: str, generation: str, expected_generation: str | None, *,
+                                    principal: Principal | None = None) -> Snapshot:
         """Activate only on the recorded base; a lost response can be retried while still current."""
+        actor = self._admin_actor(principal, tenant_id)
         identifier(tenant_id, "tenant_id")
         identifier(generation, "generation")
         if expected_generation is not None:
@@ -482,6 +493,10 @@ class _SnapshotStore:
             connection.execute(self._sql("INSERT INTO snapshot_revisions SELECT * FROM candidate_revisions "
                                          "WHERE tenant_id=? AND generation=?"), key)
             connection.execute(self._sql("DELETE FROM candidate_revisions WHERE tenant_id=? AND generation=?"), key)
+            publications = connection.execute(self._sql("SELECT j.document_id,j.revision_id FROM candidate_jobs c "
+                "JOIN jobs j USING(tenant_id,job_id) WHERE c.tenant_id=? AND c.generation=?"), key).fetchall()
+            for job in publications:
+                self._event(connection, tenant_id, job["document_id"], "publish", actor, job["revision_id"])
             connection.execute(self._sql("UPDATE jobs SET state='published' WHERE tenant_id=? AND job_id IN "
                 "(SELECT job_id FROM candidate_jobs WHERE tenant_id=? AND generation=?)"),
                 (tenant_id, tenant_id, generation))
@@ -505,7 +520,18 @@ class _SnapshotStore:
                                (tenant_id, generation))
             return True
 
+    def _rollback_manifest(self, connection, target):
+        trashed = connection.execute(self._sql("SELECT document_id FROM document_trash WHERE tenant_id=?"),
+                                     (target.tenant_id,))
+        revisions = dict(target.revisions)
+        for row in trashed:
+            revisions.pop(row["document_id"], None)
+        return self._create_snapshot(connection, target.tenant_id, revisions)
+
     def _reject_candidate_job(self, connection, tenant, job):
+        if connection.execute(self._sql("SELECT 1 FROM document_trash WHERE tenant_id=? AND document_id=?"),
+                              (tenant, job["document_id"])).fetchone():
+            raise ConflictError("restore document before publication")
         if job["state"] == "staged" and connection.execute(self._sql(
             "SELECT 1 FROM candidate_jobs j JOIN candidate_snapshots c USING(tenant_id,generation) "
             "WHERE j.tenant_id=? AND j.job_id=? AND c.activated=0"), (tenant, job["job_id"])).fetchone():
@@ -571,7 +597,7 @@ class SQLiteKnowledgeStore(_SnapshotStore, _Database):
         if referenced != set(parents):
             raise ValidationError("every parent must have a child chunk")
 
-    def stage(self, document: PreparedDocument) -> IngestResult:
+    def stage(self, document: PreparedDocument, *, principal: Principal | None = None) -> IngestResult:
         self._validate(document)
         request = document.request
         tenant, doc, revision = request.tenant_id, request.document_id, document.revision_id
@@ -590,6 +616,7 @@ class SQLiteKnowledgeStore(_SnapshotStore, _Database):
         metadata.pop("content")
         try:
             with self._connection(write=True) as connection:
+                owner = self._stage_owner(connection, tenant, doc, principal)
                 existing = connection.execute(
                     "SELECT payload_hash FROM revisions WHERE tenant_id=? AND document_id=? AND revision_id=?",
                     (tenant, doc, revision),
@@ -600,8 +627,9 @@ class SQLiteKnowledgeStore(_SnapshotStore, _Database):
                     row = self._job(connection, tenant, job_id)
                     return self._ingest_result(row, request.version, duplicate=True)
                 connection.execute(
-                    "INSERT OR IGNORE INTO documents(tenant_id,document_id,allowed_subjects,revoked,data_domains) VALUES (?,?,?,0,?)",
-                    (tenant, doc, _json(request.allowed_subjects), _json(request.data_domains)),
+                    "INSERT INTO documents(tenant_id,document_id,allowed_subjects,revoked,data_domains,owner_id) "
+                    "VALUES (?,?,?,0,?,?) ON CONFLICT(tenant_id,document_id) DO NOTHING",
+                    (tenant, doc, _json(request.allowed_subjects), _json(request.data_domains), owner),
                 )
                 connection.execute(
                     "INSERT INTO revisions(tenant_id,document_id,revision_id,version,processing_fingerprint,content_hash,raw_key,metadata_json,payload_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -620,6 +648,7 @@ class SQLiteKnowledgeStore(_SnapshotStore, _Database):
                     "INSERT INTO jobs VALUES (?,?,?,?,'staged',?,?)",
                     (tenant, job_id, doc, revision, len(document.parents), len(document.children)),
                 )
+                self._event(connection, tenant, doc, "stage", owner, revision)
                 return IngestResult(job_id, revision, doc, request.version, "staged",
                                     len(document.parents), len(document.children))
         except sqlite3.IntegrityError as exc:
@@ -652,7 +681,7 @@ class SQLiteKnowledgeStore(_SnapshotStore, _Database):
             generation = self._current(connection, tenant_id)
             rows = connection.execute(
                 "SELECT d.document_id,d.allowed_subjects,d.revoked,d.data_domains,r.revision_id,r.version,r.metadata_json,r.created_at,j.job_id,j.state "
-                "FROM documents d JOIN revisions r USING(tenant_id,document_id) "
+                "FROM active_documents d JOIN revisions r USING(tenant_id,document_id) "
                 "JOIN jobs j USING(tenant_id,document_id,revision_id) WHERE d.tenant_id=? "
                 "ORDER BY d.document_id,r.created_at DESC,r.revision_id DESC", (tenant_id,),
             ).fetchall()
@@ -679,7 +708,9 @@ class SQLiteKnowledgeStore(_SnapshotStore, _Database):
             raise ConflictError("current generation changed; reopen snapshot before retrying")
         return current
 
-    def publish(self, tenant_id: str, job_id: str, expected_generation: str | None) -> Snapshot:
+    def publish(self, tenant_id: str, job_id: str, expected_generation: str | None, *,
+                principal: Principal | None = None) -> Snapshot:
+        actor = self._admin_actor(principal, tenant_id)
         identifier(tenant_id, "tenant_id")
         identifier(job_id, "job_id")
         with self._connection(write=True) as connection:
@@ -693,6 +724,7 @@ class SQLiteKnowledgeStore(_SnapshotStore, _Database):
             else:
                 revisions[job["document_id"]] = job["revision_id"]
                 snapshot = self._create_snapshot(connection, tenant_id, revisions)
+                self._event(connection, tenant_id, job["document_id"], "publish", actor, job["revision_id"])
             connection.execute(
                 "UPDATE jobs SET state='published' WHERE tenant_id=? AND job_id=?", (tenant_id, job_id),
             )
@@ -713,7 +745,7 @@ class SQLiteKnowledgeStore(_SnapshotStore, _Database):
             rows = connection.execute(
                 "SELECT c.value_json,d.allowed_subjects,d.revoked,d.data_domains FROM children c "
                 f"JOIN {self._revision_source(allow_candidate)} s USING(tenant_id,document_id,revision_id) "
-                "JOIN documents d USING(tenant_id,document_id) "
+                "JOIN active_documents d USING(tenant_id,document_id) "
                 "WHERE s.tenant_id=? AND s.generation=? ORDER BY c.document_id,c.chunk_id",
                 (actual.tenant_id, actual.generation),
             ).fetchall()
@@ -739,7 +771,7 @@ class SQLiteKnowledgeStore(_SnapshotStore, _Database):
             rows = connection.execute(
                 "SELECT p.value_json,p.parent_id,d.allowed_subjects,d.revoked,d.data_domains FROM parents p "
                 f"JOIN {self._revision_source(allow_candidate)} s USING(tenant_id,document_id,revision_id) "
-                "JOIN documents d USING(tenant_id,document_id) "
+                "JOIN active_documents d USING(tenant_id,document_id) "
                 "WHERE s.tenant_id=? AND s.generation=?", (actual.tenant_id, actual.generation),
             ).fetchall()
             wanted_set = set(wanted)
@@ -751,20 +783,6 @@ class SQLiteKnowledgeStore(_SnapshotStore, _Database):
                     found[row["parent_id"]] = ParentChunk(**value)
             return tuple(found[parent_id] for parent_id in wanted if parent_id in found)
 
-    def delete_document(self, tenant_id: str, document_id: str, expected_generation: str | None) -> Snapshot:
-        identifier(tenant_id, "tenant_id")
-        identifier(document_id, "document_id")
-        with self._connection(write=True) as connection:
-            current = self._compare_generation(connection, tenant_id, expected_generation)
-            previous = self._snapshot(connection, tenant_id, current) if current else None
-            revisions = dict(previous.revisions) if previous else {}
-            if document_id not in revisions:
-                raise NotFoundError("document is not in the current snapshot")
-            del revisions[document_id]
-            connection.execute(
-                "UPDATE documents SET revoked=1 WHERE tenant_id=? AND document_id=?", (tenant_id, document_id),
-            )
-            return self._create_snapshot(connection, tenant_id, revisions)
 
     def rollback(self, tenant_id: str, generation: str, expected_generation: str | None) -> Snapshot:
         identifier(tenant_id, "tenant_id")
@@ -772,11 +790,12 @@ class SQLiteKnowledgeStore(_SnapshotStore, _Database):
         with self._connection(write=True) as connection:
             self._compare_generation(connection, tenant_id, expected_generation)
             target = self._snapshot(connection, tenant_id, generation)
-            return self._create_snapshot(connection, tenant_id, dict(target.revisions))
+            return self._rollback_manifest(connection, target)
 
     def set_access(self, tenant_id: str, document_id: str, allowed_subjects: tuple[str, ...] | None = None,
                    revoked: bool | None = None,
-                   data_domains: tuple[str, ...] | None = None) -> None:
+                   data_domains: tuple[str, ...] | None = None, *, principal: Principal | None = None) -> None:
+        actor = self._admin_actor(principal, tenant_id)
         identifier(tenant_id, "tenant_id")
         identifier(document_id, "document_id")
         if ((allowed_subjects is not None and not isinstance(allowed_subjects, tuple))
@@ -797,6 +816,7 @@ class SQLiteKnowledgeStore(_SnapshotStore, _Database):
             )
             if result.rowcount != 1:
                 raise NotFoundError("document not found")
+            self._event(connection, tenant_id, document_id, "set_access", actor)
 
 
 class SQLiteTraceSink(_Database):

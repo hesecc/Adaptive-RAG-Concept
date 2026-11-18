@@ -362,7 +362,9 @@ class AssetTests(unittest.TestCase):
         asyncio.run(service.process_pending("team"))
         self.assertEqual(self.index.search("team", service.profile, (1.0, 0.1), 100), ())
         again = self.create(service)
-        self.assertEqual(again["revision_id"], first["revision_id"])
+        self.assertNotEqual(again["revision_id"], first["revision_id"])
+        with self.assertRaises(ConflictError):
+            service.delete(self.access, "diagram", first["revision_id"])
         self.assertEqual(again["indexing_status"], "pending")
         self.assertEqual(asyncio.run(service.process_pending("team"))["ready"], 1)
         self.assertEqual(embedder.calls, 1, "cached vectors are reused, no second embedding request")

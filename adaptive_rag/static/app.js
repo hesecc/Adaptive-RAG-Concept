@@ -336,7 +336,7 @@ function acceptSession(session) {
   $(".account-avatar").textContent = (session.username || "U").slice(0, 1).toUpperCase();
   $("#account-role").textContent = session.admin ? "管理员" : "成员";
   $("#users-open").hidden = !session.admin;
-  $("#knowledge-open").hidden = !session.admin;
+  $("#knowledge-open").hidden = false;
   $("#evaluation-open").hidden = !session.admin;
   $("#account-domains").textContent = `数据权限：${RagDomains.text(session.data_domains)}`;
   RagDomains.load().then(() => {

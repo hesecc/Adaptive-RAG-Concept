@@ -132,8 +132,14 @@ class ClassificationStoreContract:
         rolled = self.store.rollback("tenant-a", old.generation, deleted.generation)
         self.assertEqual(self.visible_ids(rolled, self.finance), set())
         self.store.set_access("tenant-a", "report", (), revoked=False)
-        self.assertEqual(self.visible_ids(rolled, self.finance), {"report"})
-        self.assertEqual(self.visible_ids(rolled, self.operations), set())
+        # Changing access or rolling back must not stand in for restoring a file.
+        self.assertEqual(self.visible_ids(rolled, self.finance), set())
+        manager = Principal("tenant-a", "manager", admin=True)
+        tomb, = self.store.managed_documents(manager, "trash")
+        self.store.restore_document(manager, "report", tomb["trash_id"], rolled.generation)
+        restored = self.store.open_snapshot("tenant-a")
+        self.assertEqual(self.visible_ids(restored, self.finance), {"report"})
+        self.assertEqual(self.visible_ids(restored, self.operations), set())
 
     def test_partial_policy_patch_preserves_unmentioned_acl_and_revocation(self):
         old = self.publish("private", ("operations",), allowed=("alice",))
@@ -330,6 +336,9 @@ class PostgresClassificationTests(ClassificationStoreContract, unittest.TestCase
         document = prepared()
         self.store.stage(document)
         with self.store._connection() as connection:
+            # A pre-classification installation also predates the lifecycle view.
+            connection.execute("DROP VIEW active_documents")
+            connection.execute("ALTER TABLE documents DROP COLUMN owner_id")
             connection.execute("ALTER TABLE documents DROP COLUMN data_domains")
             connection.execute("ALTER TABLE revisions DROP COLUMN created_at")
         for _ in range(2):

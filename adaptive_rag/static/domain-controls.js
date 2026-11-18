@@ -21,10 +21,11 @@ window.RagDomains = (() => {
     if (!values?.length) return "未分类 · 仅管理员可见";
     return values.map(value => catalog.find(item => item.id === value)?.label || value).join("、");
   }
-  function render(root, selected = [], {publicRequired = false} = {}) {
+  function render(root, selected = [], {publicRequired = false, allowed = null} = {}) {
     root.replaceChildren();
     root.classList.add("domain-options");
     for (const item of catalog) {
+      if (allowed !== null && !allowed.includes(item.id)) continue;
       const label = document.createElement("label");
       label.className = "domain-option";
       const input = document.createElement("input");

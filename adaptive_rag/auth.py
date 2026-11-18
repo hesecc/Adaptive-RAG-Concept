@@ -167,6 +167,19 @@ class AccountStore:
         )
         return connection.execute("SELECT * FROM accounts WHERE username=?", (username,)).fetchone()
 
+    def display_names(self, tenant_id: str, subject_ids: set[str]) -> dict[str, str]:
+        """Decorate already-authorized rows only; unknown or deleted accounts retain their stable IDs."""
+        ids = sorted(subject_ids)
+        result = {}
+        with self._connection() as connection:
+            for start in range(0, len(ids), 400):
+                batch = ids[start:start + 400]
+                slots = ','.join('?' for _ in batch)
+                rows = connection.execute(f'SELECT account_id, username FROM accounts WHERE tenant_id=? '
+                                          f'AND account_id IN ({slots})', (tenant_id, *batch))
+                result.update((row['account_id'], row['username']) for row in rows)
+        return result
+
     def login(self, username: str, password: str) -> tuple[str, Account]:
         try:
             username, password = _username(username), _password(password)

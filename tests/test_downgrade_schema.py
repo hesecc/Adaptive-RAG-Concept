@@ -19,7 +19,7 @@ from adaptive_rag.domain import IngestRequest
 from support import ADMIN_PASSWORD
 
 
-DEPLOY =Path(__file__).resolve().parents[1] / "deploy"
+DEPLOY = Path(__file__).resolve().parents[1] / "deploy"
 spec = importlib.util.spec_from_file_location("rag_downgrade", DEPLOY / "downgrade_schema.py")
 downgrade_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(downgrade_module)
@@ -41,11 +41,31 @@ class DowngradeSchemaTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.data = Path(self.temporary.name) / "data"
-        self.application = RagApplication(Settings(data_dir=self.data))
-        generation = None  # publishing is compare-and-swap on the current generation
-        for document_id, domains in (("ops-guide", ("operations",)), ("fin-report", ("finance",)), ("legacy", ())):
-            result = self.application.ingest(IngestRequest("demo", document_id, "v1", f"# {document_id}\nbody text", data_domains=domains))
-            generation = self.application.publish("demo", result.job_id, generation).generation
+        self.data.mkdir()
+        # Freeze the data-domain release's affected tables; starting today's application
+        # would initialize file-center schema and invalidate a successful rollback fixture.
+        with closing(sqlite3.connect(self.data / "knowledge.sqlite3")) as con, con:
+            con.executescript("""
+                CREATE TABLE documents (
+                    tenant_id TEXT NOT NULL, document_id TEXT NOT NULL, allowed_subjects TEXT NOT NULL,
+                    revoked INTEGER NOT NULL CHECK (revoked IN (0,1)), data_domains TEXT NOT NULL DEFAULT '[]',
+                    PRIMARY KEY (tenant_id, document_id));
+                CREATE TABLE revisions (
+                    tenant_id TEXT NOT NULL, document_id TEXT NOT NULL, revision_id TEXT NOT NULL,
+                    version TEXT NOT NULL, processing_fingerprint TEXT NOT NULL, content_hash TEXT NOT NULL,
+                    raw_key TEXT NOT NULL, metadata_json TEXT NOT NULL, payload_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT '', PRIMARY KEY (tenant_id, document_id, revision_id),
+                    FOREIGN KEY (tenant_id, document_id) REFERENCES documents (tenant_id, document_id));
+            """)
+            for doc, domains in (("ops-guide", ["operations"]), ("fin-report", ["finance"]), ("legacy", [])):
+                con.execute("INSERT INTO documents VALUES ('demo',?,'[]',0,?)", (doc, json.dumps(domains)))
+                con.execute("INSERT INTO revisions VALUES ('demo',?,?,'v1','fp','ch','raw','{}',?,'')",
+                            (doc, "revision-" + doc, "payload-" + doc))
+        with closing(sqlite3.connect(self.data / "accounts.sqlite3")) as con:
+            con.execute("""CREATE TABLE accounts (
+                account_id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, tenant_id TEXT NOT NULL,
+                admin INTEGER NOT NULL CHECK(admin IN (0,1)), password_salt TEXT NOT NULL,
+                password_hash TEXT NOT NULL, created_at TEXT NOT NULL, data_domains TEXT NOT NULL DEFAULT '["public"]')""")
         AccountStore(self.data, "company", ADMIN_PASSWORD).create(
             Principal("company", "admin", admin=True), "alice", "account-password", ("operations", "finance"))
 
@@ -67,7 +87,7 @@ class DowngradeSchemaTests(unittest.TestCase):
         self.assertTrue(accounts["ragadmin"][0])
 
     def test_columns_return_to_exactly_the_previous_shape_and_order(self):
-        # A freshly created current database has these columns inside CREATE TABLE, an upgraded one
+        # A data-domain release database has these columns inside CREATE TABLE, an upgraded one
         # has them appended; either way the previous release's positional INSERT needs this order.
         self.run_downgrade()
         self.assertEqual(self.columns("knowledge.sqlite3", "documents"), PREVIOUS_COLUMNS["documents"])
@@ -135,6 +155,38 @@ class DowngradeSchemaTests(unittest.TestCase):
         self.assertIn("data_domains", self.columns("accounts.sqlite3", "accounts"))
         self.assertEqual(before, ((self.data / "knowledge.sqlite3").read_bytes(), (self.data / "accounts.sqlite3").read_bytes()))
 
+    def assert_both_modes_refuse_without_writes(self, reason):
+        def files():
+            return {p.relative_to(self.data): p.read_bytes() for p in self.data.rglob("*") if p.is_file()}
+        before = files()
+        for flags in (["--check"], []):
+            with self.subTest(flags=flags):
+                result = subprocess.run([sys.executable, str(DEPLOY / "downgrade_schema.py"), str(self.data), *flags],
+                                        capture_output=True, text=True, timeout=60)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(reason, result.stderr)
+                self.assertIn("cold backup", result.stderr)
+                self.assertEqual(files(), before)
+
+    def test_file_center_refuses_empty_then_owned_and_trashed_without_touching_catalogs(self):
+        app = RagApplication(Settings(data_dir=self.data))
+        self.assert_both_modes_refuse_without_writes("file-center schema")
+        actor = Principal("demo", "uploader")
+        app.ingest(IngestRequest("demo", "owned", "v1", "text"), principal=actor)
+        app.store.trash_document(actor, "owned", None)
+        self.assert_both_modes_refuse_without_writes("file-center schema")
+
+    def test_image_lifecycle_alone_refuses_before_historical_knowledge_and_accounts_change(self):
+        with closing(sqlite3.connect(self.data / "assets.sqlite3")) as con:
+            con.execute("CREATE TABLE image_trash (trash_id TEXT)")
+        self.assert_both_modes_refuse_without_writes("image_trash")
+
+    def test_owner_column_alone_refuses_even_when_all_owners_are_null(self):
+        with closing(sqlite3.connect(self.data / "knowledge.sqlite3")) as con:
+            con.execute("ALTER TABLE documents ADD COLUMN owner_id TEXT")
+        self.assert_both_modes_refuse_without_writes("documents.owner_id")
+
     def test_command_line_prints_only_the_export_on_stdout(self):
         result = subprocess.run([sys.executable, str(DEPLOY / "downgrade_schema.py"), str(self.data), "--check"],
                                 capture_output=True, text=True, timeout=60)
@@ -161,7 +213,7 @@ class DowngradeSchemaTests(unittest.TestCase):
             (linked / "knowledge.sqlite3").symlink_to(self.data / "knowledge.sqlite3")
         except OSError:
             self.skipTest("symlinks need privileges on this platform")
-        with redirect_stderr(io.StringIO()):
+        with redirect_stderr(io.StringIO()), self.assertRaisesRegex(SystemExit, "linked"):
             downgrade_module.downgrade(linked)
         self.assertIn("data_domains", self.columns("knowledge.sqlite3", "documents"))
 

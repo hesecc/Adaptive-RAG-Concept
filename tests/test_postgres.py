@@ -137,10 +137,11 @@ class PostgresLiveTests(unittest.TestCase):
         self.assertEqual(deleted.revisions, ())
         self.assertEqual(self.store.list_chunks(old, self.access), ())
         rolled = self.store.rollback("tenant-a", old.generation, deleted.generation)
-        self.assertEqual(rolled.revisions, old.revisions)
+        self.assertEqual(rolled.revisions, ())
         self.assertEqual(self.store.list_chunks(rolled, self.access), ())
         self.store.set_access("tenant-a", "shipping", (), revoked=False)
-        self.assertEqual(self.store.list_chunks(rolled, self.access), document.children)
+        self.assertEqual(self.store.list_chunks(rolled, self.access), ())
+        self.assertEqual(self.store.list_chunks(old, self.access), ())
 
     def test_reprocessing_and_forged_snapshot_cannot_read_unpublished_text(self):
         first = prepared()

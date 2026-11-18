@@ -533,6 +533,7 @@
       const session = await api("/console/session");
       byId("evaluation-account").textContent = session.username;
       if (!session.admin) throw Error("只有管理员可以查看评测报告。请返回知识库对话，按当前权限检索资料。");
+      byId("evaluation-open").hidden = false;
       state.tenant = session.tenant_id;
       await RagDomains.load();
       byId("evaluation-tenant").textContent = `租户：${session.tenant_id}`;

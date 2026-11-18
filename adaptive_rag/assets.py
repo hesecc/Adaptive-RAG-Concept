@@ -7,6 +7,7 @@ explicit indexing consumes the durable metadata outbox outside DB transactions.
 
 import asyncio
 from collections import Counter
+from datetime import datetime, timezone
 from hashlib import sha256
 import io
 import json
@@ -17,13 +18,27 @@ from uuid import uuid4
 import warnings
 
 from .assets_persistence import AssetDatabase, encode
-from .domain import (AccessContext, CapabilityError, ConflictError, NotFoundError,
+from .config import Principal
+from .domain import (AccessContext, CapabilityError, ConflictError, ForbiddenError, NotFoundError,
                      ValidationError, identifier, nonempty, safe_error, stable_id)
 from .retrieval import tokenize
 from .data_access import domains_allowed, normalize_data_domains
 
 
 MAX_IMAGE_BYTES = 10_000_000
+TRASH_SECONDS = 168 * 3600
+
+
+def _revision(content_hash, metadata, source_document_id, source_page, incarnation):
+    fields = (content_hash, metadata, source_document_id, source_page)
+    if incarnation is None:  # revisions persisted before lifecycle support
+        return stable_id("image-revision-v1", *fields)
+    return stable_id("image-revision-v2", incarnation, *fields)
+
+
+def _manages(principal, asset):
+    return principal.tenant_id == asset["tenant_id"] and (
+        principal.admin or principal.subject_id == asset.get("created_by"))
 
 
 def _text(value, name, limit):
@@ -133,7 +148,7 @@ class AssetService:
 
     def create(self, access: AccessContext, content: bytes, *, asset_id: str,
                title: str, description="", ocr_text="", tags=(), allowed_subjects=(),
-               source_document_id=None, source_page=None, data_domains=()):
+               source_document_id=None, source_page=None, data_domains=(), _principal=None):
         identifier(asset_id, "asset_id")
         metadata = _metadata(title, description, ocr_text, tags, allowed_subjects, data_domains)
         if source_document_id is not None:
@@ -142,17 +157,18 @@ class AssetService:
             raise ValidationError("source_page must be a positive page number")
         image, thumbnail = _image(content)
         content_hash = sha256(content).hexdigest()
-        revision = stable_id("image-revision-v1", content_hash, metadata, source_document_id, source_page)
+        incarnation = uuid4().hex
+        revision = _revision(content_hash, metadata, source_document_id, source_page, incarnation)
         # Validation precedes object writes. A failure after either put can
         # leave an unreferenced content-addressed object, never a broken asset.
         object_key = self.objects.put(content)
         thumbnail_key = self.objects.put(thumbnail)
         asset = {"tenant_id": access.tenant_id, "asset_id": asset_id,
-                 "revision_id": revision, "object_key": object_key,
+                 "revision_id": revision, "incarnation_id": incarnation, "object_key": object_key,
                  "thumbnail_key": thumbnail_key, "sha256": content_hash,
                  "source_document_id": source_document_id, "source_page": source_page,
                  "source": "document" if source_document_id else "upload",
-                 "created_by": access.subject_id, "created_at": time(),
+                 "created_by": access.subject_id, "created_at": time(), "updated_by": access.subject_id,
                  "indexing_status": "pending", "index_profile": None,
                  "index_target_profile": self.profile,
                  "index_error": None, "index_stages": [],
@@ -161,16 +177,43 @@ class AssetService:
             current = self.db.current(connection, access.tenant_id, asset_id)
             deleted = bool(current and current[1])
             if current and not deleted:
-                if current[0]["revision_id"] == revision and _allowed(current[0], access):
+                existing = current[0]
+                desired = _revision(content_hash, metadata, source_document_id, source_page, existing.get("incarnation_id"))
+                if (existing["revision_id"] == desired and
+                        (existing.get("created_by") == access.subject_id or (_principal and _principal.admin))):
                     return self._public(current[0])
                 raise ConflictError("asset_id already exists; update metadata using expected_revision")
-            if deleted:
-                self._free_asset_id(connection, access.tenant_id, asset_id)
-            # A reused asset_id may meet an index job of the same revision that is already done or
-            # cancelled; requeue it so the new asset is indexed again (cached vectors are reused).
+            if not (_principal and _principal.admin):
+                self._check_reuse(connection, access, asset_id, current[0] if current else None)
+            self._free_asset_id(connection, access.tenant_id, asset_id)
             self.db.write_asset(connection, asset)
-            self.db.enqueue(connection, asset, self.profile, requeue=deleted)
+            self._event(connection, asset, "create", access.subject_id)
+            job_id = self.db.enqueue(connection, asset, self.profile)
+            if deleted and current[0]["revision_id"] == _revision(content_hash, metadata, source_document_id,
+                    source_page, current[0].get("incarnation_id")):
+                self.db.copy_vectors(connection, asset, self.profile, current[0]["revision_id"], job_id)
         return self._public(asset)
+
+    @staticmethod
+    def _check_reuse(connection, access, asset_id, previous):
+        if previous and previous.get("created_by") != access.subject_id:
+            raise ConflictError("asset_id is unavailable")
+        if connection.execute("SELECT 1 FROM image_trash WHERE tenant_id=? AND asset_id=? AND admin_hold=1 AND expires_at>?",
+                              (access.tenant_id, asset_id, time())).fetchone():
+            raise ForbiddenError("image is held by an administrator")
+
+    def managed_create(self, principal, *, content, asset_id, title, description="", ocr_text="", tags=(),
+                       allowed_subjects=(), source_document_id=None, source_page=None, data_domains=()):
+        if not principal.admin:
+            if allowed_subjects not in ((), (principal.subject_id,)) or not set(data_domains) <= set(principal.data_domains or ()):
+                raise ForbiddenError("cannot grant image access outside your permissions")
+            allowed_subjects = (principal.subject_id,)
+            if not data_domains:
+                data_domains = principal.data_domains or ()
+        asset = self.create(principal.access, content, asset_id=asset_id, title=title, description=description,
+                            ocr_text=ocr_text, tags=tags, allowed_subjects=allowed_subjects, data_domains=data_domains,
+                            source_page=source_page, source_document_id=source_document_id, _principal=principal)
+        return self._managed_row(principal, asset)
 
     @staticmethod
     def _free_asset_id(connection, tenant_id, asset_id):
@@ -196,32 +239,146 @@ class AssetService:
         with self.db.transaction() as connection:
             return self._public(self._current(connection, access, asset_id))
 
+    def _managed_current(self, connection, principal, asset_id):
+        current = self.db.current(connection, principal.tenant_id, identifier(asset_id, "asset_id"))
+        if not current or current[1] or not _manages(principal, current[0]):
+            raise NotFoundError("image asset not found")
+        return current[0]
+
+    @staticmethod
+    def _event(conn, asset, action, actor):
+        conn.execute("INSERT INTO image_events(tenant_id,asset_id,incarnation,event_id,created_at,action,actor_id,revision_id) "
+                     "VALUES(?,?,?,?,?,?,?,?)", (asset["tenant_id"], asset["asset_id"], asset.get("incarnation_id", ""),
+                     uuid4().hex, time(), action, actor, asset["revision_id"]))
+
+    def _detail(self, conn, principal, asset, trash=None):
+        key = asset["tenant_id"], asset["asset_id"]
+        item = self._managed_row(principal, asset, trash)
+        revisions = conn.execute("SELECT body FROM image_asset_revisions WHERE tenant_id=? AND asset_id=?", key)
+        versions = [{"revision_id": v["revision_id"], "title": v["title"], "updated_by": v.get("updated_by", v["created_by"]),
+                     "updated_at": v.get("updated_at", v["created_at"])} for v in (json.loads(r["body"]) for r in revisions)
+                    if v.get("incarnation_id") == asset.get("incarnation_id") and v["created_at"] == asset["created_at"]]
+        item["versions"] = sorted(versions, key=lambda v: v["updated_at"], reverse=True)
+        item["events"] = [dict(e) for e in conn.execute("SELECT action,actor_id,created_at,revision_id FROM image_events "
+                          "WHERE tenant_id=? AND asset_id=? AND incarnation=? ORDER BY created_at DESC,event_id",
+                          (*key, asset.get("incarnation_id", "")))]
+        return item
+
+    def _managed_row(self, principal, asset, trash=None, *, occupied=False):
+        public = self._public(asset)
+        utc = lambda ts: datetime.fromtimestamp(ts, timezone.utc).isoformat()
+        return public | {
+            "kind": "image", "id": asset["asset_id"], "version": asset["revision_id"], "owner_id": asset.get("created_by"),
+            "updated_by": asset.get("updated_by", asset.get("created_by")),
+            "updated_at": utc(asset.get("updated_at", asset["created_at"])),
+            "state": "trash" if trash else "active", "status": "trashed" if trash else public["indexing_status"],
+            "trash_id": trash["trash_id"] if trash else None, "deleted_by": trash["deleted_by"] if trash else None,
+            "deleted_at": utc(trash["deleted_at"]) if trash else None,
+            "purge_after": utc(trash["expires_at"]) if trash else None,
+            "admin_hold": bool(trash and trash["admin_hold"]),
+            "can_restore": bool(trash and not occupied and time() < trash["expires_at"] and
+                                (principal.admin or (not trash["admin_hold"] and trash["deleted_by"] == principal.subject_id))),
+        }
+
+    def managed_images(self, principal, view="mine"):
+        if view not in ("mine", "all", "trash"):
+            raise ValidationError("view must be mine, all or trash")
+        if view == "all" and not principal.admin:
+            raise ForbiddenError("administrator required")
+        with self.db.transaction() as conn:
+            if view == "trash":
+                rows = conn.execute("SELECT t.*,a.deleted FROM image_trash t LEFT JOIN image_assets a "
+                                    "USING(tenant_id,asset_id) WHERE t.tenant_id=? ORDER BY t.deleted_at DESC,t.trash_id",
+                                    (principal.tenant_id,))
+                return [self._managed_row(principal, asset, row, occupied=row["deleted"] == 0)
+                        for row in rows if _manages(principal, asset := json.loads(row["body"]))]
+            rows = conn.execute("SELECT body FROM image_assets WHERE tenant_id=? AND deleted=0 ORDER BY asset_id", (principal.tenant_id,))
+            return [self._managed_row(principal, asset) for asset in (json.loads(row["body"]) for row in rows)
+                    if view == "all" or asset.get("created_by") == principal.subject_id]
+
+    def managed_image(self, principal, asset_id):
+        with self.db.transaction() as conn:
+            current = self.db.current(conn, principal.tenant_id, identifier(asset_id, "asset_id"))
+            if current and not current[1]:
+                if not _manages(principal, current[0]):
+                    raise NotFoundError("image asset not found")
+                return self._detail(conn, principal, current[0])
+            rows = conn.execute("SELECT * FROM image_trash WHERE tenant_id=? AND asset_id=? ORDER BY deleted_at DESC,trash_id",
+                                (principal.tenant_id, asset_id))
+            for row in rows:
+                asset = json.loads(row["body"])
+                if _manages(principal, asset):
+                    return self._detail(conn, principal, asset, row)
+            raise NotFoundError("image asset not found")
+
+    def managed_content(self, principal, asset_id, expected_revision=None):
+        return self._content(principal, asset_id, False, self._managed_current, expected_revision)
+
     def update(self, access, asset_id, *, title, description, ocr_text, tags,
-               allowed_subjects, expected_revision, data_domains=None):
+               allowed_subjects, expected_revision, data_domains=None, _principal=None):
         identifier(expected_revision, "expected_revision")
         with self.db.transaction(access.tenant_id + ":" + asset_id) as connection:
-            asset = self._current(connection, access, asset_id)
+            asset = (self._managed_current(connection, _principal, asset_id) if _principal else
+                     self._current(connection, access, asset_id))
+            if _principal:
+                title = asset["title"] if title is None else title
+                description = asset["description"] if description is None else description
+                ocr_text = asset["ocr_text"] if ocr_text is None else ocr_text
+                tags = tuple(asset["tags"]) if tags is None else tags
+                if allowed_subjects is None:
+                    allowed_subjects = tuple(asset["allowed_subjects"])
+            if _principal and not _principal.admin:
+                # Empty form ACL means preserve. Only administrators edit grants/classification.
+                if ((allowed_subjects and allowed_subjects != tuple(asset["allowed_subjects"])) or
+                        (data_domains is not None and set(data_domains) != set(asset.get("data_domains", ())))):
+                    raise ForbiddenError("only administrators can change image access")
+                allowed_subjects = tuple(asset["allowed_subjects"])
             metadata = _metadata(title, description, ocr_text, tags, allowed_subjects,
                 tuple(asset.get("data_domains", ())) if data_domains is None else data_domains)
             if asset["revision_id"] != expected_revision:
                 raise ConflictError("image asset changed; reload its current revision")
-            revision = stable_id("image-revision-v1", asset["sha256"], metadata,
-                                 asset["source_document_id"], asset["source_page"])
+            revision = _revision(asset["sha256"], metadata, asset["source_document_id"], asset["source_page"],
+                                 asset.get("incarnation_id"))
             if revision == expected_revision:
                 return self._public(asset)
-            asset = asset | metadata | {"revision_id": revision, "indexing_status": "pending",
+            asset = asset | metadata | {"revision_id": revision, "updated_by": access.subject_id,
+                                        "updated_at": time(), "indexing_status": "pending",
                                         "index_profile": None, "index_target_profile": self.profile,
                                         "index_error": None, "index_stages": []}
             self.db.write_asset(connection, asset)
+            self._event(connection, asset, "update", access.subject_id)
             self.db.enqueue(connection, asset, self.profile, requeue=True)
         return self._public(asset)
 
+    def managed_update(self, principal, asset_id, *, expected_revision, title=None, description=None, ocr_text=None,
+                       tags=None, allowed_subjects=None, data_domains=None):
+        asset = self.update(principal.access, asset_id, title=title, description=description, ocr_text=ocr_text,
+                            tags=tags, allowed_subjects=allowed_subjects, data_domains=data_domains,
+                            expected_revision=expected_revision, _principal=principal)
+        return self._managed_row(principal, asset)
+
     def delete(self, access, asset_id, expected_revision=None):
+        # AccessContext has no role: legacy in-process calls may delete their own asset only.
+        principal = access if isinstance(access, Principal) else Principal(access.tenant_id, access.subject_id)
+        self._trash(principal, asset_id, expected_revision)
+
+    def trash_image(self, principal, asset_id, expected_revision):
+        identifier(expected_revision, "expected_revision")
+        return self._trash(principal, asset_id, expected_revision)
+
+    def _trash(self, access, asset_id, expected_revision):
         with self.db.transaction(access.tenant_id + ":" + asset_id) as connection:
-            asset = self._current(connection, access, asset_id)
+            asset = self._managed_current(connection, access, asset_id)
             if expected_revision is not None and expected_revision != asset["revision_id"]:
                 raise ConflictError("image asset changed; reload its current revision")
-            asset["indexing_status"] = "deleted"
+            now = time()
+            self._event(connection, asset, "trash", access.subject_id)
+            trash = dict(trash_id=uuid4().hex, deleted_at=now, expires_at=now + TRASH_SECONDS,
+                         deleted_by=access.subject_id, admin_hold=int(access.admin))
+            connection.execute("INSERT INTO image_trash(tenant_id,asset_id,trash_id,deleted_at,expires_at,deleted_by,admin_hold,body) "
+                               "VALUES(?,?,?,?,?,?,?,?)", (access.tenant_id, asset_id, trash["trash_id"], now,
+                               trash["expires_at"], access.subject_id, int(access.admin), encode(asset)))
+            asset = asset | {"indexing_status": "deleted", "trash_id": trash["trash_id"]}
             connection.execute("UPDATE image_assets SET deleted=1,body=? WHERE tenant_id=? AND asset_id=?", (encode(asset), access.tenant_id, asset_id))
             # Cleanup remains an outbox effect; deleting metadata succeeds even
             # when Milvus is temporarily unavailable. Files retain historical
@@ -231,24 +388,64 @@ class AssetService:
             # The job id is fixed per asset_id. A row left by an earlier incarnation of a reused
             # asset_id (done, failed or cancelled) must be reset, or this delete would never clean up.
             connection.execute("INSERT INTO image_index_jobs(tenant_id,job_id,asset_id,revision_id,state,body) VALUES(?,?,?,?,?,?) ON CONFLICT(tenant_id,job_id) DO UPDATE SET state='pending',owner=NULL,revision_id=excluded.revision_id,body=excluded.body", (access.tenant_id, stable_id("image-delete", access.tenant_id, asset_id), asset_id, asset["revision_id"], "pending", encode(cleanup)))
+            return self._managed_row(access, asset, trash)
+
+    def restore_image(self, principal, asset_id, trash_id):
+        tenant = principal.tenant_id
+        identifier(asset_id, "asset_id")
+        identifier(trash_id, "trash_id")
+        with self.db.transaction(tenant + ":" + asset_id) as conn:
+            row = conn.execute("SELECT * FROM image_trash WHERE tenant_id=? AND asset_id=? AND trash_id=?",
+                               (tenant, asset_id, trash_id)).fetchone()
+            if not row or not _manages(principal, asset := json.loads(row["body"])):
+                raise NotFoundError("trashed image not found")
+            if not principal.admin and (row["admin_hold"] or row["deleted_by"] != principal.subject_id):
+                raise ForbiddenError("image requires an administrator to restore")
+            now = time()
+            if now >= row["expires_at"]:
+                raise ConflictError("image restore period expired")
+            current = self.db.current(conn, tenant, asset_id)
+            if current and not current[1]:
+                raise ConflictError("asset_id is already in use")
+            if current and not principal.admin:
+                self._check_reuse(conn, principal.access, asset_id, current[0])
+            self._free_asset_id(conn, tenant, asset_id)
+            asset.update(indexing_status="pending", index_profile=None, index_target_profile=self.profile,
+                         index_error=None, index_stages=[], updated_at=now, updated_by=principal.subject_id)
+            self.db.write_asset(conn, asset)
+            self._event(conn, asset, "restore", principal.subject_id)
+            self.db.enqueue(conn, asset, self.profile, requeue=True)
+            conn.execute("DELETE FROM image_trash WHERE tenant_id=? AND trash_id=?", (tenant, trash_id))
+            return self._managed_row(principal, asset)
 
     def content(self, access, asset_id, *, thumbnail=False):
+        return self._content(access, asset_id, thumbnail, self._current)
+
+    def _content(self, access, asset_id, thumbnail, lookup, expected_revision=None):
         with self.db.transaction() as connection:
-            asset = self._current(connection, access, asset_id)
+            asset = lookup(connection, access, asset_id)
+            if expected_revision is not None and asset["revision_id"] != expected_revision:
+                raise ConflictError("image changed before loading")
         key = asset["thumbnail_key"] if thumbnail else asset["object_key"]
         content = self.objects.get(key)
         # Object storage can be remote and slow. Recheck access and version
         # after that effect so an intervening delete/revocation is respected.
         with self.db.transaction() as connection:
-            current = self._current(connection, access, asset_id)
+            current = lookup(connection, access, asset_id)
             if current["revision_id"] != asset["revision_id"]:
                 raise ConflictError("image changed while loading; retry with the current revision")
         return content, "image/jpeg" if thumbnail else asset["media_type"]
 
-    def retry(self, access, asset_id):
+    def managed_reindex(self, principal, asset_id):
+        if not principal.admin:
+            raise ForbiddenError("administrator required")
+        return self._managed_row(principal, self.retry(principal.access, asset_id, _principal=principal))
+
+    def retry(self, access, asset_id, *, _principal=None):
         """Explicit retry: unknown paid calls are never retried by a poll loop."""
         with self.db.transaction(access.tenant_id + ":" + asset_id) as connection:
-            asset = self._current(connection, access, asset_id)
+            asset = (self._managed_current(connection, _principal, asset_id) if _principal else
+                     self._current(connection, access, asset_id))
             job_id = self.db.enqueue(connection, asset, self.profile)
             row = connection.execute("SELECT state,body FROM image_index_jobs WHERE tenant_id=? AND job_id=?", (access.tenant_id, job_id)).fetchone()
             if row["state"] == "running":
@@ -290,7 +487,7 @@ class AssetService:
             try:
                 if job.get("kind") == "delete":
                     started = monotonic()
-                    await asyncio.to_thread(self.index.delete, tenant_id, job["asset_id"])
+                    await asyncio.to_thread(self._delete_vectors, tenant_id, job["asset_id"], job_id, owner)
                     self._stage(stages, "vector_delete", started, {"asset_id": job["asset_id"]})
                 elif asset is None:
                     state = "cancelled"
@@ -393,6 +590,16 @@ class AssetService:
         with self.db.transaction() as connection:
             connection.execute("UPDATE image_index_jobs SET state='pending',owner=NULL WHERE tenant_id=? AND job_id=? AND owner=?", (tenant_id, job_id, owner))
 
+    def _delete_vectors(self, tenant, asset_id, job_id, owner):
+        # The external delete is asset-wide. Serialize it with restore/reuse, even
+        # when a worker outlives its lease and another process recovers the job.
+        with self.db.transaction(tenant + ":" + asset_id) as conn:
+            job = conn.execute("SELECT owner,state FROM image_index_jobs WHERE tenant_id=? AND job_id=?",
+                               (tenant, job_id)).fetchone()
+            current = self.db.current(conn, tenant, asset_id)
+            if job and job["owner"] == owner and job["state"] == "running" and (not current or current[1]):
+                self.index.delete(tenant, asset_id)
+
     def _save_job(self, tenant_id, job_id, owner, job):
         with self.db.transaction() as connection:
             cursor = connection.execute("UPDATE image_index_jobs SET body=? WHERE tenant_id=? AND job_id=? AND state='running' AND owner=?", (encode(job), tenant_id, job_id, owner))
@@ -409,7 +616,7 @@ class AssetService:
                 if current and current[1] and job.get("kind") != "delete":
                     # An old external upsert may finish after deletion cleanup.
                     # Requeue cleanup after this observed late completion.
-                    connection.execute("UPDATE image_index_jobs SET state='pending',owner=NULL WHERE tenant_id=? AND job_id=?", (tenant_id, stable_id("image-delete", tenant_id, job["asset_id"])))
+                    connection.execute("UPDATE image_index_jobs SET state='pending',owner=NULL WHERE tenant_id=? AND job_id=? AND state<>'running'", (tenant_id, stable_id("image-delete", tenant_id, job["asset_id"])))
                 return "cancelled"
             if not active and job.get("kind") != "delete":
                 state = "cancelled"

@@ -17,6 +17,7 @@ from .domain import (
     Section, ValidationError, stable_id,
 )
 from .figures import MARKER
+from .config import Principal
 from .ports import Chunker, Cleaner, KnowledgeStore, ObjectStore, Parser
 
 
@@ -387,7 +388,7 @@ class IngestionService:
             _component_fingerprint(cleaner), _component_fingerprint(chunker),
         )
 
-    def ingest(self, request: IngestRequest) -> IngestResult:
+    def ingest(self, request: IngestRequest, *, principal: Principal | None = None) -> IngestResult:
         raw = request.content.encode("utf-8")
         content_hash = sha256(raw).hexdigest()
         metadata = asdict(request)
@@ -406,11 +407,14 @@ class IngestionService:
             raise ValidationError("document contains no readable text after parsing and cleaning")
         parents, children = self.chunker.chunk(request, revision_id, sections)
         self._validate_chunks(request, revision_id, sections, parents, children)
-        return self.store.stage(PreparedDocument(
+        document = PreparedDocument(
             request=request, revision_id=revision_id,
             processing_fingerprint=self.processing_fingerprint, content_hash=content_hash,
             raw_key=raw_key, parents=tuple(parents), children=tuple(children),
-        ))
+        )
+        if principal is None:
+            return self.store.stage(document)
+        return self.store.stage(document, principal=principal)
 
     @staticmethod
     def _validate_chunks(request, revision_id, sections, parents, children):

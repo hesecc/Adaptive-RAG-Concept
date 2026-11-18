@@ -5,49 +5,53 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <meta name="color-scheme" content="dark" />
   <meta name="theme-color" content="#2b2a28" />
-  <title>知识入库与权限 · Adaptive RAG</title>
+  <title>文件中心 · Adaptive RAG</title>
   <link rel="icon" href="/static/mark.svg" type="image/svg+xml" />
   <link rel="stylesheet" href="/static/app.css" />
   <link rel="stylesheet" href="/static/knowledge.css" />
   <script src="/static/domain-controls.js" defer></script>
+  <script src="/static/file-center.js" defer></script>
+  <script src="/static/file-editor.js" defer></script>
+  <script src="/static/file-detail.js" defer></script>
   <script src="/static/knowledge.js" defer></script>
 </head>
 <body class="knowledge-page">
   <header class="topbar">
     <a class="brand" href="/" aria-label="Adaptive RAG 首页"><svg class="brand-mark" width="36" height="36" viewBox="0 0 36 36" aria-hidden="true"><rect class="m-fill" width="36" height="36" rx="10" /><path class="m-cut" d="M18 6 32 30H4Z" /><path class="m-fill" d="m18 16 8 14H10Z" /></svg><b>Adaptive RAG</b></a>
-    <nav class="tabs" aria-label="页面"><a class="tab" href="/">检索工作台</a><a class="tab" href="/images">图片资料库</a><a class="tab" href="/knowledge" aria-current="page">知识入库与权限</a><a class="tab" href="/evaluation">评测</a></nav>
+    <nav class="tabs" aria-label="页面"><a class="tab" href="/">检索工作台</a><a class="tab" href="/images">图片资料库</a><a class="tab" href="/knowledge" aria-current="page">文件中心</a><a id="evaluation-open" hidden class="tab" href="/evaluation">评测</a></nav>
     <nav class="topnav" aria-label="账号"><span id="knowledge-account" class="account-badge">正在连接</span></nav>
   </header>
   <div id="knowledge-notice" class="knowledge-notice" role="status" hidden></div>
-  <main id="knowledge-workspace" class="knowledge-workspace" hidden>
-    <aside class="knowledge-intake">
-      <span class="tiny-label">KNOWLEDGE INTAKE</span>
-      <h1>让资料，<br />进入正确的范围。</h1>
-      <p class="muted">选择资料的业务分类，再暂存和发布。检索、引用及历史记录都会按账号的当前数据权限检查。</p>
-      <p id="knowledge-domains" class="account-domains"></p>
-      <form id="knowledge-ingest-form">
-        <label for="knowledge-file">读取本地文件（可选）<input id="knowledge-file" type="file" accept=".md,.markdown,.txt,.html,.htm,text/plain,text/markdown,text/html" /></label>
-        <p class="muted file-hint">支持不超过 2MB 的文本、Markdown、HTML。PDF 可通过现有解析 / CLI 入库，再在右侧调整分类。</p>
-        <label for="knowledge-title">资料标题<input id="knowledge-title" maxlength="300" required placeholder="例如：运营活动执行规范" /></label>
-        <div class="knowledge-inline">
-          <label for="knowledge-id">文档 ID<input id="knowledge-id" maxlength="128" required /></label>
-          <label for="knowledge-version">内容版本<input id="knowledge-version" value="v1" maxlength="128" required /></label>
-        </div>
-        <label for="knowledge-format">内容格式<select id="knowledge-format"><option value="text/markdown">Markdown</option><option value="text/plain">纯文本</option><option value="text/html">HTML</option></select></label>
-        <fieldset class="knowledge-domain-field"><legend>允许访问的数据分类（必选）</legend><div id="knowledge-data-domains"></div></fieldset>
-        <p class="muted file-hint">公共表示所有成员可读。多个业务分类之间为“或”的关系；运营与财务同时选中时，两类账号均可访问。</p>
-        <label for="knowledge-content">资料正文<textarea id="knowledge-content" rows="8" maxlength="2000000" required placeholder="粘贴文本，或在上方选择本地文件。"></textarea></label>
-        <div id="knowledge-form-error" class="form-error" role="alert"></div>
-        <button id="knowledge-ingest" class="primary-button" type="submit">暂存资料 <span>↗</span></button>
-        <p class="muted file-hint">暂存完成后，在右侧点击发布才会进入可检索知识快照。相同 ID 用于同一资料的新版本，数据分类沿用该资料现有分类，需要调整请在右侧资料卡片修改。</p>
-      </form>
-    </aside>
-    <section class="knowledge-library">
-      <div class="knowledge-heading"><div><span class="tiny-label">ACCESS GOVERNANCE</span><h2>资料与数据分类</h2></div><button id="knowledge-refresh" class="secondary-button" type="button">刷新资料</button></div>
-      <p class="knowledge-summary">历史未分类资料仅管理员可见。分配正确分类后，账号才可按所授权限检索；这里修改分类不修改正文。</p>
-      <div class="knowledge-stats"><span id="knowledge-count">—</span><span id="knowledge-generation">读取当前快照中</span></div>
-      <div id="knowledge-documents" class="knowledge-documents" aria-live="polite"></div>
-    </section>
+  <main id="knowledge-workspace" class="file-center" hidden>
+    <header class="file-heading"><div><h1>文件中心</h1><p id="knowledge-domains" class="muted"></p></div>
+      <div class="file-actions"><button id="knowledge-refresh" type="button">刷新</button><button id="file-add" class="primary-button" type="button">添加文件</button></div>
+    </header>
+    <div class="file-views" role="group" aria-label="文件范围"><button data-view="all" aria-pressed="true">全部文件</button><button data-view="mine" aria-pressed="false">我的上传</button><button data-view="trash" aria-pressed="false">回收站</button></div>
+    <div class="file-filters">
+      <label>查找文件<input type="search" id="file-query" placeholder="标题、ID 或所有者" /></label>
+      <label>类型<select id="file-kind"><option value="">全部类型</option><option value="document">文档</option><option value="image">图片</option></select></label>
+      <label>状态<select id="file-status"><option value="">全部状态</option></select></label>
+      <span id="knowledge-count" role="status"></span>
+    </div>
+    <div id="file-list" aria-live="polite"></div><p id="knowledge-generation" class="file-meta"></p>
   </main>
+  <dialog id="file-editor" aria-labelledby="editor-heading"><form id="editor-form" method="post">
+    <header class="file-heading"><h2 id="editor-heading">添加文件</h2><button type="button" data-close aria-label="关闭">×</button></header>
+    <fieldset id="editor-fields">
+      <label>文件类型<select id="editor-kind"><option value="document">文本文档</option><option value="pdf">PDF 文档</option><option value="image">图片</option></select></label>
+      <label id="editor-upload-label"><span id="editor-upload-title">读取本地文件</span><input type="file" id="editor-upload" /></label>
+      <p class="file-meta" id="editor-hint"></p>
+      <label>标题<input id="editor-title" required maxlength="256" /></label>
+      <label>文件 ID<input id="editor-id" required maxlength="128" /></label>
+      <label id="editor-version-label">内容版本<input id="editor-version" required maxlength="128" /></label>
+      <div id="editor-text-fields"><label>正文格式<select id="editor-format"><option value="text/markdown">Markdown</option><option value="text/plain">纯文本</option><option value="text/html">HTML</option></select></label>
+        <label>正文<textarea id="editor-content" rows="7" maxlength="2000000"></textarea></label></div>
+      <div id="editor-image-fields" hidden><label>图片说明<textarea id="editor-description" maxlength="16000"></textarea></label>
+        <label>图片文字<textarea id="editor-ocr" maxlength="32000"></textarea></label><label>标签（逗号分隔）<input id="editor-tags" /></label></div>
+      <fieldset id="editor-domain-fields"><legend>数据分类</legend><div id="editor-domains"></div><p class="file-meta">不选择分类的文档将保留为未分类，等待管理员审核。</p></fieldset>
+    </fieldset>
+    <p id="editor-error" role="alert"></p><button id="editor-save" class="primary-button" type="submit">保存</button>
+  </form></dialog>
+  <dialog id="file-detail" aria-labelledby="detail-heading"><header class="file-heading"><h2 id="detail-heading">文件详情</h2><button type="button" data-close aria-label="关闭">×</button></header><div id="detail-body"></div></dialog>
 </body>
 </html>

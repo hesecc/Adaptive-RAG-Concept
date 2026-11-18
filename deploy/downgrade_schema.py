@@ -1,4 +1,10 @@
-"""Return the SQLite schema to the shape the PREVIOUS release writes, for a rollback.
+"""Return pre-file-center SQLite catalogs to the positional schema written by release 1f2df52.
+
+Both --check and apply refuse the whole directory before exporting or changing anything if
+document or image lifecycle schema is present, even if its tables are empty. Do not drop views,
+ownership, events or tombstones to bypass this guard: back up the current directory and restore
+a verified pre-file-center cold backup instead. Use only closed, checkpointed SQLite databases;
+never delete journal or WAL files to make a database appear checkpointed.
 
 Why this exists: the previous release inserts with positional `INSERT ... VALUES (...)`. After the
 data-domain release added columns, that release fails every write (new account, document
@@ -46,6 +52,37 @@ def columns(connection, table):
     return [row[1] for row in connection.execute(f"PRAGMA table_info({table})")]
 
 
+def cold_reader(path):
+    # Safe only with writers stopped and journals checked. Creates no WAL/SHM sidecars.
+    return sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True)
+
+
+def preflight(data):
+    markers = {
+        "knowledge.sqlite3": {"active_documents", "document_trash", "document_events", "retired_document_ids"},
+        "assets.sqlite3": {"image_trash", "image_events"},
+        "accounts.sqlite3": set(),
+    }
+    for name, names in markers.items():
+        path = data / name
+        for suffix in ("", "-shm", "-wal", "-journal"):
+            entry = data / (name + suffix)
+            if entry.is_symlink() or (entry.exists() and not entry.is_file()):
+                raise SystemExit(f"{entry.name}: cannot safely inspect linked or non-file catalog")
+            if suffix in ("-wal", "-journal") and entry.exists() and entry.stat().st_size:
+                raise SystemExit(f"{entry.name}: requires a closed, checkpointed cold backup; do not delete the journal")
+        if not path.is_file():
+            continue
+        with closing(cold_reader(path)) as connection:
+            objects = {row[0].lower() for row in connection.execute("SELECT name FROM sqlite_schema")}
+            found = objects & (names | {"retention_object_candidates_v1"})
+            if name == "knowledge.sqlite3" and "owner_id" in columns(connection, "documents"):
+                found.add("documents.owner_id")
+            if found:
+                raise SystemExit(f"{name}: file-center schema detected ({', '.join(sorted(found))}); "
+                                 "back up current data and restore a verified pre-file-center cold backup")
+
+
 def export(connection, name):
     if name == "knowledge.sqlite3" and "data_domains" in columns(connection, "documents"):
         return [{"tenant_id": tenant, "document_id": document, "data_domains": json.loads(domains)}
@@ -63,13 +100,15 @@ def downgrade(data, check_only=False):
     if sqlite3.sqlite_version_info < (3, 35, 0):
         raise SystemExit(f"SQLite {sqlite3.sqlite_version} cannot DROP COLUMN (needs 3.35+)")
     data = Path(data).resolve()
+    preflight(data)
     exported = {"documents": [], "accounts": []}
     for name, drops in PLAN.items():
         path = data / name
         if not path.is_file() or path.is_symlink():
             say(f"{name}: not present, skipped")
             continue
-        with closing(sqlite3.connect(path, isolation_level=None, timeout=10)) as connection:
+        reader = cold_reader(path) if check_only else sqlite3.connect(path, isolation_level=None, timeout=10)
+        with closing(reader) as connection:
             present = [(table, column) for table, column in drops if column in columns(connection, table)]
             say(f"{name}: columns to drop = {present or 'none (already previous shape)'}")
             exported["documents" if name == "knowledge.sqlite3" else "accounts"] = export(connection, name)

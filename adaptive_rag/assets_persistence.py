@@ -36,6 +36,21 @@ CREATE TABLE IF NOT EXISTS image_traces (
     tenant_id TEXT NOT NULL, trace_id TEXT NOT NULL, body TEXT NOT NULL,
     PRIMARY KEY (tenant_id, trace_id)
 );
+CREATE TABLE IF NOT EXISTS image_trash (
+    tenant_id TEXT NOT NULL, trash_id TEXT NOT NULL, asset_id TEXT NOT NULL,
+    deleted_at DOUBLE PRECISION NOT NULL, expires_at DOUBLE PRECISION NOT NULL,
+    deleted_by TEXT NOT NULL, admin_hold INTEGER NOT NULL, body TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, trash_id)
+);
+CREATE INDEX IF NOT EXISTS image_trash_expiry ON image_trash(expires_at);
+CREATE INDEX IF NOT EXISTS image_trash_asset ON image_trash(tenant_id, asset_id);
+CREATE TABLE IF NOT EXISTS image_events (
+    tenant_id TEXT NOT NULL, asset_id TEXT NOT NULL, incarnation TEXT NOT NULL,
+    event_id TEXT NOT NULL, created_at DOUBLE PRECISION NOT NULL, action TEXT NOT NULL,
+    actor_id TEXT NOT NULL, revision_id TEXT NOT NULL, PRIMARY KEY (tenant_id,event_id),
+    FOREIGN KEY (tenant_id,asset_id,revision_id) REFERENCES image_asset_revisions(tenant_id,asset_id,revision_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS image_events_asset ON image_events(tenant_id,asset_id,incarnation);
 """
 
 
@@ -125,6 +140,19 @@ class AssetDatabase:
     def write_current(connection, asset):
         connection.execute("UPDATE image_assets SET body=? WHERE tenant_id=? AND asset_id=? AND revision_id=? AND deleted=0",
                            (encode(asset), asset["tenant_id"], asset["asset_id"], asset["revision_id"]))
+
+    @staticmethod
+    def copy_vectors(connection, asset, profile, previous_revision, job_id):
+        from .domain import stable_id
+        tenant, asset_id = asset["tenant_id"], asset["asset_id"]
+        old_id = stable_id("image-index-v1", tenant, asset_id, previous_revision, profile)
+        rows = connection.execute("SELECT job_id,body FROM image_index_jobs WHERE tenant_id=? AND job_id IN (?,?)",
+                                  (tenant, old_id, job_id)).fetchall()
+        jobs = {r["job_id"]: json.loads(r["body"]) for r in rows}
+        vectors = jobs.get(old_id, {}).get("vectors")
+        if vectors is not None:
+            connection.execute("UPDATE image_index_jobs SET body=? WHERE tenant_id=? AND job_id=?",
+                               (encode(jobs[job_id] | {"vectors": vectors}), tenant, job_id))
 
     @staticmethod
     def enqueue(connection, asset, profile, *, requeue=False):

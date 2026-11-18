@@ -28,7 +28,7 @@ class Element {
   setAttribute(key, value) { this[key] = value; }
   addEventListener(type, fn) { this.events[type] = fn; }
   fire(type) { return this.events[type]({preventDefault() {}}); }
-  focus() {} reset() {} close() { this.open = false; }
+  focus() {} reset() {} showModal() { this.open = true; } close() { this.open = false; }
   buttons() { return this.children.flatMap(n => n.tag === 'button' ? [n] : n.buttons?.() || []); }
 }
 
@@ -68,6 +68,71 @@ async function workbench(route, bookmark = null, owner = alice, browser = {}) {
   const submit = async text => { get('#question').value = text; await get('#query-form').fire('submit'); await flush(); };
   return {get, calls, history, submit};
 }
+
+const sourceA = 'a'.repeat(64) + '.28.' + '1'.repeat(16);
+const sourceB = 'b'.repeat(64) + '.41.' + '2'.repeat(16);
+const excerpts = [sourceA, sourceB].map((evidence_id, i) => ({evidence_id, document_id: 'doc-' + i, text: 'excerpt-' + i}));
+const citedResult = {trace_id: 'cited', generation: 'edition', status: 'answered', evidence: excerpts,
+  answer: '第一项结论 [' + sourceB + ']\n第二项结论 [' + sourceA + ']', claims: [
+    {text: '第一项结论', evidence_ids: [sourceB]}, {text: '第二项结论', evidence_ids: [sourceA]},
+  ]};
+async function citedWorkbench(result, restore = false) {
+  const record = {...trace('cited'), final_result: result};
+  return workbench(url => {
+    if (url.startsWith('/conversations?')) return page([]);
+    if (url === '/query/stream') return sse([['result', {result, trace: record}]]);
+    if (url === '/conversations/group') return {conversation_id: 'group', turns: [{...turn('cited'), answer: result.answer}, turn('later')]};
+    if (url === '/traces/later') return trace('later');
+    if (url === '/traces/cited') return record;
+    for (const item of excerpts) if (url === '/evidence/edition/' + item.evidence_id)
+      return {...item, text: 'authorized original: ' + item.document_id};
+    throw Error('Unexpected fixture request: ' + url);
+  }, restore ? {subject: 'alice', tenant: 'home', id: 'group'} : null);
+}
+
+test('claims appear once in answer order and each inline source opens its own authorized original', async () => {
+  const {get, submit, calls} = await citedWorkbench(citedResult);
+  await submit('两项结论是什么？');
+  const panel = get('#panel-answer');
+  for (const claim of citedResult.claims) assert.equal(panel.textContent.split(claim.text).length - 1, 1, claim.text);
+  for (const id of [sourceA, sourceB]) assert.ok(!panel.textContent.includes(id));
+  assert.match(panel.textContent, /第一项结论\s*来源\s*2.*第二项结论\s*来源\s*1/s);
+  assert.equal(panel.buttons().length, 2);
+  for (const [index, expected] of [1, 0].entries()) {
+    await panel.buttons()[index].fire('click'); await flush();
+    assert.equal(get('#source-dialog').open, true);
+    assert.equal(calls.at(-1)[0], '/evidence/edition/' + excerpts[expected].evidence_id);
+    assert.ok(get('#source-content').textContent.includes('authorized original: doc-' + expected));
+    get('#source-dialog').close();
+  }
+});
+
+test('legacy answers convert only complete line-end evidence tokens, preserving literal brackets and math', async () => {
+  const literal = '普通 [说明]、[12]、区间 [0, 1] 与 f(x) = A[i] + B[j]。';
+  const embedded = '标识 [' + sourceB + '] 在句中不是出处。';
+  const malformed = '[' + sourceA.slice(0, -1) + ']';
+  const {get, submit} = await citedWorkbench({...citedResult, claims: [], answer:
+    [literal, embedded, malformed, '第一段。 [' + sourceA + ']', '第二段。 [' + sourceB + '] [' + sourceA + ']'].join('\r\n')});
+  await submit('旧回答');
+  const panel = get('#panel-answer');
+  for (const text of [literal, embedded, malformed]) assert.ok(panel.textContent.includes(text), text);
+  assert.ok(!panel.textContent.includes('[' + sourceA + ']'), 'line-end hash still visible');
+  assert.deepEqual(panel.buttons().map(b => b.textContent.match(/来源\s*(\d+)/)?.[1]), ['1', '2', '1']);
+});
+
+test('restored history hides citation hashes and the selected turn opens its own inline source', async () => {
+  const {get, calls} = await citedWorkbench(citedResult, true);
+  const history = get('#chat-history');
+  assert.match(history.textContent, /第一项结论/);
+  for (const id of [sourceA, sourceB]) assert.ok(!history.textContent.includes(id), 'history exposes citation ID');
+  await history.buttons().find(b => b.textContent.includes('查看本轮流程')).fire('click');
+  assert.ok(calls.some(([url]) => url === '/traces/cited'));
+  const source = history.buttons().find(b => b.textContent === '来源 2');
+  assert.ok(source, 'selected historical answer has an inline source');
+  await source.fire('click'); await flush();
+  assert.equal(get('#source-dialog').open, true);
+  assert.match(get('#source-content').textContent, /authorized original: doc-1/);
+});
 
 test('a filtered page advances by next_offset; restore and inspect without moving any turn', async () => {
   const {get, calls} = await workbench(url => {

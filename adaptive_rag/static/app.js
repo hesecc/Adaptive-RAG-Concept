@@ -1315,6 +1315,37 @@ function renderStageOutput(target, output) {
   } else target.append(el("pre", "json-view", json(output)));
 }
 
+// Compact history has only the exported answer string. Match the suffix emitted
+// by make_evidence + CloudGenerator, never arbitrary numbers or bracketed text.
+function legacyParagraphs(answer) {
+  return answer.split(/\r?\n/).map(line => {
+    const suffix = line.match(/(?:[ \t]+\[[0-9a-f]{64}\.\d+\.[0-9a-f]{16}\])+[ \t]*$/);
+    return suffix ? {text: line.slice(0, suffix.index), evidence_ids: [...suffix[0].matchAll(/\[([^\]]+)\]/g)].map(m => m[1])}
+      : {text: line, evidence_ids: []};
+  }).filter(part => part.text.trim());
+}
+
+function answerReader(result) {
+  const reader = el("div", "answer-reader");
+  const evidence = new Map((result.evidence || []).map((item, i) => [item.evidence_id, {item, number: i + 1}]));
+  const paragraphs = result.claims?.length ? result.claims : legacyParagraphs(result.answer);
+  for (const claim of paragraphs) {
+    const paragraph = el("p", "answer-paragraph", claim.text);
+    for (const id of new Set(claim.evidence_ids || [])) {
+      const source = evidence.get(id);
+      if (!source) continue;
+      const button = el("button", "citation-button", "来源 " + source.number);
+      button.type = "button";
+      button.title = [source.item.document_id, ...(source.item.heading_path || [])].filter(Boolean).join(" / ");
+      button.setAttribute("aria-label", "查看来源 " + source.number + " 的原文");
+      button.addEventListener("click", () => showSource(source.item));
+      paragraph.append(button);
+    }
+    reader.append(paragraph);
+  }
+  return reader;
+}
+
 function renderAnswer() {
   const target = $("#panel-answer");
   target.replaceChildren();
@@ -1335,7 +1366,7 @@ function renderAnswer() {
       `${statuses[result.status] || result.status} · ${result.message || ""}`,
     ),
   );
-  if (result.answer) target.append(el("div", "answer-text", result.answer));
+  if (result.answer) target.append(answerReader(result));
   else
     target.append(
       el(
@@ -1344,35 +1375,6 @@ function renderAnswer() {
         noAnswerNotes[result.status] || "本次没有返回可确认的最终答案。",
       ),
     );
-  if (result.claims?.length) {
-    const list = el("div", "claim-list");
-    list.append(el("h3", "", "逐条结论与出处"));
-    for (const claim of result.claims) {
-      const item = el("div", "claim");
-      item.append(el("p", "", claim.text));
-      for (const id of claim.evidence_ids || []) {
-        const position = (result.evidence || []).findIndex(
-          (e) => e.evidence_id === id,
-        );
-        const button = el(
-          "button",
-          "citation-button",
-          position >= 0 ? `证据 ${position + 1} ↗` : id,
-        );
-        button.type = "button";
-        button.title = id;
-        button.addEventListener("click", () => {
-          switchTab("evidence");
-          const card = document.getElementById(`evidence-${position}`);
-          card?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-          card?.focus({ preventScroll: true });
-        });
-        item.append(button);
-      }
-      list.append(item);
-    }
-    target.append(list);
-  }
   // Figures of the passages the answer rests on. A closest-match list ("insufficient") is not an answer,
   // so its figures stay on the evidence cards.
   if (["answered", "partial", "evidence_preview"].includes(result.status)) {
@@ -1829,10 +1831,11 @@ function renderChatHistory() {
     const answer = el("article", "chat-message assistant-message");
     const label = el("div", "message-label");
     label.append(el("span", "assistant-mark", "A"), document.createTextNode("Adaptive RAG"));
-    answer.append(label, el("p", "history-answer", message.answer || message.message || noAnswerNotes[message.status] || "本轮没有返回回答。"));
+    const selected = message.trace_id === state.traceId;
+    const result = selected && state.result ? state.result : message;
+    answer.append(label, result.answer ? answerReader(result) : el("p", "history-answer", result.message || noAnswerNotes[result.status] || "本轮没有返回回答。"));
     const footer = el("div", "history-caption");
     footer.append(el("span", "", statuses[message.status] || message.status));
-    const selected = message.trace_id === state.traceId;
     const button = el("button", "", selected ? "正在查看本轮流程" : "查看本轮流程 →");
     button.type = "button";
     button.disabled = state.running;

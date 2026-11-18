@@ -39,6 +39,10 @@ const labels = {
   dense: ["向量语义检索", "按语义相似度召回授权候选内容。"],
   fusion: ["RRF 结果融合", "融合各检索通道的排名，合并重复命中。"],
   reranker: ["相关性重排", "对融合后的候选执行已配置的排序适配器。"],
+  relevance: [
+    "相似度判定",
+    "按词面重合或重排分数判断候选是否与问题相同或相似，不相似的不会作为来源。",
+  ],
   parent_backfill: ["父块回填", "将检索到的子块回填为更完整的上下文。"],
   judge: ["证据充分性检查", "判断证据是否覆盖各个子问题。"],
   "decision.gap": ["补检索决策", "根据缺项和剩余预算判断是否补充检索。"],
@@ -88,7 +92,7 @@ const statuses = {
   insufficient: "证据不足",
   evidence_preview: "证据预览",
   no_index: "暂无知识索引",
-  empty: "无可用证据",
+  empty: "未找到相似内容",
   clarify: "需要补充信息",
   capability_unavailable: "能力暂不可用",
   policy_stopped: "策略已停止",
@@ -123,6 +127,55 @@ function notice(message = "", type = "") {
   node.hidden = !message;
 }
 const failedStatuses = ["error", "timeout", "cancelled"];
+// What the answer and evidence panels say when a query ends without an answer.
+const noAnswerNotes = {
+  evidence_preview: "当前模式返回证据预览，尚未启用答案生成。",
+  empty:
+    "知识库中没有找到与问题相同或相似的内容，所以没有生成回答。可以换一种说法，或请管理员补充资料。",
+  insufficient:
+    "找到了相关内容，但不足以回答这个问题，所以没有生成回答。可在“证据”中查看最接近的资料。",
+};
+// A figure travels inside the evidence text as one Markdown line that holds its storage key.
+// The page shows the picture itself, so the line is replaced by a short placeholder.
+const FIGURE_LINE = /!\[[^[\]\n]*\]\(ragfig:[0-9a-f]{64}(?: "[^"\n]*")?\)/g;
+const withoutFigureLines = (text) =>
+  (text || "").replace(FIGURE_LINE, "［插图］");
+function figureNode(item, image, label = "") {
+  const generation =
+    item.generation || state.result?.generation || state.trace?.generation;
+  const url = `/evidence/${encodeURIComponent(generation)}/${encodeURIComponent(item.evidence_id)}/images/${image.key}`;
+  const figure = el("figure", "evidence-figure");
+  const link = el("a");
+  link.href = url;
+  link.target = "_blank";
+  link.rel = "noopener";
+  link.title = "在新标签页打开原图";
+  const picture = el("img");
+  picture.src = url;
+  picture.alt = image.caption || "文档插图";
+  picture.loading = "lazy";
+  picture.decoding = "async";
+  // The picture is fetched with the session cookie; a revoked document or an expired session answers 4xx.
+  picture.addEventListener(
+    "error",
+    () => link.replaceWith(el("p", "muted", "这张图片暂时无法显示。")),
+    { once: true },
+  );
+  link.append(picture);
+  const caption = el("figcaption");
+  if (image.caption) caption.append(el("span", "", image.caption));
+  caption.append(
+    el(
+      "span",
+      "figure-source",
+      `来源：${[item.document_id, image.page ? `第 ${image.page} 页` : "", label]
+        .filter(Boolean)
+        .join(" · ")}`,
+    ),
+  );
+  figure.append(link, caption);
+  return figure;
+}
 function failureDetails(stage, trace = state.trace) {
   if (stage?.error?.message) return stage.error;
   const call = trace?.usage?.calls?.findLast((item) =>
@@ -892,7 +945,7 @@ function phase(name) {
     return "plan";
   if (/^(snapshot|authorized_chunks|lexical|dense|gap|decision.gap)/.test(name))
     return "retrieve";
-  if (/^(fusion|reranker|parent_backfill|judge)/.test(name)) return "rank";
+  if (/^(fusion|reranker|relevance|parent_backfill|judge)/.test(name)) return "rank";
   if (/^(generator|decision.generate)/.test(name)) return "generate";
   return "verify";
 }
@@ -1195,9 +1248,7 @@ function renderAnswer() {
       el(
         "p",
         "muted",
-        result.status === "evidence_preview"
-          ? "当前模式返回证据预览，尚未启用答案生成。"
-          : "本次没有返回可确认的最终答案。",
+        noAnswerNotes[result.status] || "本次没有返回可确认的最终答案。",
       ),
     );
   if (result.claims?.length) {
@@ -1229,7 +1280,32 @@ function renderAnswer() {
     }
     target.append(list);
   }
-  if (result.missing_query_ids?.length)
+  // Figures of the passages the answer rests on. A closest-match list ("insufficient") is not an answer,
+  // so its figures stay on the evidence cards.
+  if (["answered", "partial", "evidence_preview"].includes(result.status)) {
+    const cited = new Set(
+      (result.claims || []).flatMap((claim) => claim.evidence_ids || []),
+    );
+    const seen = new Set();
+    const figures = [];
+    (result.evidence || []).forEach((item, index) => {
+      if (cited.size && !cited.has(item.evidence_id)) return;
+      for (const image of item.images || []) {
+        if (seen.has(image.key)) continue;
+        seen.add(image.key);
+        figures.push(
+          figureNode(item, image, `证据 E${String(index + 1).padStart(2, "0")}`),
+        );
+      }
+    });
+    if (figures.length) {
+      const gallery = el("div", "figure-list");
+      gallery.append(el("h3", "", "相关插图"), ...figures);
+      target.append(gallery);
+    }
+  }
+  // An empty result already says nothing was found; listing raw sub-question ids next to it is noise.
+  if (result.missing_query_ids?.length && result.status !== "empty")
     target.append(
       el(
         "div",
@@ -1245,9 +1321,18 @@ function renderEvidence() {
   const target = $("#panel-evidence");
   target.replaceChildren();
   if (!evidence.length) {
-    empty(target, "本次没有可展示的授权证据。");
+    empty(
+      target,
+      state.result?.status === "empty"
+        ? "没有找到相同或相似的内容，所以没有可引用的来源。"
+        : "本次没有可展示的授权证据。",
+    );
     return;
   }
+  if (state.result?.status === "insufficient")
+    target.append(
+      el("p", "missing-box", "以下是与问题最接近的资料，但不足以回答，请谨慎参考。"),
+    );
   evidence.forEach((item, index) => {
     const card = el("article", "evidence-card");
     card.id = `evidence-${index}`;
@@ -1278,9 +1363,14 @@ function renderEvidence() {
           .filter(Boolean)
           .join(" / "),
       ),
-      el("p", "evidence-text", item.text || ""),
-      bottom,
+      el("p", "evidence-text", withoutFigureLines(item.text)),
     );
+    if (item.images?.length) {
+      const figures = el("div", "evidence-figures");
+      figures.append(...item.images.map((image) => figureNode(item, image)));
+      card.append(figures);
+    }
+    card.append(bottom);
     const details = el("details");
     details.append(
       el("summary", "", "引用元数据"),
@@ -1318,8 +1408,17 @@ async function showSource(item) {
         "source-meta",
         `${data.document_id} / ${data.version}\n${(data.heading_path || []).join(" / ")}\n${data.locator || ""}${data.truncated ? "\n按原查询证据预算截取，未包含整个文档。" : ""}`,
       ),
-      el("div", "source-body", data.text),
+      el("div", "source-body", withoutFigureLines(data.text)),
     );
+    if (data.images?.length) {
+      const figures = el("div", "evidence-figures");
+      figures.append(
+        ...data.images.map((image) =>
+          figureNode({ ...data, generation }, image),
+        ),
+      );
+      target.append(figures);
+    }
   } catch (error) {
     if (epoch === state.sourceEpoch && session === state.sessionEpoch)
       target.replaceChildren(

@@ -1,7 +1,11 @@
 """One application facade shared by trusted local CLI and authenticated HTTP."""
 
+from dataclasses import asdict
+import re
+
 from .config import Settings
-from .domain import AccessContext, NotFoundError, ValidationError, identifier, stable_id
+from .domain import AccessContext, NotFoundError, PdfIngestResult, ValidationError, identifier, stable_id
+from .figures import attach_figures, sniff_media_type
 from .ingestion import IngestionService
 from .pipeline import QueryPipeline, digest, make_evidence
 from .plugins import PluginRegistry, default_registry
@@ -54,8 +58,11 @@ class RagApplication:
         if sha256(raw).hexdigest() != parsed.metadata.get("source_sha256"):
             raise ValidationError("PDF source changed during parsing; retry with a stable source")
         raw_key = self.objects.put(raw)
-        return self.ingest(IngestRequest(content=parsed.markdown, media_type="text/markdown",
+        # Figures are stored before the document, so a stored document never points at a missing picture.
+        markdown, figures = attach_figures(parsed.markdown, parsed.figures, self.objects.put)
+        result = self.ingest(IngestRequest(content=markdown, media_type="text/markdown",
             source_object_key=raw_key, source_parser=parsed.backend, **metadata))
+        return PdfIngestResult(**asdict(result), figures=figures)
 
     def publish(self, tenant_id, job_id, expected_generation):
         return self.store.publish(tenant_id, job_id, expected_generation)
@@ -129,6 +136,23 @@ class RagApplication:
         if evidence.evidence_id != evidence_id:
             raise NotFoundError("evidence identifier integrity check failed")
         return evidence
+
+    def get_evidence_image(self, access: AccessContext, generation: str, evidence_id: str, key: str):
+        """Bytes and media type of a figure shown by an evidence the caller may read.
+
+        The key alone opens nothing: it must occur in that evidence, so the
+        object store cannot be browsed and a figure follows its document's ACL.
+        """
+        if not re.fullmatch(r"[0-9a-f]{64}", key):
+            raise ValidationError("invalid image key")
+        evidence = self.get_evidence(access, generation, evidence_id)
+        if key not in {image.key for image in evidence.images}:
+            raise NotFoundError("image not found in this evidence")
+        content = self.objects.get(key)
+        media_type = sniff_media_type(content)
+        if media_type is None:
+            raise ValidationError("stored figure is not a supported image")
+        return content, media_type
 
     def capabilities(self):
         cloud_mode = any(d["requires_model"] for d in self.descriptions.values())

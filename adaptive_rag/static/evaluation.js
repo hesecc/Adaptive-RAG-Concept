@@ -219,8 +219,8 @@
       grid.append(metricTile(label, score(value), finite(value) ? note : "没有带标注的问题，无法计算", {meter: value}));
     }
     if (finite(report.retrieval_empty_rate)) {
-      grid.append(metricTile("无结果率", `${Math.round(report.retrieval_empty_rate * 100)}%`,
-        `无标注问题（${count(report.unlabelled_case_count)} 个）里没有检索到任何结果的占比，不代表拒答质量`));
+      grid.append(metricTile("未找到率", `${Math.round(report.retrieval_empty_rate * 100)}%`,
+        `无标注问题（${count(report.unlabelled_case_count)} 个）里没有找到相同或相似内容的占比，不代表拒答质量`));
     }
     section.append(grid);
     return section;
@@ -264,7 +264,7 @@
       }
       const retrieved = array(item.retrieved_ids);
       const foundCell = el("td", "id-cell");
-      if (!retrieved.length) foundCell.append(el("span", "none", "无结果"));
+      if (!retrieved.length) foundCell.append(el("span", "none", "未找到"));
       for (const id of retrieved) {
         const hit = goldSet.has(id);
         const chip = el("span", hit ? "id-chip hit" : "id-chip", hit ? `✓ ${id}` : id);

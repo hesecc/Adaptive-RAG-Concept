@@ -63,6 +63,8 @@ uv run adaptive-rag --env-file .env trace --tenant demo --id $result.trace_id
 
 启用质量检查后，证据不足返回 `insufficient`，不会将相关片段强行生成为答案；仅部分子问题有充分证据时可返回 `partial`。生成后检查每条 claim 是否被其引用支持，以及是否遗漏问题要点；未支持或矛盾的 claim 不会出现在最终答案。生成前与生成后的定向补检索**合计最多一次**，共享 12 个检索通道的总预算；初检保留原问并为补救预留通道。生成后只有加入新证据才重新生成并复验，重复结果或预算耗尽时返回已支持部分或 `insufficient`。非法审查 JSON、未知引用及模型调用失败会安全报错，不会把未核验草稿当作通过结果。
 
+每个子问题的候选在选作证据前，会先判断是否与问题相同或相似（默认开启，`RAG_RELEVANCE_GATE=false` 可关闭）。库里没有时返回 `empty`，提示「在你有权访问的知识库中，没有找到与问题相同或相似的内容」，不列来源；找到相关内容但不足以回答时返回 `insufficient`，并列出最接近的资料。无模型模式只按词面判断，会漏掉没有共同词的改写，也会放过只撞上常见词的问题；云端模式另用重排分数。阈值、校准数据和限制见[相似度判定](docs/relevance.md)。
+
 容器可由部署系统显式注入相同环境变量，进程环境优先于指定的本地文件。`.env` 和带凭证的配置不进入 Git、镜像或公开日志；模型 Key 与本项目 HTTP 的 Bearer token 分开生成和保存。
 
 ## PDF 解析与对比
@@ -76,9 +78,9 @@ uv run adaptive-rag parse-pdf --file $pdf.FullName --backend local --output .rag
 uv run adaptive-rag --env-file .env parse-pdf --file $pdf.FullName --backend mineru --output .rag-data/pdf-mineru.md --checkpoint .rag-data/mineru-checkpoint.json
 ```
 
-`--checkpoint` 仅供 MinerU 使用，保留同一 PDF 与解析配置的批次状态；失败后用同一路径重试可恢复已确认的批次，提交结果不明时会停下而不会自动重复提交。`parse-pdf` 只写解析产物，不会发布知识。选择产物后可用普通 Markdown `ingest`，或直接 `ingest --file <PDF路径> --pdf-backend local|mineru --pdf-checkpoint <检查点路径>` 暂存并归档原 PDF，随后按已有 CAS 流程发布；本地后端不传检查点。解析代码默认 `local`，本轮实际 `.env` 已根据样本选择 `RAG_PDF_BACKEND=mineru`，可用 CLI 参数覆盖。
+`--checkpoint` 仅供 MinerU 使用，保留同一 PDF 与解析配置的批次状态；失败后用同一路径重试可恢复已确认的批次，提交结果不明时会停下而不会自动重复提交。`parse-pdf` 只写解析产物，不会发布知识。选择产物后可用普通 Markdown `ingest`，或直接 `ingest --file <PDF路径> --pdf-backend local|mineru --pdf-checkpoint <检查点路径>` 暂存并归档原 PDF，随后按已有 CAS 流程发布；本地后端不传检查点。MinerU 解析出的插图会随文档保存，并随证据返回；本地后端不提取插图（见[文档里的插图](docs/figures.md)）。解析代码默认 `local`，本轮实际 `.env` 已根据样本选择 `RAG_PDF_BACKEND=mineru`，可用 CLI 参数覆盖。
 
-此前三模型请求、整篇论文问答、PDF 公式/表格对照和当时限制见[实践验收报告](docs/research/cloud-and-parser-validation.md)；其中记录的结果不代表新增增强开关已经通过业务质量评测。对该样本优先 MinerU；图像资源和原 PDF 页坐标尚未进入证据服务。分块现已识别 Markdown 表格、HTML 表格、围栏代码和常见闭合块公式：在相应父/子块字符上限内尽量整体保留；已识别的超长结构按预算分片，在 locator 标记 `structure_fragment`。未闭合代码和 HTML 表格也可标记，未闭合公式尚未专门识别；不补造表头或公式定界符。该保护以解析后的 Markdown 为输入，不等于完整文档结构理解。
+此前三模型请求、整篇论文问答、PDF 公式/表格对照和当时限制见[实践验收报告](docs/research/cloud-and-parser-validation.md)；其中记录的结果不代表新增增强开关已经通过业务质量评测。对该样本优先 MinerU；插图只带页码，原 PDF 页内坐标尚未进入证据服务。分块现已识别 Markdown 表格、HTML 表格、围栏代码和常见闭合块公式：在相应父/子块字符上限内尽量整体保留；已识别的超长结构按预算分片，在 locator 标记 `structure_fragment`。未闭合代码和 HTML 表格也可标记，未闭合公式尚未专门识别；不补造表头或公式定界符。该保护以解析后的 Markdown 为输入，不等于完整文档结构理解。
 
 ## 已实现链路
 
@@ -106,7 +108,7 @@ flowchart LR
 
 | 环节 | 当前实现 | 替换边界 |
 | --- | --- | --- |
-| 入库 | plain、ATX Markdown、惰性 HTML；PDF 本地/MinerU 转 Markdown；结构保护父子切块与配置指纹 | `Parser` / `Cleaner` / `Chunker` |
+| 入库 | plain、ATX Markdown、惰性 HTML；PDF 本地/MinerU 转 Markdown（MinerU 插图随文档保存）；结构保护父子切块与配置指纹 | `Parser` / `Cleaner` / `Chunker` |
 | 知识生命周期 | 暂存、显式发布、不可变快照、CAS、删除、回滚 | `KnowledgeStore` |
 | 原文与 trace | 默认内容寻址文件、SQLite；可选 S3 兼容对象存储、PostgreSQL | `ObjectStore` / `TraceSink` |
 | 计划与控制 | 默认规则、可选云语义分解；最多 3 子问题、12 总通道、一次共享补救；Laya 未接入 | `Planner` / `DecisionPolicy` |
@@ -160,6 +162,7 @@ uv run adaptive-rag --env-file .env serve
 | GET | `/traces/{id}` | 同租户链路诊断，按当前源权限复核 |
 | GET | `/evaluation`、`/evaluation/reports`、`/evaluation/reports/{id}` | 评测页面；管理员读取已保存的评测报告（只读，按租户隔离） |
 | GET | `/evidence/{generation}/{evidence_id}` | 按快照回源并复核实时 ACL |
+| GET | `/evidence/{generation}/{evidence_id}/images/{key}` | 读取该证据里的一张插图，按证据的实时 ACL 复核 |
 | POST | `/access`、`/documents/delete`、`/rollback` | 撤权、删除、回滚 |
 
 ### 检索工作台
@@ -170,7 +173,7 @@ uv run adaptive-rag --env-file .env serve
 
 页面显示真实执行时间线、各步状态与服务端耗时，并可查看结构化返回、最终回答、逐条引用、证据回源、模型调用及平台返回的 Token 用量。实时事件先展示阶段元数据，结果经最终权限检查与 Trace 持久化后再展示内容；未启用或因预算跳过的步骤会明确标记。按 Trace ID 可重新加载历史记录并复核当前权限，也可下载本次运行 JSON。会话列表仅保留在当前页面；下载文件包含问题与证据，应按知识库数据管理。
 
-当前页面用于已有知识库的检索与诊断。管理员可在「知识管理」页（`/knowledge`）导入文本、Markdown、HTML 资料并选择数据分类，暂存、发布和调整分类；PDF 导入、撤权和回滚仍使用现有 CLI 或 HTTP 接口。管理员还可以点击顶栏的「评测」（`/evaluation`）只读查看已保存的评测报告，见[评测](docs/evaluation.md)。详细操作与事件契约见 [检索工作台说明](docs/workbench.md)。
+当前页面用于已有知识库的检索与诊断。管理员可在「知识管理」页（`/knowledge`）导入文本、Markdown、HTML 资料并选择数据分类，暂存、发布和调整分类；PDF 导入只能用命令行（`ingest --file`），撤权和回滚仍使用现有 CLI 或 HTTP 接口。管理员还可以点击顶栏的「评测」（`/evaluation`）只读查看已保存的评测报告，见[评测](docs/evaluation.md)。详细操作与事件契约见 [检索工作台说明](docs/workbench.md)。
 
 ## 数据分类与鉴权
 
@@ -182,13 +185,13 @@ uv run adaptive-rag --env-file .env serve
 
 图片资产、版本、持久化任务与图片 trace 默认使用 SQLite，可切换 PostgreSQL；原图与缩略图通过 `ObjectStore` 接本地文件或 S3；图片文字向量可接 SQLite 精确检索或 Milvus。远程存储开关与云模型开关相互独立，不会因切换存储自动调用模型或迁移已有数据。
 
-本轮不使用共享图文向量空间，不自动理解图片、不自动提取 PDF 配图，也不生成图片。图片结果暂为独立入口，文档 dense 检索不自动迁移到图片 Milvus。操作、接口、失败恢复与边界见 [图片资料库说明](docs/image-library.md)，配置见 [存储模板](deploy/storage.env.template)，测试覆盖和部署缺口见 [验收记录](docs/research/image-storage-validation.md)。
+本轮不使用共享图文向量空间，不自动理解图片，也不生成图片。PDF 里的插图不进入图片资料库，而是随文档保存、跟着证据显示，见[文档里的插图](docs/figures.md)。图片资料库的结果暂为独立入口，文档 dense 检索不自动迁移到图片 Milvus。操作、接口、失败恢复与边界见 [图片资料库说明](docs/image-library.md)，配置见 [存储模板](deploy/storage.env.template)，测试覆盖和部署缺口见 [验收记录](docs/research/image-storage-validation.md)。
 
 ## 不变量与当前边界
 
 - 快照保存内容版本；权限始终实时检查。删除立即撤销历史文档读取；回滚不会自动恢复权限。重复导入或发布也不会重置 ACL。管理员可以通过 `access` 显式重新授权。
 - 每次查询固定一个 generation；检索插件只能返回来自该次已授权候选的原始块，融合及排序只能处理输入候选，不能改写内容、越权添块或改变子问题 ID。证据回源不信任客户端的 parent/revision 清单。
-- `no_index`、`empty`、`clarify`、`capability_unavailable`、`partial`、`insufficient`、插件错误、超时各自可辨。`partial` 只包含通过当前检查的事实，`missing_query_ids` 标识仍需确认的子问题；`insufficient` 不返回无法支持的答案。trace 保存插件、阶段状态、耗时、实际 child IDs、覆盖、核验与补救诊断；默认模型调用为零，云查询按实际请求尝试（含重试）记录调用次数、网络次数、模型耗时及平台返回的 token 用量。全局 capabilities 不预估云调用次数，以每次查询的 usage/trace 为准；配置密钥不写入 trace。trace 含问题与证据，属于敏感本地数据。
+- `no_index`、`empty`、`clarify`、`capability_unavailable`、`partial`、`insufficient`、插件错误、超时各自可辨。`empty` 表示没有找到与问题相同或相似的内容，不返回来源，见[相似度判定](docs/relevance.md)。`partial` 只包含通过当前检查的事实，`missing_query_ids` 标识仍需确认的子问题；`insufficient` 不返回无法支持的答案。trace 保存插件、阶段状态、耗时、实际 child IDs、覆盖、核验与补救诊断；默认模型调用为零，云查询按实际请求尝试（含重试）记录调用次数、网络次数、模型耗时及平台返回的 token 用量。全局 capabilities 不预估云调用次数，以每次查询的 usage/trace 为准；配置密钥不写入 trace。trace 含问题与证据，属于敏感本地数据。
 - 基座使用字符预算，不将字符数声称为模型 token 数。截断证据带 `truncated=true`，正文摘录 hash 与完整父块 source hash 分开。
 - 词法覆盖不等于语义充分性；默认引用核验只检查出处/哈希/ID，`support_checked=false`。开启质量检查才进行云语义判断并记录 `support_checked` / `completeness_checked`；审查器与生成器共用模型，仍需独立业务 gold 验证质量。云查询预处理可结合 history 理解问题，不授予权限、不代替商品身份确认。
 - 默认 BM25 每次对授权块计算词法统计；文档云 dense 对授权块精确计算余弦，相同模型配置的向量缓存在 SQLite，冷查询才补算缺失文档向量。图片文字检索新增独立 Milvus 适配与持久化索引任务。当前仍未提供文档双索引就绪发布、通用分布式任务或高可用方案。已有手动冷备、隔离恢复检查及显式 SQLite 知识库到空 PostgreSQL 迁移函数，账号和对象需分别处理；尚无自动调度、异机副本及生产原位自动恢复。

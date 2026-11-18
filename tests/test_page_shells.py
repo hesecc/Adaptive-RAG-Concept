@@ -2,6 +2,7 @@
 
 from html.parser import HTMLParser
 from pathlib import Path
+import re
 import unittest
 
 STATIC = Path(__file__).resolve().parents[1] / "adaptive_rag" / "static"
@@ -46,6 +47,30 @@ class PageShellTests(unittest.TestCase):
     def test_the_login_form_never_falls_back_to_a_get_request(self):
         # Submitted natively as GET, the form would put the password into the address bar and the history.
         self.assertEqual(tags().with_id("login-form").get("method"), "post")
+
+    def test_every_page_carries_the_same_four_navigation_tabs(self):
+        # The image library once shipped with only two tabs, so the other two vanished until the user went back.
+        expected = [("/", "检索工作台"), ("/images", "图片资料库"),
+                    ("/knowledge", "知识入库与权限"), ("/evaluation", "评测")]
+        own = {"index.html": "/", "images.html": "/images", "knowledge.html": "/knowledge", "evaluation.html": "/evaluation"}
+        for page in PAGES:
+            text = (STATIC / page).read_text(encoding="utf-8")
+            nav = re.search(r'<nav class="tabs"[^>]*>(.*?)</nav>', text, re.S)
+            self.assertIsNotNone(nav, page)
+            links = re.findall(r"<a\b([^>]*)>([^<]*)</a>", nav.group(1))
+            self.assertEqual([(re.search(r'href="([^"]*)"', attrs).group(1), label.strip()) for attrs, label in links],
+                             expected, page)
+            current = [re.search(r'href="([^"]*)"', attrs).group(1) for attrs, _ in links if "aria-current" in attrs]
+            self.assertEqual(current, [own[page]], page)
+
+    def test_pages_that_reveal_the_administrator_tabs_start_with_them_hidden(self):
+        # Members never see these two tabs on the workbench, so the image library must not show them either.
+        for page, script in (("index.html", "app.js"), ("images.html", "images.js")):
+            shell = tags(page)
+            source = (STATIC / script).read_text(encoding="utf-8")
+            for identifier in ("knowledge-open", "evaluation-open"):
+                self.assertIn("hidden", shell.with_id(identifier), (page, identifier))
+                self.assertRegex(source, rf'["#]{identifier}["\']?\)?\.hidden\s*=\s*!', (script, identifier))
 
     def test_brand_marks_have_a_size_without_the_stylesheet(self):
         # An inline SVG that only has a viewBox grows to the width of the page when app.css is missing.

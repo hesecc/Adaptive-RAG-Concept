@@ -20,10 +20,19 @@ from time import monotonic, sleep
 from typing import Any
 from urllib.parse import urlsplit
 from zipfile import BadZipFile, ZipFile
+import zlib
 
 import httpx
 
 from .domain import CapabilityError, ValidationError
+from .figures import ARCHIVE_REFERENCE, Figure
+
+# Pictures MinerU exports next to full.md. Over the limits a picture is skipped, not the document.
+MAX_FIGURES = 200
+MAX_FIGURE_BYTES = 10_000_000
+MAX_FIGURE_TOTAL_BYTES = 60_000_000
+_CONTENT_LIST_BYTES = 8_000_000
+_ARCHIVE_READ_ERRORS = (BadZipFile, OSError, RuntimeError, EOFError, zlib.error)
 
 
 @dataclass(frozen=True)
@@ -75,6 +84,8 @@ class ParsedPdf:
     backend: str
     duration_seconds: float
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Pictures the Markdown refers to. Only the MinerU backend exports any.
+    figures: tuple[Figure, ...] = ()
 
 
 def _checkpoint_error(action: str, operation: str, error: OSError) -> CapabilityError:
@@ -377,7 +388,7 @@ class MinerUPdfParser:
                 archive = request("GET", archive_url, limit=self.settings.max_download_bytes).content
             except CapabilityError:
                 raise CapabilityError("MinerU result download failed or archive exceeds the configured size limit") from None
-            markdown, archive_metadata = self._markdown(archive)
+            markdown, figures, archive_metadata = self._markdown(archive)
             checkpoint.save("complete", batch_id)
             return ParsedPdf(markdown, pages, "mineru", round(self.clock() - started, 4), {
                 "source_sha256": data_id, "model_version": self.settings.model_version,
@@ -385,12 +396,12 @@ class MinerUPdfParser:
                 "states": states, "network_calls": calls,
                 "formula_recognition_requested": True, "table_recognition_requested": True,
                 **archive_metadata,
-            })
+            }, figures)
         finally:
             if owns_client:
                 client.close()
 
-    def _markdown(self, raw: bytes) -> tuple[str, dict]:
+    def _markdown(self, raw: bytes) -> tuple[str, tuple[Figure, ...], dict]:
         try:
             with ZipFile(BytesIO(raw)) as archive:
                 infos = archive.infolist()
@@ -421,12 +432,74 @@ class MinerUPdfParser:
                 if not markdown:
                     raise CapabilityError("MinerU returned empty Markdown")
                 # Markdown is inert data: no asset fetching, HTML execution or ZIP extraction.
-                return markdown + "\n", {"archive_entries": len(infos), "markdown_bytes": len(text),
+                # Pictures are read into memory under fixed limits, never written to disk.
+                figures, figure_metadata = _figures(
+                    archive, {info.filename: info for info in infos if not info.is_dir()},
+                    selected.filename, markdown)
+                return markdown + "\n", figures, {"archive_entries": len(infos), "markdown_bytes": len(text),
                     "removed_nul_characters": removed_nuls,
                     "formula_blocks": len(re.findall(r"\$\$[\s\S]*?\$\$", markdown)),
-                    "html_tables": len(re.findall(r"<table(?:\s|>)", markdown, re.I))}
+                    "html_tables": len(re.findall(r"<table(?:\s|>)", markdown, re.I)),
+                    **figure_metadata}
         except (BadZipFile, UnicodeError, OSError, RuntimeError):
             raise CapabilityError("MinerU returned an invalid result archive") from None
+
+
+def _figure_details(archive: ZipFile, entries: dict, folder: PurePosixPath) -> dict[str, tuple[str, int | None]]:
+    """Caption and page per picture path, from MinerU's `*_content_list.json`; empty when it is absent.
+
+    Only `image` and `chart` items count. Table screenshots are skipped on
+    purpose: their HTML is already in the Markdown. MinerU puts a chart's
+    caption in its footnote field, so captions are tried before footnotes.
+    """
+    names = [name for name in entries
+             if name.endswith("_content_list.json") and PurePosixPath(name).parent == folder]
+    if len(names) != 1 or entries[names[0]].file_size > _CONTENT_LIST_BYTES:
+        return {}
+    try:
+        items = json.loads(archive.read(entries[names[0]]))
+    except (ValueError, *_ARCHIVE_READ_ERRORS):
+        return {}
+    details: dict[str, tuple[str, int | None]] = {}
+    for item in items if isinstance(items, list) else ():
+        kind = item.get("type") if isinstance(item, dict) else None
+        path = item.get("img_path") if kind in ("image", "chart") else None
+        if not isinstance(path, str) or path in details:
+            continue
+        caption = ""
+        for name in (f"{kind}_caption", f"{kind}_footnote", "content"):
+            value = item.get(name)
+            parts = value if isinstance(value, list) else [value]
+            caption = " ".join(part.strip() for part in parts if isinstance(part, str) and part.strip())
+            if caption:
+                break
+        index = item.get("page_idx")
+        details[path] = (caption, index + 1 if type(index) is int and 0 <= index < 99_999 else None)
+    return details
+
+
+def _figures(archive: ZipFile, entries: dict, markdown_name: str, markdown: str) -> tuple[tuple[Figure, ...], dict]:
+    """The pictures `full.md` points at, read under count and size limits; unreadable ones are left out."""
+    folder = PurePosixPath(markdown_name).parent
+    referenced = list(dict.fromkeys(match["path"] for match in ARCHIVE_REFERENCE.finditer(markdown)))
+    details = _figure_details(archive, entries, folder) if referenced else {}
+    figures, total = [], 0
+    for path in referenced:
+        info = entries.get((folder / path).as_posix())
+        if (info is None or len(figures) >= MAX_FIGURES or info.file_size > MAX_FIGURE_BYTES
+                or total + info.file_size > MAX_FIGURE_TOTAL_BYTES):
+            continue
+        try:
+            with archive.open(info) as handle:
+                content = handle.read(MAX_FIGURE_BYTES + 1)
+        except _ARCHIVE_READ_ERRORS:
+            continue
+        if not content or len(content) > MAX_FIGURE_BYTES:
+            continue
+        total += len(content)
+        caption, page = details.get(path, ("", None))
+        figures.append(Figure(path, content, caption, page))
+    return tuple(figures), {"figures_referenced": len(referenced), "figures_extracted": len(figures)}
 
 
 def parse_pdf(path: str | Path, backend: str = "local", settings: PdfSettings | None = None,

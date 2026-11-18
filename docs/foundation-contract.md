@@ -52,7 +52,7 @@ Settings位于adaptive_rag/config.py，可Settings(data_dir=Path(...))，load_se
 
 `parse-pdf --file <PDF> --backend local|mineru --output <Markdown>` 仅生成解析产物；`ingest --file <PDF> --pdf-backend local|mineru` 暂存，发布仍需显式 CAS。默认 `local`，也可通过 `RAG_PDF_BACKEND` 选择。MinerU 需 `MINERU_API_KEY`，会上传文档；模型开关与 PDF 后端选择分别控制各自能力。
 
-MinerU 的 `parse-pdf` 可带 `--checkpoint <本地JSON路径>`，PDF `ingest` 可带 `--pdf-checkpoint`，在同一 PDF 和解析配置下恢复已确认的批次。提交结果不明时保留检查点并报错，避免自动重复提交；本地后端拒绝检查点参数。源 PDF 按内容哈希独立归档，归档前复核解析时源哈希；图片资源服务和原 PDF 页坐标回源尚未实现。解析质量按同一文件的完整性、顺序、表格和公式对比，不以字符数或无报错代替质量验收。命令见 [README](../README.md#pdf-解析与对比)。
+MinerU 的 `parse-pdf` 可带 `--checkpoint <本地JSON路径>`，PDF `ingest` 可带 `--pdf-checkpoint`，在同一 PDF 和解析配置下恢复已确认的批次。提交结果不明时保留检查点并报错，避免自动重复提交；本地后端拒绝检查点参数。源 PDF 按内容哈希独立归档，归档前复核解析时源哈希；MinerU 的插图随文档入库、按证据权限提供（见[文档里的插图](figures.md)），原 PDF 页内坐标回源尚未实现。解析质量按同一文件的完整性、顺序、表格和公式对比，不以字符数或无报错代替质量验收。命令见 [README](../README.md#pdf-解析与对比)。
 
 ## 运行与验收边界
 
@@ -60,7 +60,7 @@ MinerU 的 `parse-pdf` 可带 `--checkpoint <本地JSON路径>`，PDF `ingest` �
 
 `CloudPlanner` 结合当前问题和最多六轮传入 history 做有界语义分解；rewrite 可添加独立检索表述，多查询和 HyDE 各自增加变体。保留原问和子问题 ID，HyDE 草稿仅用于检索，不进入可引用正文。规则守卫仍拦截未接入的实时工具路由与未明确商品身份；模型不能从 history 推断可信 SKU。默认规则模式不消解多轮指代。trace 的 `history_used` 按带历史且确实产生模型请求的相关组件计量；守卫或预算跳过不算已使用。
 
-结构保护识别解析后 Markdown 中的管道表格、HTML table、围栏代码、`$$...$$`、`\[...\]` 和常见闭合块公式环境。在对应父块/子块字符上限内保留完整元素，并避免重叠窗口切入元素中间。已识别且超过上限的元素仍切片，其 locator 带 `structure_fragment`；未闭合代码和 HTML table 也可标记，未闭合公式尚未专门识别。不增加重复表头、闭合定界符等非原文文本。处理指纹已变更，旧文档须重新导入/发布才能得到新切块；图片语义、PDF 页坐标及通用版面结构树仍未实现。
+结构保护识别解析后 Markdown 中的管道表格、HTML table、围栏代码、`$$...$$`、`\[...\]` 和常见闭合块公式环境，以及文档插图行（`![题注](ragfig:…)`）。在对应父块/子块字符上限内保留完整元素，并避免重叠窗口切入元素中间。已识别且超过上限的元素仍切片，其 locator 带 `structure_fragment`；未闭合代码和 HTML table 也可标记，未闭合公式尚未专门识别。不增加重复表头、闭合定界符等非原文文本。处理指纹已变更，旧文档须重新导入/发布才能得到新切块；图片语义、PDF 页坐标及通用版面结构树仍未实现。
 
 云生成只接受已知证据 ID 的 claims，无证据不调用生成。默认 `CitationVerifier` 只核验出处，`support_checked=false`。开启质量检查后，`CloudEvidenceJudge` 判断每个子问题的全部要点是否有证据，返回充分/缺失分区及定向缺口查询；相关词重叠不视为充分。`CloudVerifier.evaluate(plan,draft,evidence)` 先经本地引用完整性检查，再请求云模型判断每条 claim 的支持/矛盾/无依据，以及答案是否漏答；保留原 `verify(draft,evidence)` 接口供只检查事实支持性的适配器使用。`Coverage.missing_queries` 与 `Verification.supported_claim_indexes` / `missing_queries` / `completeness_checked` 明确传递结果。
 

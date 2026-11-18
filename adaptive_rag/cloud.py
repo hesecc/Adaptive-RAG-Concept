@@ -31,6 +31,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from .domain import CapabilityError, ChildChunk, Claim, Draft, Evidence, Hit, Plan, SubQuery, ValidationError
+from .figures import readable_text
 
 
 _usage: ContextVar[dict | None] = ContextVar("cloud_usage", default=None)
@@ -393,7 +394,8 @@ class CloudDenseRetriever:
         if len(missing) > self.max_missing_chunks:
             raise CapabilityError("cold dense retrieval exceeds its document embedding budget")
         if missing:
-            vectors = await self.embedder.embed(tuple(by_key[key].retrieval_text for key in missing))
+            # The cache key above stays on the stored text; the model sees a figure's caption, not its storage key.
+            vectors = await self.embedder.embed(tuple(readable_text(by_key[key].retrieval_text) for key in missing))
             additions = dict(zip(missing, vectors))
             await asyncio.to_thread(self._write, additions)
             cached.update(additions)
@@ -423,7 +425,7 @@ class CloudReranker:
         if len(hits) > 100 or any(hit.query_id != query.query_id for hit in hits) or len({h.chunk.chunk_id for h in hits}) != len(hits):
             raise ValidationError("rerank candidates must be unique and belong to one query")
         count = min(limit, len(hits))
-        documents = [hit.chunk.retrieval_text for hit in hits]
+        documents = [readable_text(hit.chunk.retrieval_text) for hit in hits]
         if self.settings.rerank_format == "dashscope":
             payload = {"model": self.settings.rerank_model, "input": {"query": query.text, "documents": documents},
                        "parameters": {"top_n": count, "instruct": "Given a web search query, retrieve relevant passages that answer the query."}}
@@ -462,7 +464,7 @@ def evidence_chat_rows(evidence: Sequence[Evidence]) -> list[dict]:
             remaining -= len(path[-1])
         rows.append({"evidence_id": item.evidence_id, "query_ids": list(item.query_ids),
                      "heading_path": path, "heading_path_truncated": tuple(path) != item.heading_path,
-                     "text": item.text})
+                     "text": readable_text(item.text)})
     return rows
 
 

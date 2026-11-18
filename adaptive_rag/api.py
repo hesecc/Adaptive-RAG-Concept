@@ -413,6 +413,14 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     def evidence(generation: str, evidence_id: str, principal: User):
         return asdict(application.get_evidence(principal.access, generation, evidence_id))
 
+    @api.get("/evidence/{generation}/{evidence_id}/images/{key}")
+    def evidence_image(generation: str, evidence_id: str, key: str, request: Request, principal: User):
+        content, media_type = application.get_evidence_image(principal.access, generation, evidence_id, key)
+        # Same recheck as the image library: the session and the document may have changed during the read.
+        application.get_evidence(authenticate(request).access, generation, evidence_id)
+        return Response(content=content, media_type=media_type,
+                        headers={"Content-Disposition": "inline", "Cache-Control": "private, no-store"})
+
     def asset_view(value):
         return value | {"content_url": f"/assets/{value['asset_id']}/content"}
 

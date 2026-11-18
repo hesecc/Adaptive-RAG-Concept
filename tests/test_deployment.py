@@ -272,7 +272,7 @@ class DeploymentTemplateTests(unittest.TestCase):
         # One zone per purpose; the strict zone must still guard the catch-all.
         self.assertIn("zone=an_rag_media:10m rate=300r/m", nginx)
         blocks = dict(nginx_locations(nginx))
-        media_block = blocks["~ ^/assets/[^/]+/(thumbnail|content)$"]
+        media_block = blocks["~ ^(/assets/[^/]+/(thumbnail|content)|/evidence/[^/]+/[^/]+/images/[^/]+)$"]
         catch_block = blocks["/"]
         self.assertIn("limit_req zone=an_rag_media burst=120 nodelay", media_block)
         self.assertNotIn("an_rag_requests", media_block)
@@ -330,7 +330,7 @@ class DeploymentTemplateTests(unittest.TestCase):
             elif path in pages:
                 self.assertEqual(zone, "an_rag_pages", label)
                 relaxed.add(path)
-            elif re.fullmatch(r"/assets/x1/(thumbnail|content)", path):
+            elif re.fullmatch(r"/assets/x1/(thumbnail|content)|/evidence/x1/x1/images/x1", path):
                 self.assertEqual(zone, "an_rag_media", label)
             else:
                 self.assertEqual(zone, "an_rag_requests", label)
@@ -339,7 +339,8 @@ class DeploymentTemplateTests(unittest.TestCase):
             self.assertEqual(guarding_zone(nginx, path), "an_rag_pages", path)
         # Lookalikes of the relaxed paths do not slip into the relaxed zone.
         for path in ("/images/", "/images/x1", "/static", "/static/", "/console/session/x1", "/health",
-                     "/evaluation/reports", "/auth/login", "/capabilities"):
+                     "/evaluation/reports", "/auth/login", "/capabilities",
+                     "/evidence/x1/x1", "/evidence/x1/x1/images", "/evidence/x1/x1/images/x1/x1"):
             self.assertEqual(guarding_zone(nginx, path), "an_rag_requests", path)
 
 

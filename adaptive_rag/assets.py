@@ -78,6 +78,14 @@ def _image(content):
         raise ValidationError("image cannot be decoded as a supported static image") from None
 
 
+def image_info(content):
+    """Media type and size of a static PNG, JPEG or WEBP; raises ValidationError for anything else.
+
+    The same checks as an image upload, shared with document figures.
+    """
+    return _image(content)[0]
+
+
 def _allowed(asset, access):
     subjects = asset["allowed_subjects"]
     return (asset["tenant_id"] == access.tenant_id

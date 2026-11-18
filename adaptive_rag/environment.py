@@ -43,8 +43,32 @@ def _enabled(values: Mapping[str, str], name: str) -> bool:
     return value == "true"
 
 
+def _fraction(values: Mapping[str, str], name: str) -> float | None:
+    """An optional number between 0 and 1; an empty value counts as unset."""
+    text = values.get(name, "")
+    if not text:
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        raise ValidationError(f"{name} must be a number between 0 and 1") from None
+    if not 0 <= value <= 1:
+        raise ValidationError(f"{name} must be a number between 0 and 1")
+    return value
+
+
 def apply_environment(settings: Settings, values: Mapping[str, str]) -> Settings:
     updates = {}
+    if values.get("RAG_RELEVANCE_GATE"):
+        gate = values["RAG_RELEVANCE_GATE"].lower()
+        if gate not in ("true", "false"):
+            raise ValidationError("RAG_RELEVANCE_GATE must be true or false")
+        updates["relevance_gate"] = gate == "true"
+    for name, field in (("RAG_RELEVANCE_LEXICAL_FLOOR", "relevance_lexical_floor"),
+                        ("RAG_RELEVANCE_RERANK_FLOOR", "relevance_rerank_floor")):
+        value = _fraction(values, name)
+        if value is not None:
+            updates[field] = value
     remote_enabled = _enabled(values, "RAG_ENABLE_REMOTE_STORAGE")
     storage_names = {name for name in values if name.startswith(("RAG_STORE_", "RAG_TRACE_", "RAG_OBJECT_", "RAG_ASSET_", "RAG_POSTGRES_", "RAG_S3_", "RAG_MILVUS_"))}
     if storage_names:

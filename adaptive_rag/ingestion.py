@@ -16,6 +16,7 @@ from .domain import (
     ChildChunk, IngestRequest, IngestResult, ParentChunk, PreparedDocument,
     Section, ValidationError, stable_id,
 )
+from .figures import MARKER
 from .ports import Chunker, Cleaner, KnowledgeStore, ObjectStore, Parser
 
 
@@ -248,6 +249,10 @@ def _structures(text: str):
         for match in re.finditer(pattern, text):
             if not inside_code(match.start()):
                 spans.append((match.start(), match.end(), "formula", True))
+    # A figure line carries its caption and storage key; cut in two it would lose the link.
+    for match in MARKER.finditer(text):
+        if not inside_code(match.start()):
+            spans.append((match.start(), match.end(), "figure", True))
     # Prefer the encompassing element when syntax is nested (formula in a
     # table, literal table markup inside code), not competing boundaries.
     merged = []

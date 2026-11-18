@@ -56,6 +56,9 @@ class Settings:
     max_lanes: int = 12
     max_retries: int = 1
     evidence_chars: int = 12000
+    relevance_gate: bool = True
+    relevance_lexical_floor: float = 0.3
+    relevance_rerank_floor: float = 0.05
     timeout_seconds: float = 12.0
     stage_timeout_seconds: float = 5.0
     host: str = "127.0.0.1"
@@ -71,9 +74,13 @@ class Settings:
 
     def __post_init__(self):
         object.__setattr__(self, "data_dir", Path(self.data_dir).resolve())
-        for name in ("allow_models", "allow_network"):
+        for name in ("allow_models", "allow_network", "relevance_gate"):
             if type(getattr(self, name)) is not bool:
                 raise ValidationError(f"{name} must be boolean")
+        for name in ("relevance_lexical_floor", "relevance_rerank_floor"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1:
+                raise ValidationError(f"{name} must be a finite number between 0 and 1")
         if self.allow_models and not self.allow_network:
             raise ValidationError("cloud models require allow_network=true")
         limits = {

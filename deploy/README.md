@@ -78,7 +78,7 @@ zones. A request is counted by the first location that matches it.
 | Zone | Rate and burst | Covers |
 | --- | --- | --- |
 | `an_rag_requests` | 30 r/min, burst 10 | Everything else: login, every write, `/health`, model and search endpoints, JSON reads such as `/documents` and `/assets` |
-| `an_rag_media` | 300 r/min, burst 120 | Image bytes: `/assets/<id>/thumbnail` and `/assets/<id>/content` |
+| `an_rag_media` | 300 r/min, burst 120 | Image bytes: `/assets/<id>/thumbnail`, `/assets/<id>/content` and the figures inside evidence, `/evidence/<generation>/<evidence>/images/<key>` |
 | `an_rag_pages` | 300 r/min, burst 60 | Read-only page loads: `/`, `/images`, `/knowledge`, `/evaluation`, `/static/*`, `/console/session`, `/access/domains` |
 
 Every response is `no-store`, so switching pages fetches the HTML, scripts,

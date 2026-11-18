@@ -218,6 +218,12 @@ class IngestResult:
 
 
 @dataclass(frozen=True)
+class PdfIngestResult(IngestResult):
+    # Counts of the figures the PDF parser handed over: referenced, stored, skipped.
+    figures: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class Snapshot:
     tenant_id: str
     generation: str
@@ -278,6 +284,14 @@ class Hit:
 
 
 @dataclass(frozen=True)
+class EvidenceImage:
+    """A figure that sits inside an evidence passage; the bytes live in the object store."""
+    key: str
+    caption: str = ""
+    page: int | None = None
+
+
+@dataclass(frozen=True)
 class Evidence:
     evidence_id: str
     query_ids: tuple[str, ...]
@@ -293,6 +307,7 @@ class Evidence:
     source_hash: str
     truncated: bool = False
     heading_path: tuple[str, ...] = ()
+    images: tuple[EvidenceImage, ...] = ()
 
 
 @dataclass(frozen=True)

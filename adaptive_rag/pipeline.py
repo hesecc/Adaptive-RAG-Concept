@@ -17,8 +17,13 @@ from .domain import (
     CapabilityError, Coverage, Draft, Evidence, Hit, NotFoundError, Plan,
     QueryRequest, QueryResult, RagError, SubQuery, ValidationError, Verification, safe_error,
 )
+from .figures import cut_before_figure, find_figures
+from .relevance import RelevanceGate
 from .retrieval import tokenize
 from .cloud import start_usage, usage_snapshot, reset_usage
+
+NOT_FOUND = "在你有权访问的知识库中，没有找到与问题相同或相似的内容。"
+NOT_FOUND_BY_WORDS = NOT_FOUND + "当前仅按词面匹配判断，换一种说法可能命中。"
 
 
 def digest(text: str) -> str:
@@ -26,14 +31,16 @@ def digest(text: str) -> str:
 
 
 def make_evidence(parent, generation: str, length: int, query_ids=()) -> Evidence:
-    text = parent.text[:length]
+    # The cut may move back to a figure line's start; the id records the length actually used,
+    # and cutting again at that length gives the same text, so `get_evidence` can rebuild it.
+    text = parent.text[:cut_before_figure(parent.text, length)]
     excerpt_hash = digest(text)
     evidence_id = f"{parent.parent_id}.{len(text)}.{excerpt_hash[:16]}"
     return Evidence(
         evidence_id, tuple(query_ids), parent.tenant_id, generation,
         parent.document_id, parent.version, parent.revision_id, parent.parent_id,
         text, parent.locator, excerpt_hash, parent.content_hash, len(text) < len(parent.text),
-        parent.heading_path,
+        parent.heading_path, find_figures(text),
     )
 
 
@@ -99,6 +106,9 @@ class CitationVerifier:
 class QueryPipeline:
     def __init__(self, settings, components, descriptions):
         self.settings, self.c, self.descriptions = settings, components, descriptions
+        self.gate = (RelevanceGate(settings.relevance_lexical_floor, settings.relevance_rerank_floor,
+                                   dense=bool(descriptions["dense"]["enabled"]))
+                     if settings.relevance_gate else None)
 
     async def run(self, request: QueryRequest, capabilities: dict, observer=None) -> QueryResult:
         usage_token = start_usage()
@@ -268,12 +278,18 @@ class QueryPipeline:
             for role in ("dense",):
                 if not self.descriptions[role]["enabled"]:
                     disabled(role)
+            if self.gate is None:
+                disabled("relevance")
+            relevance_bases = {}
+            wordings = {qid: [query.text] for qid, query in original.items()}
             lanes = {qid: [] for qid in original}
             lane_count = 0
 
             async def retrieve(batch):
                 nonlocal lane_count
                 for variant in batch:
+                    if variant.text not in wordings[variant.query_id]:
+                        wordings[variant.query_id].append(variant.text)
                     for role in ("lexical", "dense"):
                         if not self.descriptions[role]["enabled"]:
                             continue
@@ -301,9 +317,18 @@ class QueryPipeline:
                     ranked[qid] = await stage(f"reranker.{qid}", self.c["reranker"].rank, query, fused, self.settings.candidate_limit,
                                               validate=lambda value: self._hits(value, qid, candidates, self.settings.candidate_limit))
                     output(f"reranker.{qid}", {"query_id": qid, **hit_output(ranked[qid])})
+                    related = ranked[qid]
+                    if self.gate is not None:
+                        # Retrieval ranks something for any question; only similar chunks may become sources.
+                        judgement = await stage(f"relevance.{qid}", self.gate.assess, query, ranked[qid], tuple(wordings[qid][1:]))
+                        output(f"relevance.{qid}", judgement.detail)
+                        relevance_bases[qid] = judgement.detail["basis"]
+                        related = judgement.hits
                     trace["rankings"].append({"query_id": qid, "retry": trace["retry_count"],
                         "fused_chunk_ids": [h.chunk.chunk_id for h in fused],
-                        "ranked_chunk_ids": [h.chunk.chunk_id for h in ranked[qid]]})
+                        "ranked_chunk_ids": [h.chunk.chunk_id for h in ranked[qid]],
+                        "related_chunk_ids": [h.chunk.chunk_id for h in related]})
+                    ranked[qid] = related
                 ordered = []
                 for rank in range(max((len(v) for v in ranked.values()), default=0)):
                     for hits in ranked.values():
@@ -399,10 +424,11 @@ class QueryPipeline:
                 disabled("gap")
             trace["coverage"] = asdict(coverage)
             if not evidence:
-                return result("empty", "没有检索到可访问的词法证据；这不等同于语义拒答判断。", missing=coverage.missing_query_ids)
+                semantic = self.descriptions["dense"]["enabled"] or "rerank" in relevance_bases.values()
+                return result("empty", NOT_FOUND if semantic else NOT_FOUND_BY_WORDS, missing=coverage.missing_query_ids)
             semantic_coverage = coverage.basis == "cloud_semantic_sufficiency"
             if semantic_coverage and not coverage.covered_query_ids:
-                return await finish("insufficient", "现有证据不足以完整支持问题，暂不生成答案。",
+                return await finish("insufficient", "找到了相关内容，但不足以完整支持这个问题，暂不生成答案；列出的是最接近的资料。",
                                     evidence, coverage.missing_query_ids)
             if await decision("generate", coverage.missing_query_ids) == "stop":
                 return result("policy_stopped", "策略停止生成阶段。", missing=coverage.missing_query_ids)

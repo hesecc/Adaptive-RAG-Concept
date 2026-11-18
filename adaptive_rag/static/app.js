@@ -14,7 +14,11 @@ const state = {
   selected: null,
   running: false,
   controller: null,
-  runs: [],
+  conversationId: null,
+  conversations: [],
+  listEpoch: 0,
+  nextOffset: null,
+  restoring: false,
   tab: "inspect",
   started: 0,
   timer: null,
@@ -140,22 +144,50 @@ const noAnswerNotes = {
 const FIGURE_LINE = /!\[[^[\]\n]*\]\(ragfig:[0-9a-f]{64}(?: "[^"\n]*")?\)/g;
 const withoutFigureLines = (text) =>
   (text || "").replace(FIGURE_LINE, "［插图］");
+const figureLoads = new WeakMap();
+const figureUrls = new Set();
+const figureObserver = new IntersectionObserver(entries => {
+  for (const {target, isIntersecting} of entries) if (isIntersecting) {
+    figureObserver.unobserve(target);
+    figureLoads.get(target)?.();
+  }
+});
 function figureNode(item, image, label = "") {
   const generation =
     item.generation || state.result?.generation || state.trace?.generation;
   const url = `/evidence/${encodeURIComponent(generation)}/${encodeURIComponent(item.evidence_id)}/images/${image.key}`;
   const figure = el("figure", "evidence-figure");
   const link = el("a");
-  link.href = url;
   link.target = "_blank";
   link.rel = "noopener";
   link.title = "在新标签页打开原图";
   const picture = el("img");
-  picture.src = url;
   picture.alt = image.caption || "文档插图";
   picture.loading = "lazy";
   picture.decoding = "async";
-  // The picture is fetched with the session cookie; a revoked document or an expired session answers 4xx.
+  // Native img/link requests cannot carry the expected owner. The page CSP
+  // permits data: for inline images; the original link uses the checked blob.
+  const epoch = state.viewEpoch;
+  figureLoads.set(picture, async () => {
+    if (epoch !== state.viewEpoch) return;
+    try {
+      const blob = await (await api(url)).blob();
+      if (epoch !== state.viewEpoch) return;
+      if (!["image/png", "image/jpeg", "image/webp"].includes(blob.type)) throw new Error();
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (epoch !== state.viewEpoch) return;
+        picture.src = reader.result;
+        link.href = URL.createObjectURL(blob);
+        figureUrls.add(link.href);
+      };
+      reader.onerror = () => link.replaceWith(el("p", "muted", "这张图片暂时无法显示。"));
+      reader.readAsDataURL(blob);
+    } catch {
+      if (epoch === state.viewEpoch) link.replaceWith(el("p", "muted", "这张图片暂时无法显示。"));
+    }
+  });
+  figureObserver.observe(picture);
   picture.addEventListener(
     "error",
     () => link.replaceWith(el("p", "muted", "这张图片暂时无法显示。")),
@@ -266,12 +298,37 @@ $$("dialog").forEach((node) =>
 );
 $("#plugins-open").addEventListener("click", () => dialog("#plugins-dialog"));
 
-async function api(path, options = {}) {
+const ownerHeaders = {subject_id: "X-RAG-Principal", tenant_id: "X-RAG-Tenant"};
+const transport = window.fetch.bind(window);
+// The shared domain picker fetches its catalog directly. Apply the workbench
+// session contract to that endpoint without changing the picker on other pages.
+window.fetch = (path, options) => path === "/access/domains" ? api(path, options) : transport(path, options);
+const sessionChanged = "登录身份已变更，请重新登录或刷新工作台。";
+const sessionSignal = "rag.session.changed";
+function notifyOtherTabs() {
+  try { window.localStorage.setItem(sessionSignal, crypto.randomUUID()); } catch {
+    // Storage may be unavailable. Requests still carry the owner precondition.
+  }
+}
+function matchesOwner(headers, owner) {
+  try {
+    return Object.entries(ownerHeaders).every(([key, header]) =>
+      headers.has(header) && decodeURIComponent(headers.get(header)) === owner[key]);
+  } catch { return false; }
+}
+async function api(path, options = {}, owner = state.user) {
   const epoch = state.sessionEpoch;
+  if (!owner && path !== "/auth/login" && path !== "/console/session") throw new Error(sessionChanged);
+  const headers = new Headers(options.headers);
+  if (owner) for (const [key, header] of Object.entries(ownerHeaders)) {
+    const encoded = encodeURIComponent(owner[key]).replace(/[!'()*]/g, c => "%" + c.charCodeAt(0).toString(16).toUpperCase());
+    headers.set(header, encoded);
+  }
   let response;
   try {
-    response = await fetch(path, {
+    response = await transport(path, {
       ...options,
+      headers,
       cache: "no-store",
       credentials: "same-origin",
     });
@@ -279,10 +336,20 @@ async function api(path, options = {}) {
     if (error.name === "AbortError") throw error;
     throw Object.assign(new Error("无法连接服务，请检查网络或服务状态后重试。"), { status: 0 });
   }
+  if (epoch !== state.sessionEpoch) throw new Error(sessionChanged);
+  // Gate both JSON and SSE before handing a single byte to a renderer. Gateways
+  // may return unsigned errors (e.g. 503); do not display their body either.
+  const tagged = Object.values(ownerHeaders).some(header => response.headers.has(header));
+  if (owner && (response.ok || tagged) && !matchesOwner(response.headers, owner)) {
+    showLogin(sessionChanged);
+    throw new Error(sessionChanged);
+  }
   if (!response.ok) {
     let message = `请求失败（HTTP ${response.status}）`;
-    try {
+    let code;
+    if (!owner || tagged) try {
       const body = await response.json();
+      code = body.error?.code;
       message = body.error?.message || body.detail || message;
     } catch {}
     if (response.status === 401) {
@@ -294,6 +361,7 @@ async function api(path, options = {}) {
     if (response.status === 429) message = "请求过于频繁，请稍后重试。";
     const error = new Error(message);
     error.status = response.status;
+    error.code = code;
     throw error;
   }
   return response;
@@ -305,6 +373,8 @@ function showLogin(message = "") {
   state.controller?.abort();
   state.controller = null;
   setRunning(false);
+  rememberConversation(null);
+  resetList();
   state.connected = false;
   state.user = null;
   state.capabilities = null;
@@ -314,6 +384,10 @@ function showLogin(message = "") {
   $("#user-create-form").reset();
   $("#users-error").textContent = "";
   $("#account-name").textContent = "";
+  $(".account-avatar").textContent = "";
+  clearTimeout(toastTimer);
+  $("#toast").textContent = "";
+  $("#toast").hidden = true;
   $("#account-role").textContent = "";
   $("#users-open").hidden = true;
   $("#knowledge-open").hidden = true;
@@ -327,7 +401,9 @@ function showLogin(message = "") {
   renderPlugins();
 }
 function acceptSession(session) {
+  if (!session?.subject_id || !session.tenant_id) throw new Error("服务未返回完整的登录身份。");
   state.sessionEpoch++;
+  resetList();
   clearData();
   state.user = session;
   state.connected = true;
@@ -343,13 +419,17 @@ function acceptSession(session) {
     if (state.user !== session) return;
     $("#account-domains").textContent = `数据权限：${RagDomains.text(session.data_domains)}`;
     RagDomains.render($("#new-user-domains"), ["public"], {publicRequired: true});
-  }).catch(error => toast(error.message));
+  }).catch(error => { if (state.user === session) toast(error.message); });
   $("#login-password").value = "";
   $("#login-error").textContent = "";
   $("#boot-page").hidden = true;
   $("#login-page").hidden = true;
   $("#app-shell").hidden = false;
   renderPlugins();
+  loadConversations();
+  const saved = history.state?.ragConversation;
+  if (saved?.subject === session.subject_id && saved.tenant === session.tenant_id && saved.id) openConversation(saved.id);
+  else rememberConversation(null);
   $("#question").focus({ preventScroll: true });
 }
 $("#login-form").addEventListener("submit", async (event) => {
@@ -367,6 +447,7 @@ $("#login-form").addEventListener("submit", async (event) => {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username, password }),
     })).json();
+    notifyOtherTabs();
     if (epoch === state.sessionEpoch) acceptSession(session);
   } catch (error) {
     if (epoch === state.sessionEpoch) $("#login-error").textContent = error.message;
@@ -377,12 +458,14 @@ $("#login-form").addEventListener("submit", async (event) => {
 });
 $("#logout-button").addEventListener("click", async () => {
   if (state.connecting) return;
+  const owner = state.user;
   // Hide account data immediately; wait for cookie invalidation before another login.
   showLogin();
   state.connecting = true;
   $("#login-submit").disabled = true;
   try {
-    await api("/auth/logout", { method: "POST" });
+    await api("/auth/logout", { method: "POST" }, owner);
+    notifyOtherTabs();
     toast("已退出登录。");
   } catch (error) {
     $("#login-error").textContent = `退出请求未完成：${error.message} 请刷新页面后重试退出。`;
@@ -450,6 +533,7 @@ async function loadUsers() {
   $("#users-list").replaceChildren(el("p", "muted", "正在读取账号…"));
   try {
     await RagDomains.load();
+    if (session !== state.sessionEpoch || epoch !== state.usersEpoch) return;
     const data = await (await api("/admin/users")).json();
     if (session !== state.sessionEpoch || epoch !== state.usersEpoch) return;
     $("#users-list").replaceChildren();
@@ -553,6 +637,7 @@ $("#user-create-form").addEventListener("submit", async (event) => {
   $("#users-error").textContent = "";
   try {
     await RagDomains.load();
+    if (session !== state.sessionEpoch) return;
     await api("/admin/users", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username, password, data_domains: RagDomains.values($("#new-user-domains")) }) });
     if (session !== state.sessionEpoch) return;
     $("#user-create-form").reset();
@@ -626,8 +711,8 @@ function setRunning(value) {
   $("#run-button").disabled = value;
   $("#run-button span").textContent = value ? "正在检索…" : "发送问题";
   $("#cancel-button").hidden = !value;
-  $("#history-clear").disabled = value;
-  $("#trace-form button").disabled = value;
+  $("#new-chat").disabled = value;
+  for (const button of $$("#conversation-list button, #chat-history button")) button.disabled = value;
   $("#timeline-dot").classList.toggle("running-dot", value);
   clearInterval(state.timer);
   if (value)
@@ -643,7 +728,13 @@ function setRunning(value) {
 }
 function resetCurrent() {
   state.viewEpoch++;
+  figureObserver.disconnect();
+  for (const url of figureUrls) URL.revokeObjectURL(url);
+  figureUrls.clear();
   state.sourceEpoch++;
+  $("#source-content").replaceChildren();
+  if ($("#source-dialog").open) $("#source-dialog").close();
+  $("#current-chat").hidden = false;
   state.stages = [];
   state.trace = null;
   state.result = null;
@@ -659,8 +750,6 @@ function resetCurrent() {
   $("#inspector-heading").textContent = "步骤详情";
   $("#inspector-subtitle").textContent = "选择左侧步骤，查看实际返回。";
   $("#raw-data").textContent = "等待服务器返回实际运行数据…";
-  $("#trace-label").textContent = "正在建立连接，等待服务器生成编号";
-  $("#trace-copy").disabled = true;
   $("#export-button").disabled = true;
   $("#metric-duration").replaceChildren(
     document.createTextNode("—"),
@@ -689,22 +778,17 @@ function clearData() {
   renderWelcome();
   empty($("#panel-evidence"), "开始检索后，查看授权引用证据。");
   empty($("#panel-models"), "开始检索后，查看实际模型调用。");
-  state.runs = [];
+  state.conversationId = null;
   state.messages = [];
+  state.restoring = false;
+  $("#run-button").disabled = false;
   $("#chat-history").replaceChildren();
-  $("#recent-runs").replaceChildren(
-    el("p", "muted", "运行记录仅保留在当前页面。"),
-  );
-  $("#source-content").replaceChildren();
-  if ($("#source-dialog").open) $("#source-dialog").close();
   $("#question").value = "";
-  $("#history").value = "";
   $("#sku").value = "";
-  $("#trace-id").value = "";
   $("#char-count").textContent = "0 / 4000";
   $("#run-status").textContent = "待运行";
   $("#timeline-heading").textContent = "准备就绪，等待一个好问题";
-  $("#trace-label").textContent = "尚未开始，提交问题后自动生成";
+  $("#raw-data").textContent = "尚无运行数据。";
   $("#timeline").replaceChildren(
     el("div", "plain-empty", "输入问题，开始追踪一次真实检索。"),
   );
@@ -721,7 +805,7 @@ $("#question").addEventListener("keydown", (event) => {
 });
 $("#query-form").addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (state.running) return;
+  if (state.running || state.restoring) return;
   if (state.connecting) {
     toast("正在验证连接，请稍候。");
     return;
@@ -735,23 +819,11 @@ $("#query-form").addEventListener("submit", async (event) => {
     toast("请输入一个非空问题。");
     return;
   }
-  const explicitHistory = $("#history")
-    .value.split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-  if (explicitHistory.length > 6 || explicitHistory.some((line) => line.length > 4000)) {
-    toast("历史上下文最多 6 轮，每轮不超过 4000 字。");
-    return;
-  }
   const sku = $("#sku").value.trim();
   if (sku && !/^[\p{L}\p{N}_.:-]{1,128}$/u.test(sku)) {
     toast("SKU 仅支持字母、数字、下划线、点、冒号和连字符。");
     return;
   }
-  archiveCurrent();
-  const history = explicitHistory.length ? explicitHistory : state.messages
-    .filter((message) => ["answered", "partial"].includes(message.status))
-    .slice(-3).flatMap((message) => [message.question.slice(0, 4000), message.answer.slice(0, 4000)]);
   resetCurrent();
   state.activeQuestion = question;
   showQuestion(question);
@@ -778,7 +850,8 @@ $("#query-form").addEventListener("submit", async (event) => {
       body: JSON.stringify({
         question,
         top_k: Number($("#top-k").value),
-        history,
+        persist_conversation: true,
+        ...(state.conversationId ? { conversation_id: state.conversationId } : {}),
         ...(sku ? { sku } : {}),
       }),
       signal: controller.signal,
@@ -789,34 +862,45 @@ $("#query-form").addEventListener("submit", async (event) => {
       if (!current()) return;
       if (type === "trace") {
         state.traceId = data.trace_id;
-        $("#trace-label").textContent = state.traceId;
-        $("#trace-copy").disabled = false;
       } else if (type === "stage") {
         acceptStage(data);
       } else if (type === "result") {
         terminal = true;
-        applyRun(data.result, data.trace);
-        saveRun(question);
+        applyConfirmedTurn(data.result, data.trace);
       } else if (type === "error") {
         terminal = true;
-        if (data.trace_id) {
-          state.traceId = data.trace_id;
-          $("#trace-label").textContent = state.traceId;
-          $("#trace-copy").disabled = false;
+        const code = data.code || data.error?.code;
+        if (code === "unauthorized") {
+          showLogin("登录已失效，请重新登录。");
+          return;
         }
+        if (code === "not_found" || code === "forbidden") {
+          inaccessibleConversation();
+          return;
+        }
+        if (code === "conversation_full") throw Object.assign(new Error("这段对话已达到轮数上限，请新建对话。"), {code});
+        state.traceId = data.trace_id || data.trace?.trace_id || state.traceId;
         if (data.trace) {
-          applyRun(data.trace.final_result || null, data.trace);
-          saveRun(question);
+          applyConfirmedTurn(data.trace.final_result || null, data.trace);
         }
         throw new Error(data.message || "查询执行失败。");
       }
     });
     if (current() && !terminal)
       throw new Error(
-        "连接提前结束，尚未收到最终结果。可使用 Trace ID 检查执行记录。",
+        "连接提前结束，尚未收到最终结果。请从历史对话查看执行记录。",
       );
   } catch (error) {
     if (!current()) return;
+    if ([403, 404].includes(error.status)) return inaccessibleConversation();
+    if (error.code === "conversation_full" && state.conversationId) {
+      // A competing turn filled the group. This run has no stored trace;
+      // restore only what is still readable, including the winning turn.
+      state.controller = null;
+      setRunning(false);
+      loadConversations();
+      return openConversation(state.conversationId, "这段对话已达到轮数上限，本轮未保存。请新建对话。");
+    }
     let aborted = error.name === "AbortError" || controller.signal.aborted;
     let diagnosticLoadError = "";
     // Read-only recovery also supports older servers and an interrupted SSE
@@ -829,10 +913,11 @@ $("#query-form").addEventListener("submit", async (event) => {
           })
         ).json();
         if (!current()) return;
-        applyRun(trace.final_result || null, trace);
-        saveRun(question);
+        if (trace.trace_id !== state.traceId) throw new Error("执行记录不匹配。");
+        applyConfirmedTurn(trace.final_result || null, trace);
       } catch (loadError) {
         if (!current()) return;
+        if ([403, 404].includes(loadError.status)) return inaccessibleConversation();
         aborted = loadError.name === "AbortError" || controller.signal.aborted;
         if (!aborted)
           diagnosticLoadError = ` 执行记录暂不可读取：${loadError.message}`;
@@ -853,7 +938,7 @@ $("#query-form").addEventListener("submit", async (event) => {
     notice(
       aborted
         ? "已停止等待并取消查询。已完成的步骤保留在时间线中。"
-        : `${error.message}${state.traceId ? ` 本次 Trace ID：${state.traceId}。` : ""}${diagnosticLoadError}`,
+        : `${error.message}${diagnosticLoadError}`,
       aborted ? "" : "error",
     );
     for (const stage of state.stages) {
@@ -877,14 +962,22 @@ $("#query-form").addEventListener("submit", async (event) => {
     );
     empty(
       $("#panel-models"),
-      "未能读取完整调用记录。可按本次 Trace ID 重新加载。",
+      "未能读取完整调用记录。请从历史对话重新打开本轮流程。",
     );
     $("#duration-caption").textContent = "页面等待耗时";
   } finally {
     if (state.controller === controller) {
       setRunning(false);
       state.controller = null;
-      if (current()) revealCurrentReply();
+      if (current()) {
+        if (state.traceId && (state.trace || state.result)) {
+          state.messages.push({trace_id: state.traceId, question,
+            answer: state.result?.answer, message: state.result?.message,
+            status: state.result?.status || state.trace?.status || (controller.signal.aborted ? "cancelled" : "error")});
+        }
+        loadConversations();
+        revealCurrentReply();
+      }
     }
   }
 });
@@ -1065,17 +1158,17 @@ function renderMetrics() {
   }
 }
 
-function applyRun(result, trace) {
+function applyRun(result, trace, { transcript = true } = {}) {
   clearInterval(state.timer);
   state.result = result || null;
   state.trace = trace || null;
   state.stages = trace?.stages || state.stages;
   state.traceId = result?.trace_id || trace?.trace_id || state.traceId;
   state.activeQuestion = trace?.question || state.activeQuestion;
-  showQuestion(state.activeQuestion);
-  renderChatHistory();
-  $("#trace-label").textContent = state.traceId || "未提供";
-  $("#trace-copy").disabled = !state.traceId;
+  if (transcript) {
+    showQuestion(state.activeQuestion);
+    renderChatHistory();
+  }
   $("#export-button").disabled = false;
   const status = result?.status || trace?.status || "ok";
   $("#run-status").textContent = statuses[status] || status;
@@ -1091,7 +1184,7 @@ function applyRun(result, trace) {
   renderTimeline();
   renderMetrics();
   renderInspector(state.selected);
-  renderAnswer();
+  if (transcript) renderAnswer();
   renderEvidence();
   renderModels();
   $("#raw-data").textContent = json({
@@ -1112,7 +1205,7 @@ function applyRun(result, trace) {
   else if (failedStatuses.includes(status))
     notice(failureMessage(trace), "error");
   else notice();
-  revealCurrentReply();
+  if (transcript) revealCurrentReply();
 }
 
 function renderInspector(index) {
@@ -1420,10 +1513,9 @@ async function showSource(item) {
       target.append(figures);
     }
   } catch (error) {
-    if (epoch === state.sourceEpoch && session === state.sessionEpoch)
-      target.replaceChildren(
-        el("div", "form-error", `无法读取证据：${error.message}`),
-      );
+    if (epoch !== state.sourceEpoch || session !== state.sessionEpoch) return;
+    if ([403, 404].includes(error.status)) return inaccessibleConversation();
+    target.replaceChildren(el("div", "form-error", `无法读取证据：${error.message}`));
   }
 }
 
@@ -1526,87 +1618,167 @@ $$("[data-tab]").forEach((button) => {
     tabs[next].focus();
   });
 });
-function saveRun(question) {
-  if (!state.traceId) return;
-  state.runs = state.runs.filter((run) => run.id !== state.traceId);
-  state.runs.unshift({
-    id: state.traceId,
-    question,
-    result: state.result,
-    trace: state.trace,
-  });
-  state.runs = state.runs.slice(0, 8);
-  renderRuns();
+// Only an owner-scoped bookmark survives a reload; titles, answers and traces do not.
+function rememberConversation(id) {
+  const owner = state.user;
+  history.replaceState({...history.state, ragConversation: id && owner ? {subject: owner.subject_id, tenant: owner.tenant_id, id} : null}, "");
 }
-function renderRuns() {
-  $("#recent-runs").replaceChildren();
-  if (!state.runs.length) {
-    $("#recent-runs").append(el("p", "muted", "运行记录仅保留在当前页面。"));
-    return;
+function applyConfirmedTurn(result, trace) {
+  // Only a terminal result or a readable stored trace confirms persistence.
+  const id = trace?.conversation_id || result?.conversation_id || trace?.trace_id || result?.trace_id;
+  if (!state.conversationId && id) {
+    state.conversationId = id;
+    rememberConversation(id);
   }
-  state.runs.forEach((run, index) => {
-    const button = el("button", `recent-run${run.id === state.traceId ? " selected" : ""}`);
+  applyRun(result, trace);
+}
+function resetList() {
+  state.listEpoch++;
+  state.conversations = [];
+  state.nextOffset = null;
+  $("#conversation-list").replaceChildren();
+  $("#conversation-status").textContent = "";
+  $("#conversation-more").hidden = true;
+}
+function renderConversations() {
+  const list = $("#conversation-list");
+  list.replaceChildren();
+  for (const {conversation_id: id, title, updated_at} of state.conversations) {
+    const button = el("button", "conversation-row");
     button.type = "button";
-    button.append(
-      el("span", "", String(index + 1).padStart(2, "0")),
-      el("span", "recent-title", run.question),
-      el("time", "", ms(run.trace?.duration_ms)),
-    );
-    button.title = run.question;
-    button.addEventListener("click", () => {
-      if (state.running) {
-        toast("请先等待当前查询结束。");
-        return;
-      }
-      loadTrace(run.id);
-    });
-    $("#recent-runs").append(button);
-  });
+    button.disabled = state.running;
+    button.setAttribute("aria-current", String(state.conversationId === id));
+    button.title = title;
+    button.append(el("span", "recent-title", title || "无标题对话"));
+    const date = new Date(updated_at);
+    if (updated_at && Number.isFinite(date.getTime())) {
+      const time = el("time", "", date.toLocaleDateString("zh-CN", {month: "numeric", day: "numeric"}));
+      time.dateTime = date.toISOString();
+      time.title = date.toLocaleString("zh-CN");
+      button.append(time);
+    }
+    button.addEventListener("click", () => openConversation(id));
+    list.append(button);
+  }
 }
-$("#history-clear").addEventListener("click", () => {
-  if (state.running) return;
-  clearData();
-  toast("本次会话记录已清空。");
+async function loadConversations(offset = 0) {
+  if (!state.connected) return;
+  if (!offset) resetList();
+  const epoch = ++state.listEpoch;
+  const status = $("#conversation-status");
+  const more = $("#conversation-more");
+  more.disabled = true;
+  status.textContent = "正在读取对话…";
+  try {
+    const page = await (await api(`/conversations?limit=20&offset=${offset}`)).json();
+    if (epoch !== state.listEpoch) return;
+    if (!Array.isArray(page.items) || (page.has_more && !(Number.isSafeInteger(page.next_offset) && page.next_offset > offset)))
+      throw new Error("对话列表返回格式不正确。");
+    const unique = new Map(state.conversations.map(row => [row.conversation_id, row]));
+    for (const row of page.items) unique.set(row.conversation_id, row);
+    state.conversations = [...unique.values()];
+    state.nextOffset = page.has_more ? page.next_offset : null;
+    renderConversations();
+    status.textContent = state.conversations.length ? "" : page.has_more ? "本页没有可读对话。" : "暂无历史对话。";
+    more.textContent = "加载更多";
+    more.hidden = !page.has_more;
+  } catch (error) {
+    if (epoch !== state.listEpoch) return;
+    state.nextOffset = offset;
+    status.textContent = error.message;
+    more.textContent = "重试";
+    more.hidden = false;
+  } finally {
+    if (epoch === state.listEpoch) more.disabled = false;
+  }
+}
+$("#conversation-more").addEventListener("click", () => {
+  if (state.nextOffset !== null) loadConversations(state.nextOffset);
 });
-async function loadTrace(id) {
-  if (!state.connected) {
-    showLogin("请先登录工作台。");
+function newChat() {
+  rememberConversation(null);
+  clearData();
+  renderConversations();
+}
+$("#new-chat").addEventListener("click", () => {
+  if (state.running) return;
+  newChat();
+  $("#question").focus();
+});
+function inaccessibleConversation() {
+  newChat();
+  notice("这段对话已不可读取，请重新选择。", "error");
+  loadConversations();
+}
+async function openConversation(id, restoredNotice = "") {
+  if (!state.connected || state.running) return;
+  clearData();
+  if (history.state?.ragConversation?.id !== id) rememberConversation(null);
+  const epoch = state.viewEpoch;
+  state.restoring = true;
+  $("#run-button").disabled = true;
+  $("#current-chat").hidden = true;
+  renderConversations();
+  notice("正在读取对话…");
+  try {
+    const detail = await (await api(`/conversations/${encodeURIComponent(id)}`)).json();
+    if (epoch !== state.viewEpoch) return;
+    if (detail.conversation_id !== id || !Array.isArray(detail.turns)) throw new Error("对话记录返回格式不正确。");
+    state.messages = detail.turns;
+    state.conversationId = id;
+    rememberConversation(id);
+    renderConversations();
+    renderChatHistory();
+    notice(state.messages.length ? "" : "这段对话暂无可读记录。");
+    state.restoring = false;
+    $("#run-button").disabled = false;
+  } catch (error) {
+    if (epoch !== state.viewEpoch) return;
+    if ([403, 404].includes(error.status)) inaccessibleConversation();
+    else detailError(error, () => openConversation(id, restoredNotice));
     return;
   }
-  if (state.running) return;
-  const epoch = ++state.viewEpoch;
-  const session = state.sessionEpoch;
-  $("#trace-form button").disabled = true;
+  const latest = state.messages.at(-1);
+  if (latest) {
+    $("#chat-scroll").scrollTop = $("#chat-scroll").scrollHeight;
+    await inspectTurn(latest.trace_id, restoredNotice);
+  } else if (restoredNotice) {
+    notice(restoredNotice, "error");
+  }
+}
+function detailError(error, retry) {
+  $("#run-status").textContent = "读取失败";
+  $("#timeline-heading").textContent = "记录暂不可读取";
+  for (const id of ["panel-answer", "panel-evidence", "panel-models", "timeline", "inspector-body"])
+    empty($("#" + id), "记录暂不可读取。");
+  $("#raw-data").textContent = "记录暂不可读取。";
+  $("#duration-caption").textContent = "暂无执行记录";
+  notice(error.message, "error");
+  const button = el("button", "", "重试");
+  button.type = "button";
+  button.addEventListener("click", retry);
+  $("#notice").append(" ", button);
+}
+async function inspectTurn(id, restoredNotice = "") {
+  if (!state.connected || state.running) return;
+  resetCurrent();
+  const epoch = state.viewEpoch;
+  $("#current-chat").hidden = true;
+  renderChatHistory();
+  $("#run-status").textContent = "正在读取";
   try {
     const trace = await (await api(`/traces/${encodeURIComponent(id)}`)).json();
-    if (epoch !== state.viewEpoch || session !== state.sessionEpoch) return;
-    archiveCurrent();
-    resetCurrent();
-    applyRun(trace.final_result || null, trace);
-    $("#question").value = "";
+    if (epoch !== state.viewEpoch) return;
+    if (trace.trace_id !== id) throw new Error("执行记录不匹配。");
+    applyRun(trace.final_result, trace, {transcript: false});
     renderChatHistory();
-    $("#char-count").textContent = `${$("#question").value.length} / 4000`;
-    toast("已按当前权限加载 Trace。");
+    if (restoredNotice) notice(restoredNotice, "error");
   } catch (error) {
-    if (epoch === state.viewEpoch && session === state.sessionEpoch)
-      notice(error.message, "error");
-  } finally {
-    if (!state.running) $("#trace-form button").disabled = false;
+    if (epoch !== state.viewEpoch) return;
+    if ([403, 404].includes(error.status)) return inaccessibleConversation();
+    detailError(error, () => inspectTurn(id, restoredNotice));
   }
 }
-$("#trace-form").addEventListener("submit", (event) => {
-  event.preventDefault();
-  const id = $("#trace-id").value.trim();
-  if (id) loadTrace(id);
-});
-$("#trace-copy").addEventListener("click", async () => {
-  try {
-    await navigator.clipboard.writeText(state.traceId);
-    toast("Trace ID 已复制。");
-  } catch {
-    toast("无法访问剪贴板，可从「本次 Trace ID」区域手动复制。");
-  }
-});
 $("#export-button").addEventListener("click", () => {
   const blob = new Blob([json({ result: state.result, trace: state.trace })], {
     type: "application/json",
@@ -1648,33 +1820,24 @@ function renderWelcome() {
     el("p", "", "在下方输入问题。左侧追踪检索流程，右侧查看每一步的证据与结果。"), pills);
   $("#panel-answer").replaceChildren(welcome);
 }
-function archiveCurrent() {
-  if (!state.activeQuestion || !state.traceId) return;
-  state.messages = state.messages.filter((message) => message.id !== state.traceId);
-  state.messages.push({
-    id: state.traceId, question: state.activeQuestion,
-    answer: state.result?.answer || (failedStatuses.includes(state.trace?.status)
-      ? failureMessage() : state.result?.message || "本次没有返回核验完成的最终答案。"),
-    status: state.result?.status || state.trace?.status || "cancelled",
-    duration: state.trace?.duration_ms,
-  });
-  state.messages = state.messages.slice(-6);
-  renderChatHistory();
-}
 function renderChatHistory() {
   const target = $("#chat-history"); target.replaceChildren();
   for (const message of state.messages) {
-    if (message.id === state.traceId) continue;
+    if (!$("#current-chat").hidden && message.trace_id === state.traceId) continue;
     const question = el("article", "chat-message user-message");
     question.append(el("div", "message-label", "你"), el("p", "", message.question));
     const answer = el("article", "chat-message assistant-message");
     const label = el("div", "message-label");
     label.append(el("span", "assistant-mark", "A"), document.createTextNode("Adaptive RAG"));
-    answer.append(label, el("p", "history-answer", message.answer));
+    answer.append(label, el("p", "history-answer", message.answer || message.message || noAnswerNotes[message.status] || "本轮没有返回回答。"));
     const footer = el("div", "history-caption");
-    footer.append(el("span", "", `${statuses[message.status] || message.status} · ${ms(message.duration)}`));
-    const button = el("button", "", "查看本轮流程 →"); button.type = "button";
-    button.addEventListener("click", () => loadTrace(message.id));
+    footer.append(el("span", "", statuses[message.status] || message.status));
+    const selected = message.trace_id === state.traceId;
+    const button = el("button", "", selected ? "正在查看本轮流程" : "查看本轮流程 →");
+    button.type = "button";
+    button.disabled = state.running;
+    button.setAttribute("aria-pressed", String(selected));
+    button.addEventListener("click", () => inspectTurn(message.trace_id));
     footer.append(button); answer.append(footer); target.append(question, answer);
   }
 }
@@ -1684,5 +1847,13 @@ document.addEventListener("keydown", (event) => {
     if (state.connected) $("#question").focus();
     else $("#login-username").focus();
   }
+});
+// A back/forward-cache restore bypasses the normal session and permission checks.
+window.addEventListener("pageshow", event => { if (event.persisted) location.reload(); });
+window.addEventListener("storage", event => {
+  if (event.key === sessionSignal) showLogin(sessionChanged);
+});
+window.addEventListener("focus", () => {
+  if (state.connected) api("/console/session").catch(() => {});
 });
 restoreSession();

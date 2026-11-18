@@ -1,0 +1,372 @@
+// Exercise the shipped script and its event handlers with deterministic, reorderable responses.
+// No browser, network, storage service or package dependencies.
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+const staticDir = path.join(__dirname, '../adaptive_rag/static');
+const script = fs.readFileSync(path.join(staticDir, 'app.js'), 'utf8');
+const html = fs.readFileSync(path.join(staticDir, 'index.html'), 'utf8');
+const flush = () => new Promise(resolve => setImmediate(resolve));
+const page = (items, has_more = false, next_offset = 0) => ({items, has_more, next_offset});
+const row = id => ({conversation_id: id, title: id + ' title', updated_at: '2026-01-02T12:00:00Z'});
+const turn = id => ({trace_id: id, question: 'question-' + id, status: 'evidence_preview', message: 'preview-' + id});
+const trace = id => ({...turn(id), stages: [], final_result: {...turn(id), evidence: [
+  {document_id: 'doc-' + id, evidence_id: 'source-' + id, text: 'evidence-' + id, images: [{key: 'pic', caption: 'figure-' + id}]}]}});
+const sse = events => new Response(events.map(([name, data]) => 'event: ' + name + '\ndata: ' + JSON.stringify(data) + '\n\n').join(''),
+  {headers: {'Content-Type': 'text/event-stream'}});
+
+class Element {
+  constructor(tag) { this.tag = tag; this.children = []; this.events = {}; this.value = ''; this.dataset = {}; }
+  classList = {toggle() {}, remove() {}};
+  get textContent() { return this.children.map(n => n.textContent ?? n).join(''); }
+  set textContent(value) { this.children = [String(value)]; }
+  get childElementCount() { return this.children.length; }
+  append(...nodes) { this.children.push(...nodes); }
+  replaceChildren(...nodes) { this.children = nodes; }
+  setAttribute(key, value) { this[key] = value; }
+  addEventListener(type, fn) { this.events[type] = fn; }
+  fire(type) { return this.events[type]({preventDefault() {}}); }
+  focus() {} reset() {} close() { this.open = false; }
+  buttons() { return this.children.flatMap(n => n.tag === 'button' ? [n] : n.buttons?.() || []); }
+}
+
+const alice = {subject_id: 'alice', tenant_id: 'home'};
+function signed(response, owner = alice) {
+  response.headers.set('X-RAG-Principal', encodeURIComponent(owner.subject_id));
+  response.headers.set('X-RAG-Tenant', encodeURIComponent(owner.tenant_id));
+  return response;
+}
+async function workbench(route, bookmark = null, owner = alice, browser = {}) {
+  const nodes = new Map([...html.matchAll(/id="([\w-]+)"/g)].map(m => ['#' + m[1], new Element()]));
+  for (const key of ['.account-avatar', '#run-button span']) nodes.set(key, new Element());
+  const get = key => { assert.ok(nodes.has(key), 'missing element ' + key); return nodes.get(key); };
+  const document = {querySelector: get, querySelectorAll: sel => sel.includes('#conversation-list button') ?
+    [...get('#conversation-list').buttons(), ...get('#chat-history').buttons()] : [],
+    addEventListener() {}, createElement: tag => new Element(tag), createTextNode: String};
+  const history = {state: {ragConversation: bookmark}, replaceState(value) { this.state = value; }};
+  const calls = [];
+  const domains = {text: () => '', load: async () => {}, render() {}};
+  const context = {document, history, window: {RagDomains: domains, addEventListener() {}, ...browser}, RagDomains: domains,
+    IntersectionObserver: browser.IntersectionObserver || class { observe() {} disconnect() {} },
+    Headers, crypto: require('node:crypto'), AbortController, TextDecoder, performance, setTimeout, clearTimeout, setInterval, clearInterval,
+    requestAnimationFrame() {}, fetch: async (url, options) => {
+      calls.push([url, options]);
+      assert.equal(options.cache, 'no-store');
+      if (url === '/console/session') return signed(Response.json(owner), owner);
+      if (url === '/auth/logout') return signed(Response.json({}), owner);
+      const result = await route(url, options);
+      if (result instanceof Response && result.headers.has('X-RAG-Principal')) return result;
+      return signed(result instanceof Response ? result : Response.json(result), owner);
+    }};
+  Object.assign(context, context.window);
+  context.window = context;
+  if (browser.useDomainControls) vm.runInNewContext(fs.readFileSync(path.join(staticDir, 'domain-controls.js'), 'utf8'), context);
+  vm.runInNewContext(script, context);
+  await flush();
+  const submit = async text => { get('#question').value = text; await get('#query-form').fire('submit'); await flush(); };
+  return {get, calls, history, submit};
+}
+
+test('a filtered page advances by next_offset; restore and inspect without moving any turn', async () => {
+  const {get, calls} = await workbench(url => {
+    if (url.endsWith('offset=0')) return page([], true, 20);
+    if (url.endsWith('offset=20')) return page([row('a')]);
+    if (url === '/conversations/a') return {conversation_id: 'a', turns: [turn('one'), turn('two')]};
+    if (url.startsWith('/traces/')) return trace(url.slice(8));
+    throw Error(url);
+  });
+  assert.equal(get('#conversation-more').hidden, false);
+  get('#conversation-more').fire('click'); await flush();
+  assert.equal(get('#conversation-more').hidden, true);
+  await get('#conversation-list').buttons()[0].fire('click');
+  assert.deepEqual(calls.map(([url]) => url).slice(1), ['/conversations?limit=20&offset=0', '/conversations?limit=20&offset=20', '/conversations/a', '/traces/two']);
+  assert.equal(get('#export-button').disabled, false);
+  await get('#chat-history').buttons()[0].fire('click');
+  const chat = get('#chat-history').textContent;
+  assert.deepEqual(chat.match(/question-(one|two)/g), ['question-one', 'question-two']);
+  assert.match(chat, /preview-one.*question-two.*preview-two/);
+  assert.equal(get('#current-chat').hidden, true);
+  assert.match(get('#panel-evidence').textContent, /figure-one/);
+  assert.doesNotMatch(get('#raw-data').textContent, /question-two/);
+});
+
+test('new and continued streams send no client history; result-only stream can establish a conversation', async () => {
+  const bodies = [];
+  const {get, history, submit} = await workbench((url, options) => {
+    if (url.startsWith('/conversations?')) return page([row('saved')]);
+    assert.equal(url, '/query/stream');
+    bodies.push(JSON.parse(options.body));
+    const id = 'id' + bodies.length;
+    const events = bodies.length === 3 ? [] : [['trace', {trace_id: id}]];
+    return sse([...events, ['result', {trace: trace(id), result: trace(id).final_result}]]);
+  });
+  await submit('one'); await submit('two');
+  assert.equal(history.state.ragConversation.id, 'id1');
+  get('#new-chat').fire('click');
+  assert.equal(history.state.ragConversation, null);
+  assert.equal(get('#chat-history').textContent, '');
+  assert.match(get('#conversation-list').textContent, /saved title/);
+  await submit('three');
+  assert.equal(history.state.ragConversation.id, 'id3');
+  assert.deepEqual(bodies.map(b => b.conversation_id), [undefined, 'id1', undefined]);
+  assert.ok(bodies.every(b => b.persist_conversation === true && !('history' in b)));
+});
+
+for (const denial of [403, 404, 'not_found', 'forbidden', 'recovery']) {
+  test('revoked continuation clears all previously readable output: ' + denial, async () => {
+    let denied = false;
+    const {get, calls, history, submit} = await workbench(url => {
+      if (url.includes('?')) return page(denied ? [] : [row('private')]);
+      if (url === '/conversations/private') return {conversation_id: 'private', turns: [turn('private')]};
+      if (url === '/traces/private') return trace('private');
+      if (url === '/traces/interrupted') return new Response(null, {status: 404});
+      assert.equal(url, '/query/stream'); denied = true;
+      if (denial === 'recovery') return sse([['trace', {trace_id: 'interrupted'}]]);
+      return typeof denial === 'number' ? new Response(null, {status: denial}) :
+        sse([['error', {code: denial, trace_id: 'forbidden', trace: trace('forbidden') }]]);
+    }, {subject: 'alice', tenant: 'home', id: 'private'});
+    assert.match(get('#chat-history').textContent, /private/);
+    assert.match(get('#raw-data').textContent, /private/);
+    await submit('next');
+    assert.equal(history.state.ragConversation, null);
+    for (const id of ['chat-history', 'conversation-list', 'panel-answer', 'panel-evidence', 'raw-data', 'source-content', 'timeline', 'inspector-body'])
+      assert.doesNotMatch(get('#' + id).textContent, /private|forbidden/);
+    assert.equal(get('#export-button').disabled, true);
+    assert.equal(calls.filter(([url]) => url === '/query/stream').length, 1);
+  });
+}
+
+for (const [transport, revokedAt] of [['SSE', null], ['SSE', 'group'], ['SSE', 'latest'], ['HTTP', null]]) {
+  test(transport + ' conversation_full rechecks the saved group, not the rejected trace: ' + (revokedAt || 'readable'), async () => {
+    const committed = Array.from({length: 63}, (_, i) => turn('private-' + (i + 1)));
+    let rejected = false, finishDetail;
+    const {get, history, calls, submit} = await workbench(url => {
+      if (url.includes('?')) return page(rejected && revokedAt ? [] : [row('group')]);
+      if (url === '/conversations/group') return rejected ? new Promise(resolve => finishDetail = resolve) :
+        {conversation_id: 'group', turns: committed};
+      if (url === '/traces/private-63') return trace('private-63');
+      if (url === '/traces/winner') return revokedAt === 'latest' ? new Response(null, {status: 404}) : trace('winner');
+      if (url === '/traces/loser') return new Response(null, {status: 404});
+      assert.equal(url, '/query/stream');
+      rejected = true;
+      if (transport === 'HTTP') return Response.json({error: {code: 'conversation_full'}}, {status: 409});
+      return sse([['trace', {trace_id: 'loser'}], ['error', {code: 'conversation_full', trace_id: 'loser'}]]);
+    }, {subject: 'alice', tenant: 'home', id: 'group'});
+    assert.match(get('#raw-data').textContent, /private-63/);
+    const submission = submit('rejected question'); await flush();
+    assert.ok(!calls.some(([url]) => url === '/traces/loser'));
+    assert.equal(get('#chat-history').textContent, '');
+    assert.equal(get('#export-button').disabled, true);
+    finishDetail(revokedAt === 'group' ? new Response(null, {status: 403}) :
+      {conversation_id: 'group', turns: [...committed, turn('winner')]});
+    await submission;
+    assert.equal(calls.filter(([url]) => url === '/query/stream').length, 1);
+    if (revokedAt) {
+      assert.equal(history.state.ragConversation, null);
+      for (const id of ['chat-history', 'conversation-list', 'chat-question', 'raw-data', 'panel-evidence', 'notice'])
+        assert.doesNotMatch(get('#' + id).textContent, /private-|winner|loser|rejected question|轮数上限/);
+      assert.equal(get('#export-button').disabled, true);
+    } else {
+      assert.equal(history.state.ragConversation.id, 'group');
+      assert.equal(get('#chat-history').buttons().length, 64);
+      assert.match(get('#raw-data').textContent, /question-winner/);
+      assert.doesNotMatch(get('#chat-history').textContent, /loser|rejected question/);
+      assert.match(get('#notice').textContent, /轮数上限.*新建对话/);
+    }
+  });
+}
+
+test('selecting an inaccessible conversation discards the previous view before detail returns', async () => {
+  let finish;
+  const {get, history} = await workbench(url => {
+    if (url.includes('?')) return page([row('first'), row('removed')]);
+    if (url === '/conversations/first') return {conversation_id: 'first', turns: [turn('first')]};
+    if (url === '/traces/first') return trace('first');
+    assert.equal(url, '/conversations/removed');
+    return new Promise(resolve => finish = resolve);
+  });
+  await get('#conversation-list').buttons()[0].fire('click');
+  const switching = get('#conversation-list').buttons()[1].fire('click');
+  assert.equal(get('#run-button').disabled, true);
+  assert.equal(get('#chat-history').textContent, '');
+  assert.doesNotMatch(get('#raw-data').textContent, /question-first/);
+  finish(new Response(null, {status: 404})); await switching;
+  assert.equal(get('#run-button').disabled, false);
+  assert.equal(get('#export-button').disabled, true);
+  assert.equal(history.state.ragConversation, null);
+});
+
+test('requests carry the displayed owner, even for logout after the screen is cleared', async () => {
+  const owner = {subject_id: '张 /+%', tenant_id: '组/A'};
+  const {calls, get, submit} = await workbench(url => url.startsWith('/conversations?') ? page([]) :
+    sse([['result', {trace: trace('t'), result: trace('t').final_result}]]), null, owner);
+  await submit('hello');
+  await get('#logout-button').fire('click');
+  for (const [url, options] of calls) {
+    const headers = new Headers(options.headers);
+    assert.equal(headers.get('X-RAG-Principal'), url === '/console/session' ? null : '%E5%BC%A0%20%2F%2B%25', url);
+    assert.equal(headers.get('X-RAG-Tenant'), url === '/console/session' ? null : '%E7%BB%84%2FA', url);
+  }
+});
+
+for (const [status, owner] of [[409, {...alice, tenant_id: 'away'}], [200, {...alice, subject_id: 'bob'}]]) {
+  test('foreign authenticated response clears the tab without consuming its body: ' + status, async () => {
+    let foreign, writes = 0;
+    const {get, history, submit} = await workbench(url => {
+      if (url.includes('?')) return page([row('private')]);
+      if (url === '/conversations/private') return {conversation_id: 'private', turns: [turn('private')]};
+      if (url === '/traces/private') return trace('private');
+      writes++;
+      foreign = signed(status === 200 ? sse([['result', {trace: trace('foreign')}]]) : Response.json({detail: 'foreign'}, {status}), owner);
+      return foreign;
+    }, {subject: 'alice', tenant: 'home', id: 'private'});
+    assert.match(get('#raw-data').textContent, /private/);
+    await submit('continue');
+    assert.equal(writes, 1);
+    assert.equal(foreign.bodyUsed, false);
+    assert.equal(history.state.ragConversation, null);
+    assert.equal(get('#app-shell').hidden, true);
+    for (const id of ['chat-history', 'conversation-list', 'raw-data', 'notice', 'login-error'])
+      assert.doesNotMatch(get('#' + id).textContent, /private|foreign/);
+  });
+}
+
+test('a same-subject bookmark from another tenant is never requested', async () => {
+  const {calls, history} = await workbench(() => page([]), {subject: 'alice', tenant: 'away', id: 'other'});
+  assert.ok(!calls.some(([url]) => url === '/conversations/other'));
+  assert.equal(history.state.ragConversation, null);
+});
+
+test('the shared domain catalog also requests and checks the displayed identity', async () => {
+  let headers, foreign;
+  const {get} = await workbench((url, options) => {
+    if (url !== '/access/domains') return page([]);
+    headers = new Headers(options.headers);
+    foreign = signed(Response.json({domains: []}), {...alice, subject_id: 'other'});
+    return foreign;
+  }, null, alice, {useDomainControls: true});
+  assert.equal(headers.get('X-RAG-Principal'), 'alice');
+  assert.equal(foreign.bodyUsed, false);
+  assert.equal(get('#app-shell').hidden, true);
+});
+
+test('evidence thumbnails cannot fetch or display bytes under another tenant', async () => {
+  let imageHeaders, foreign;
+  class Visible { constructor(fn) { this.fn = fn; } observe(target) { queueMicrotask(() => this.fn([{isIntersecting: true, target}], this)); } unobserve() {} disconnect() {} }
+  const {get} = await workbench((url, options) => {
+    if (url.includes('?')) return page([row('picture')]);
+    if (url === '/conversations/picture') return {conversation_id: 'picture', turns: [turn('picture')]};
+    if (url === '/traces/picture') return trace('picture');
+    assert.ok(url.endsWith('/images/pic'));
+    imageHeaders = new Headers(options.headers);
+    foreign = signed(new Response('image bytes'), {...alice, tenant_id: 'other'});
+    return foreign;
+  }, {subject: 'alice', tenant: 'home', id: 'picture'}, alice, {IntersectionObserver: Visible});
+  assert.equal(imageHeaders?.get('X-RAG-Tenant'), 'home');
+  assert.equal(foreign.bodyUsed, false);
+  assert.equal(get('#app-shell').hidden, true);
+});
+
+test('logout in another tab clears already visible private data without a new query', async () => {
+  const listeners = [];
+  const browser = {localStorage: {setItem(key) { for (const fn of listeners) fn({key}); }}};
+  const route = url => url.includes('?') ? page([row('private')]) :
+    url.startsWith('/traces/') ? trace('private') : {conversation_id: 'private', turns: [turn('private')]};
+  const first = await workbench(route, null, alice, browser);
+  const other = await workbench(route, {subject: 'alice', tenant: 'home', id: 'private'}, alice,
+    {...browser, addEventListener(name, fn) { if (name === 'storage') listeners.push(fn); }});
+  assert.match(other.get('#raw-data').textContent, /private/);
+  await first.get('#logout-button').fire('click');
+  assert.equal(other.get('#app-shell').hidden, true);
+  assert.equal(other.history.state.ragConversation, null);
+  assert.doesNotMatch(other.get('#raw-data').textContent, /private/);
+});
+
+test('detail 503 leaves a retryable selection, not a sendable blank chat', async () => {
+  let attempts = 0;
+  const {get, history, calls, submit} = await workbench(url => {
+    if (url.includes('?')) return page([]);
+    if (url === '/traces/again') return trace('again');
+    assert.equal(url, '/conversations/again');
+    return ++attempts === 1 ? new Response(null, {status: 503}) : {conversation_id: 'again', turns: [turn('again')]};
+  }, {subject: 'alice', tenant: 'home', id: 'again'});
+  assert.equal(get('#run-button').disabled, true);
+  assert.equal(history.state.ragConversation.id, 'again');
+  await submit('should not start a query');
+  assert.ok(!calls.some(([url]) => url === '/query/stream'));
+  await get('#notice').buttons()[0].fire('click');
+  assert.equal(get('#run-button').disabled, false);
+  assert.match(get('#raw-data').textContent, /question-again/);
+});
+
+test('an interrupted opening trace is not a bookmark or a continuation target', async () => {
+  let finishRecovery;
+  const bodies = [];
+  const {get, history, submit} = await workbench((url, options) => {
+    if (url.includes('?')) return page([]);
+    if (url === '/traces/early') return new Promise(resolve => finishRecovery = resolve);
+    bodies.push(JSON.parse(options.body));
+    return bodies.length === 1 ? sse([['trace', {trace_id: 'early', conversation_id: 'early'}]]) :
+      sse([['result', {trace: trace('done'), result: trace('done').final_result}]]);
+  });
+  const interrupted = submit('unpersisted'); await flush();
+  try { assert.equal(history.state.ragConversation, null); }
+  finally { finishRecovery(new Response(null, {status: 503})); await interrupted; }
+  assert.equal(history.state.ragConversation, null);
+  await submit('fresh');
+  assert.equal(bodies[1].conversation_id, undefined);
+  assert.doesNotMatch(get('#chat-history').textContent, /unpersisted/);
+  assert.equal(history.state.ragConversation.id, 'done');
+});
+
+test('a readable recovered trace establishes its persisted conversation, not the early SSE ID', async () => {
+  const {calls, history, submit} = await workbench(url => {
+    if (url.includes('?')) return page([]);
+    if (url === '/traces/run') return {...trace('run'), conversation_id: 'group'};
+    return sse([['trace', {trace_id: 'run', conversation_id: 'provisional'}]]);
+  });
+  await submit('recover');
+  assert.equal(history.state.ragConversation.id, 'group');
+  assert.equal(calls.filter(([url]) => url === '/query/stream').length, 1);
+});
+
+test('trace detail 503 neither erases the readable transcript nor presents a running query', async () => {
+  let attempt = 0;
+  const {get, calls} = await workbench(url => {
+    if (url.includes('?')) return page([]);
+    if (url === '/conversations/group') return {conversation_id: 'group', turns: [turn('one')]};
+    return ++attempt === 1 ? new Response(null, {status: 503}) : trace('one');
+  }, {subject: 'alice', tenant: 'home', id: 'group'});
+  assert.match(get('#chat-history').textContent, /question-one/);
+  assert.doesNotMatch(get('#panel-evidence').textContent, /查询执行中/);
+  assert.equal(get('#export-button').disabled, true);
+  await get('#notice').buttons()[0].fire('click');
+  assert.match(get('#raw-data').textContent, /question-one/);
+  assert.ok(!calls.some(([url]) => url === '/query/stream'));
+});
+
+test('late detail and trace cannot replace a new chat; late list cannot survive logout', async () => {
+  const pending = {};
+  const {get, history, calls} = await workbench(url => {
+    if (url.endsWith('offset=0')) return page([row('slow'), row('recent')], true, 35);
+    if (url === '/conversations/recent') return {conversation_id: 'recent', turns: [turn('recent')]};
+    return new Promise(resolve => pending[url] = resolve);
+  }, {subject: 'bob', id: 'other-user'});
+  assert.ok(!calls.some(([url]) => url.includes('other-user')));
+  get('#conversation-list').buttons()[0].fire('click');
+  get('#conversation-list').buttons()[1].fire('click'); await flush();
+  assert.match(get('#chat-history').textContent, /recent/);
+  get('#new-chat').fire('click');
+  pending['/conversations/slow']({conversation_id: 'slow', turns: [turn('slow')]});
+  pending['/traces/recent'](trace('recent')); await flush();
+  assert.equal(get('#chat-history').textContent, '');
+  assert.doesNotMatch(get('#raw-data').textContent, /recent|slow/);
+  assert.equal(history.state.ragConversation, null);
+  get('#conversation-more').fire('click');
+  await get('#logout-button').fire('click');
+  pending['/conversations?limit=20&offset=35'](page([row('late')])); await flush();
+  assert.equal(get('#conversation-list').textContent, '');
+  assert.equal(get('#app-shell').hidden, true);
+});

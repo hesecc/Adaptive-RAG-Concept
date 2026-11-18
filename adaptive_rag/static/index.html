@@ -134,32 +134,12 @@
           <section class="session-card side-section">
             <p id="account-domains" class="account-domains"></p>
             <div class="section-top">
-              <h2>
-                本次会话
-              </h2>
-              <button type="button" id="history-clear" class="text-button">
-                新对话
-              </button>
+              <h2>历史对话</h2>
+              <button type="button" id="new-chat" class="text-button">新对话</button>
             </div>
-            <div id="recent-runs">
-              <p class="muted">
-                运行记录仅保留在当前页面。
-              </p>
-            </div>
-            <details class="trace-lookup">
-              <summary>
-                按 Trace ID 回放
-              </summary>
-              <form id="trace-form">
-                <label class="sr-only" for="trace-id">
-                  Trace ID
-                </label>
-                <input id="trace-id" placeholder="输入历史 Trace ID" maxlength="128" required />
-                <button type="submit" aria-label="加载 Trace">
-                  →
-                </button>
-              </form>
-            </details>
+            <div id="conversation-list" aria-label="历史对话"></div>
+            <p id="conversation-status" class="muted" role="status"></p>
+            <button id="conversation-more" class="text-button" type="button" hidden>加载更多</button>
           </section>
           <section id="panel-flow" class="flow-section" aria-labelledby="flow-heading">
             <div class="section-top">
@@ -251,11 +231,6 @@
                   SKU（可选）
                   <input id="sku" maxlength="128" placeholder="商品范围" />
                 </label>
-                <label class="wide" for="history">
-                  补充上下文（每行一轮，最多 6 轮）
-                  <textarea id="history" rows="3" placeholder="需要指定上下文时填写">
-                  </textarea>
-                </label>
               </div>
             </details>
             <details class="capability-card">
@@ -336,20 +311,10 @@
               </span>
             </div>
           </div>
-          <div class="trace-summary">
-            <div class="trace-summary-label">
-              本次 Trace ID
-            </div>
-            <code id="trace-label">
-              尚未开始，提交问题后自动生成
-            </code>
-            <button id="trace-copy" class="trace-copy-button" type="button" disabled>
-              复制
-            </button>
-          </div>
           <div id="chat-scroll" class="chat-scroll">
             <div id="chat-history" class="chat-history">
             </div>
+            <div id="notice" class="run-notice" role="status" hidden></div>
             <div id="current-chat" class="current-chat">
               <article id="question-message" class="chat-message user-message" hidden>
                 <div class="message-label">
@@ -364,8 +329,6 @@
                     A
                   </span>
                   Adaptive RAG
-                </div>
-                <div id="notice" class="run-notice" role="status" hidden>
                 </div>
                 <div id="panel-answer" class="answer-panel">
                   <div class="chat-welcome">

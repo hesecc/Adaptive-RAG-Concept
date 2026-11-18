@@ -14,8 +14,8 @@ can later replace this adapter without changing the retrieval interface.
 """
 
 import asyncio
-from collections.abc import Callable, Mapping, Sequence
-from contextlib import closing
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import closing, contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from hashlib import sha256
@@ -35,6 +35,23 @@ from .figures import readable_text
 
 
 _usage: ContextVar[dict | None] = ContextVar("cloud_usage", default=None)
+_history_check: ContextVar[Callable[[], Awaitable[None]] | None] = ContextVar("history_check", default=None)
+
+
+@contextmanager
+def guard_history_calls(check):
+    """Bind a live authorization check to this query only, including transport retries."""
+    token = _history_check.set(check)
+    try:
+        yield
+    finally:
+        _history_check.reset(token)
+
+
+async def check_history_access():
+    check = _history_check.get()
+    if check is not None:
+        await check()
 
 
 def _empty_usage() -> dict:
@@ -182,6 +199,7 @@ class CloudTransport:
         url = root + path
         async with self._client_factory(timeout=self.settings.timeout_seconds, follow_redirects=False, trust_env=False) as client:
             for attempt in range(self.settings.max_retries + 1):
+                await check_history_access()
                 meter = _usage.get()
                 started = monotonic()
                 record = {"model": payload.get("model", ""), "endpoint": path, "attempt": attempt + 1, "status": "started"}

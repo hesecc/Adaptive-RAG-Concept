@@ -16,10 +16,7 @@ const fileCenter = (() => {
     node.classList.toggle("error", error);
   }
   async function response(path, options = {}) {
-    let res;
-    try { res = await fetch(path, {credentials: "same-origin", cache: "no-store", ...options}); }
-    catch (error) { if (error.name === "AbortError") throw error; throw Error("无法连接服务，请重试。"); }
-    if (res.status === 401) { location.href = "/"; throw Error("请先登录。"); }
+    const res = await pageOwner.request(path, options);
     if (res.ok) return res;
     const json = await res.json().catch(() => null);
     const message = json?.error?.message || (typeof json?.detail === "string" && json.detail);

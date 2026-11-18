@@ -239,6 +239,8 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         class BadTrace:
             def save(self, trace): raise RuntimeError("sensitive detail")
             def get(self, tenant_id, trace_id): raise NotFoundError()
+            def list_conversations(self, tenant_id, subject_id, limit, offset): return []
+            def conversation_turns(self, tenant_id, subject_id, conversation_id, *, limit=65): return []
         registry = default_registry()
         registry.register("trace", "bad", lambda s: BadTrace())
         app = RagApplication(replace(self.settings, plugins={"trace": "bad"}), registry)
@@ -247,9 +249,8 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("trace persistence failed", str(caught.exception))
         self.assertNotIn("sensitive", str(caught.exception))
 
-        class SlowTrace:
+        class SlowTrace(BadTrace):
             def save(self, trace): time.sleep(0.2)
-            def get(self, tenant_id, trace_id): raise NotFoundError()
         registry.register("trace", "slow", lambda s: SlowTrace())
         app = RagApplication(replace(self.settings, plugins={"trace": "slow"}, timeout_seconds=0.1), registry)
         ticked = []

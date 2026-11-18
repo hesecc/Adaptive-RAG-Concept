@@ -92,12 +92,12 @@
   for (const d of document.querySelectorAll("dialog")) d.addEventListener("cancel", e => { if (state.busy) e.preventDefault(); });
   fileEditor.bind(saved);
   (async () => {
-    state.session = await json("/console/session");
+    state.session = await pageOwner.session();
     byId("knowledge-account").textContent = state.session.username || state.session.subject_id;
     byId("evaluation-open").hidden = !state.session.admin;
     document.querySelector('[data-view="all"]').hidden = !state.session.admin;
     state.view = state.session.admin ? "all" : "mine";
-    await RagDomains.load();
+    await RagDomains.load(pageOwner.request);
     byId("knowledge-domains").textContent = "数据权限：" + RagDomains.text(state.session.data_domains);
     byId("knowledge-workspace").hidden = false;
     await refresh();

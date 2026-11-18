@@ -26,6 +26,7 @@ from .domain import (
 from .config import Principal
 from .document_lifecycle import DocumentLifecycle, LIFECYCLE_SCHEMA
 from .data_access import domains_allowed, normalize_data_domains
+from .trace_history import STORAGE_VERSION, TraceHistory, index_trace, initialize_history, with_conversation
 
 
 def _json(value: Any) -> str:
@@ -232,6 +233,7 @@ class _Database:
         if self.path.is_symlink():
             raise ValidationError("database must not be a symlink")
         connection = sqlite3.connect(self.path, timeout=10, isolation_level=None)
+        connection.row_factory = sqlite3.Row
         try:
             connection.execute("PRAGMA busy_timeout=10000")
             # Changing a legacy database to WAL can report BUSY immediately
@@ -246,13 +248,12 @@ class _Database:
                     if code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED) or time.monotonic() >= deadline:
                         raise
                     time.sleep(0.02)
-            connection.executescript(_SCHEMA + _CANDIDATE_SCHEMA)
+            connection.executescript("BEGIN IMMEDIATE;" + _SCHEMA + _CANDIDATE_SCHEMA)
             version = connection.execute("SELECT version FROM schema_metadata WHERE id=1").fetchone()[0]
-            if version != 1:
+            if version not in (1, STORAGE_VERSION):
                 raise ConflictError("unsupported storage schema version")
             # Serialize the read/ALTER sequence across concurrent API/worker
             # startup. Existing unclassified documents stay restricted.
-            connection.execute("BEGIN IMMEDIATE")
             for table, column, definition in (
                 ("documents", "data_domains", "TEXT NOT NULL DEFAULT '[]'"),
                 ("documents", "owner_id", "TEXT"),
@@ -264,6 +265,7 @@ class _Database:
             for statement in LIFECYCLE_SCHEMA.split(";"):
                 if statement.strip():
                     connection.execute(statement)
+            initialize_history(connection, version)
             connection.commit()
         finally:
             connection.close()
@@ -819,7 +821,7 @@ class SQLiteKnowledgeStore(_SnapshotStore, _Database):
             self._event(connection, tenant_id, document_id, "set_access", actor)
 
 
-class SQLiteTraceSink(_Database):
+class SQLiteTraceSink(TraceHistory, _Database):
     """Tenant-isolated immutable JSON traces; credentials are never accepted."""
 
     _SECRET_KEYS = frozenset({
@@ -843,29 +845,31 @@ class SQLiteTraceSink(_Database):
             for item in value:
                 cls._reject_secrets(item)
 
-    def save(self, trace: dict[str, Any]) -> None:
+    def save(self, trace: dict[str, Any], *, conversation_id: str | None = None) -> None:
         if not isinstance(trace, dict):
             raise ValidationError("trace must be a dictionary")
+        trace = with_conversation(trace, conversation_id)
         tenant = identifier(trace.get("tenant_id"), "tenant_id")
         trace_id = identifier(trace.get("trace_id"), "trace_id")
         self._reject_secrets(trace)
         value = _json(trace)
         with self._connection(write=True) as connection:
             existing = connection.execute(
-                "SELECT value_json FROM traces WHERE tenant_id=? AND trace_id=?", (tenant, trace_id),
+                "SELECT envelope_json FROM traces WHERE tenant_id=? AND trace_id=?", (tenant, trace_id),
             ).fetchone()
             if existing is not None:
                 if existing[0] != value:
                     raise ConflictError("trace_id already belongs to a different trace")
                 return
-            connection.execute("INSERT INTO traces VALUES (?,?,?)", (tenant, trace_id, value))
+            connection.execute("INSERT INTO traces(tenant_id,trace_id,envelope_json) VALUES (?,?,?)", (tenant, trace_id, value))
+            index_trace(connection, trace, self._placeholder)
 
     def get(self, tenant_id: str, trace_id: str) -> dict[str, Any]:
         identifier(tenant_id, "tenant_id")
         identifier(trace_id, "trace_id")
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT value_json FROM traces WHERE tenant_id=? AND trace_id=?", (tenant_id, trace_id),
+                "SELECT envelope_json FROM traces WHERE tenant_id=? AND trace_id=?", (tenant_id, trace_id),
             ).fetchone()
             if row is None:
                 raise NotFoundError("trace not found")

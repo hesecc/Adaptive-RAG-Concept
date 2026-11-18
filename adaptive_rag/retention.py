@@ -17,6 +17,7 @@ from time import time
 from .domain import ChildChunk
 from .figures import figure_binding, find_figures
 from .storage import FileObjectStore, _hash
+from .trace_history import STORAGE_VERSION
 
 WEEK = 7 * 24 * 3600
 QUEUE = "retention_object_candidates_v1"
@@ -173,9 +174,22 @@ def purge_docs(db, cache, now):
         for table in ("snapshot_revisions", "jobs", "children", "parents", "revisions", "document_trash", "documents"):
             db.sql(f"DELETE FROM {table}" + where, pair)
     for tenant, ids in refs.items():
-        for row in db.sql("SELECT trace_id,value_json FROM traces WHERE tenant_id=?", (tenant,)).fetchall():
-            if document_trace(json.loads(row["value_json"]), ids):
-                db.sql("DELETE FROM traces WHERE tenant_id=? AND trace_id=?", (tenant, row["trace_id"]))
+        dependents = defaultdict(set)
+        doomed = set()
+        for row in db.sql("SELECT trace_id,envelope_json FROM traces WHERE tenant_id=?", (tenant,)):
+            trace = json.loads(row["envelope_json"])
+            if document_trace(trace, ids):
+                doomed.add(row["trace_id"])
+            for parent in trace.get("history_trace_ids", ()):
+                dependents[parent].add(row["trace_id"])
+        # A follow-up can quote an old answer without retrieving its source again.
+        pending = list(doomed)
+        while pending:
+            more = dependents.pop(pending.pop(), set()) - doomed
+            doomed.update(more)
+            pending.extend(more)
+        for key in doomed:
+            db.sql("DELETE FROM traces WHERE tenant_id=? AND trace_id=?", (tenant, key))
     return len(due)
 
 
@@ -291,7 +305,7 @@ def _run_locked(root, values, now):
     with ExitStack() as stack:
         docs = stack.enter_context(docs_db())
         images = stack.enter_context(image_db())
-        require(docs.sql('SELECT version FROM schema_metadata WHERE id=1').fetchone()['version'] == 1)
+        require(docs.sql('SELECT version FROM schema_metadata WHERE id=1').fetchone()['version'] == STORAGE_VERSION)
         for db in (docs, images):
             db.sql(f'CREATE TABLE IF NOT EXISTS {QUEUE} (digest TEXT PRIMARY KEY)')
         if local:

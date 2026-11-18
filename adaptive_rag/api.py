@@ -4,22 +4,24 @@ from dataclasses import asdict, replace
 import asyncio
 import base64
 import binascii
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 import hmac
 import json
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import quote
 
 from anyio import CancelScope
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .app import RagApplication
+from .cloud import guard_history_calls
 from .auth import AccountStore, AuthenticationError, COOKIE_NAME, SESSION_SECONDS
 from .config import Principal, Settings, load_settings
-from .domain import NotFoundError, QueryRequest, RagError, safe_error
+from .domain import ConflictError, NotFoundError, RagError, safe_error
 from .file_manager import register_files, stage_document
 from .http_inputs import (AccessInput, AccountDomainsInput, AccountInput, AssetIndex, AssetInput, AssetSearch,
                           AssetUpdate, DeleteInput, DocumentInput, LoginInput, PublishInput, QueryInput, RollbackInput)
@@ -39,6 +41,7 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     @api.middleware("http")
     async def browser_headers(request: Request, call_next):
         response = await call_next(request)
+        response.headers.update(getattr(request.state, "identity_headers", {}))
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
@@ -84,11 +87,21 @@ def create_api(settings: Settings | None = None) -> FastAPI:
                 request.state.username = account.username
         if found is None:
             raise AuthenticationError("请先登录工作台。")
+        actual = {"X-RAG-Principal": quote(found.subject_id, safe=""), "X-RAG-Tenant": quote(found.tenant_id, safe="")}
+        request.state.identity_headers = actual
+        if any(request.headers.get(key, value) != value for key, value in actual.items()):
+            raise ConflictError("登录账号已切换，请刷新工作台。")
         if not found.admin and found.data_domains is None:
             # Legacy Bearer readers receive the same limited default as
             # browser accounts; an omitted scope is never an HTTP bypass.
             found = replace(found, data_domains=("public",))
         return found
+
+    def current_access(request, principal):
+        current = authenticate(request)
+        if current != principal:
+            raise NotFoundError("conversation not found")
+        return current.access
 
     def administrator(principal: Annotated[Principal, Depends(authenticate)]) -> Principal:
         if not principal.admin:
@@ -161,6 +174,8 @@ def create_api(settings: Settings | None = None) -> FastAPI:
 
     @api.post("/auth/logout", status_code=204)
     def logout(request: Request):
+        if "x-rag-principal" in request.headers or "x-rag-tenant" in request.headers:
+            authenticate(request)
         accounts.logout(request.cookies.get(COOKIE_NAME))
         response = Response(status_code=204)
         response.delete_cookie(COOKIE_NAME, httponly=True, samesite="lax", path="/")
@@ -211,21 +226,58 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     def publish(body: PublishInput, principal: Admin):
         return asdict(application.publish(principal.tenant_id, body.job_id, body.expected_generation, principal=principal))
 
+    @contextmanager
+    def consistent_access(request, principal):
+        # Detect committed ACL/trash changes anywhere during a multi-read response.
+        # An epoch is monotonic even when the original permission is later restored.
+        access = current_access(request, principal)
+        epoch = application.store.access_epoch(access.tenant_id)
+        yield access
+        current_access(request, principal)
+        if application.store.access_epoch(access.tenant_id) != epoch:
+            raise NotFoundError("conversation not found")
+
+    @api.get("/conversations")
+    def conversation_list(request: Request, principal: User, limit: int = Query(20, ge=1, le=50), offset: int = Query(0, ge=0)):
+        with consistent_access(request, principal) as access:
+            return application.conversations.page(access, limit, offset)
+
+    @api.get("/conversations/{conversation_id}")
+    def conversation_detail(conversation_id: str, request: Request, principal: User):
+        history = application.conversations
+        with consistent_access(request, principal) as access:
+            turns = list(history.turns(access, conversation_id))
+            history.recheck(access, conversation_id, [turn["trace_id"] for turn in turns])
+        return {"conversation_id": conversation_id, "turns": turns}
+
+    async def run_authenticated_query(query_request, principal, request, observer=None):
+        def check():
+            with consistent_access(request, principal) as access:
+                application.conversations.recheck(access, query_request.conversation_id, query_request.history_trace_ids)
+
+        guard = (lambda: asyncio.to_thread(check)) if query_request.conversation_id else None
+        with guard_history_calls(guard):
+            return await application.query(query_request, observer)
+
+    def release_trace(request, principal, trace_id):
+        with consistent_access(request, principal):
+            return accessible_trace(principal, trace_id)
+
     @api.post("/query")
     async def query(body: QueryInput, request: Request, principal: User):
-        values = body.model_dump()
-        values["history"] = tuple(values["history"])
-        result = await application.query(QueryRequest(access=principal.access, **values))
+        query_request = await asyncio.to_thread(application.conversations.request, principal.access, body)
+        result = await run_authenticated_query(query_request, principal, request)
         # Account grants can change during remote/model work. Re-authenticate
         # and validate every trace source before returning any answer text.
-        accessible_trace(authenticate(request), result.trace_id)
-        return asdict(result)
+        await asyncio.to_thread(release_trace, request, principal, result.trace_id)
+        payload = asdict(result)
+        if query_request.persist_conversation:
+            payload["conversation_id"] = query_request.conversation_id or result.trace_id
+        return payload
 
     @api.post("/query/stream")
     async def query_stream(body: QueryInput, request: Request, principal: User):
-        values = body.model_dump()
-        values["history"] = tuple(values["history"])
-        query_request = QueryRequest(access=principal.access, **values)
+        query_request = await asyncio.to_thread(application.conversations.request, principal.access, body)
 
         async def events():
             # One queue belongs to one request; no global run registry or
@@ -241,9 +293,8 @@ def create_api(settings: Settings | None = None) -> FastAPI:
 
             async def run_query():
                 try:
-                    value = await application.query(query_request, observer=observe)
-                    current = await asyncio.to_thread(authenticate, request)
-                    trace = await asyncio.to_thread(accessible_trace, current, value.trace_id)
+                    value = await run_authenticated_query(query_request, principal, request, observe)
+                    trace = await asyncio.to_thread(release_trace, request, principal, value.trace_id)
                     queue.put_nowait(("result", {"result": asdict(value), "trace": trace}))
                 except asyncio.CancelledError:
                     raise
@@ -260,8 +311,7 @@ def create_api(settings: Settings | None = None) -> FastAPI:
                     # returning them, exactly as for a successful terminal.
                     if trace_id:
                         try:
-                            current = await asyncio.to_thread(authenticate, request)
-                            value["trace"] = await asyncio.to_thread(accessible_trace, current, trace_id)
+                            value["trace"] = await asyncio.to_thread(release_trace, request, principal, trace_id)
                         except Exception:
                             pass
                     queue.put_nowait(("error", value))
@@ -310,8 +360,8 @@ def create_api(settings: Settings | None = None) -> FastAPI:
         return application.get_job(principal.tenant_id, job_id)
 
     @api.get("/traces/{trace_id}")
-    def trace(trace_id: str, principal: User):
-        return accessible_trace(principal, trace_id)
+    def trace(trace_id: str, request: Request, principal: User):
+        return release_trace(request, principal, trace_id)
 
     @api.get("/evidence/{generation}/{evidence_id}")
     def evidence(generation: str, evidence_id: str, principal: User):

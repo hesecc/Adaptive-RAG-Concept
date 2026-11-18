@@ -32,6 +32,13 @@ class ConflictError(RagError):
     status_code = 409
 
 
+class ConversationFullError(ConflictError):
+    code = "conversation_full"
+
+    def __init__(self):
+        super().__init__("这段对话已达到轮数上限，请新建对话。")
+
+
 class ForbiddenError(RagError):
     code = "forbidden"
     status_code = 403
@@ -47,6 +54,7 @@ class CapabilityError(RagError):
 
 
 _SAFE_ERRORS = {
+    "conversation_full": "这段对话已达到轮数上限，请新建对话。",
     "capability_unavailable": "当前能力调用失败；本次未生成核验完成的回答。",
     "cloud_network_error": "与云模型的连接中断，本次调用未取得完整返回。可检查网络后手动重试。",
     "cloud_timeout": "等待云模型返回超时；为避免重复计费，本次没有自动重试。",
@@ -59,6 +67,7 @@ _SAFE_ERRORS = {
 def safe_error(exc: BaseException) -> dict[str, str]:
     """Return fixed diagnostics, never provider or plugin exception text."""
     code = (exc.diagnostic_code if isinstance(exc, CapabilityError) else
+            exc.code if isinstance(exc, ConversationFullError) else
             "query_timeout" if isinstance(exc, TimeoutError) else
             "query_cancelled" if isinstance(exc, CancelledError) else "capability_unavailable")
     if not isinstance(code, str) or code not in _SAFE_ERRORS:
@@ -239,6 +248,9 @@ class QueryRequest:
     generation: str | None = None
     top_k: int = 5
     history: tuple[str, ...] = ()
+    persist_conversation: bool = False
+    conversation_id: str | None = None
+    history_trace_ids: tuple[str, ...] = ()
 
     def __post_init__(self):
         if not isinstance(self.access, AccessContext):
@@ -250,6 +262,8 @@ class QueryRequest:
             identifier(self.sku, "sku")
         if self.generation is not None:
             identifier(self.generation, "generation")
+        if self.conversation_id is not None:
+            identifier(self.conversation_id, "conversation_id")
         if not isinstance(self.history, tuple) or len(self.history) > 6:
             raise ValidationError("history must contain at most 6 turns")
         for turn in self.history:

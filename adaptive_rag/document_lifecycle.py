@@ -10,6 +10,9 @@ from .domain import ConflictError, ForbiddenError, NotFoundError, ValidationErro
 
 
 LIFECYCLE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS document_access_epochs (
+    tenant_id TEXT PRIMARY KEY, epoch BIGINT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS retired_document_ids (
     tenant_id TEXT NOT NULL, document_id TEXT NOT NULL, PRIMARY KEY (tenant_id,document_id)
 );
@@ -53,9 +56,17 @@ class DocumentLifecycle:
         return principal.subject_id if principal else None
 
     def _event(self, conn, tenant, doc, action, actor, revision=None):
+        if action in {"set_access", "trash", "restore"}:
+            conn.execute(self._sql("INSERT INTO document_access_epochs VALUES (?,1) ON CONFLICT(tenant_id) "
+                                   "DO UPDATE SET epoch=document_access_epochs.epoch+1"), (tenant,))
         conn.execute(self._sql("INSERT INTO document_events(tenant_id,document_id,ordinal,action,actor_id,created_at,revision_id) "
             "SELECT ?,?,COALESCE(MAX(ordinal),0)+1,?,?,?,? FROM document_events WHERE tenant_id=? AND document_id=?"),
             (tenant, doc, action, actor, _now().isoformat(), revision, tenant, doc))
+
+    def access_epoch(self, tenant):
+        with self._snapshot_read() as conn:
+            row = conn.execute(self._sql("SELECT epoch FROM document_access_epochs WHERE tenant_id=?"), (tenant,)).fetchone()
+            return row["epoch"] if row else 0
 
     def _stage_owner(self, conn, tenant, doc, principal):
         if principal is not None:

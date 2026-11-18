@@ -33,7 +33,16 @@
     await detail();
     assert(one("#detail-body pre").textContent === "<b>plain text</b>" && !one("#detail-body pre b"), "inert text preview");
     const rev = one("#detail-body select"); rev.value = "r1"; rev.dispatchEvent(new Event("change"));
-    assert(one("#detail-body a").getAttribute("href") === "/files/document/guide/content?original=true&revision=r1", "revision original");
+    // Capture the final download handoff without writing into the browser user's Downloads.
+    const click = HTMLAnchorElement.prototype.click;
+    let download;
+    HTMLAnchorElement.prototype.click = function () { download = {url: this.href, name: this.download}; };
+    try {
+      btn(id("detail-body"), "下载原文件").click();
+      await until(() => download, "download handoff");
+      assert(download.url.startsWith("blob:") && download.name === "guide.txt" &&
+        reads.includes("/files/document/guide/content?original=true&revision=r1"), "owner-checked revision original");
+    } finally { HTMLAnchorElement.prototype.click = click; }
     assert(id("detail-body").textContent.includes("updated"), "events");
     if (adminFixture) {
       btn(id("detail-body"), "发布版本 v2").click(); await until(()=>!id("file-detail").open && !fileCenter.state.busy, "publish");

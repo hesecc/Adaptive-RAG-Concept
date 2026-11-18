@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import tomllib
 import unittest
 from urllib.parse import urlsplit
 
@@ -43,6 +44,29 @@ class FixtureHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+
+class OwnerTransportTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('node'), 'Node.js required for transport tests')
+    def test_owner_transport_scenarios(self):
+        run = subprocess.run([shutil.which('node'), '--test', str(TESTS / 'page_owner.test.cjs')],
+                             capture_output=True, timeout=45)
+        self.assertEqual(run.returncode, 0, (run.stdout + run.stderr).decode('utf8', errors='replace'))
+
+    def test_page_script_references_are_packaged_in_dependency_order(self):
+        class References(HTMLParser):
+            def handle_starttag(self, tag, attrs):
+                if tag == 'script':
+                    scripts.append(dict(attrs)['src'])
+
+        package = STATIC.parent
+        rules = tomllib.loads((package.parent / 'pyproject.toml').read_text('utf8'))['tool']['setuptools']['package-data'][package.name]
+        packaged = {p for rule in rules for p in package.glob(rule)}
+        for page in ('knowledge', 'images'):
+            scripts = []
+            References().feed((STATIC / (page + '.html')).read_text('utf8'))
+            self.assertEqual(scripts[0], '/static/page-owner.js')
+            self.assertTrue(all(package / src.removeprefix('/') in packaged for src in scripts))
 
 
 @unittest.skipUnless(BROWSER, "Set RAG_TEST_CHROMIUM to run browser UI tests")

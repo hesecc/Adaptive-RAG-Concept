@@ -25,19 +25,8 @@ function element(tag, text, className) {
 }
 
 async function api(path, options = {}) {
-  let response;
-  try {
-    response = await fetch(path, {
-      credentials: "same-origin", ...options,
-      headers: {"Content-Type": "application/json", ...(options.headers || {})},
-    });
-  } catch {
-    throw Error("无法连接服务，请检查网络或服务状态后重试。");
-  }
-  if (response.status === 401) {
-    location.href = "/";
-    throw Error("请先登录工作台。");
-  }
+  const response = await pageOwner.request(path, {...options,
+    headers: {"Content-Type": "application/json", ...options.headers}});
   if (response.status === 429) throw Error("请求过于频繁，请稍后重试。");
   let value = null;
   try { value = response.status === 204 ? null : await response.json(); }
@@ -54,7 +43,45 @@ function notice(message, isError = false) {
 }
 
 const assetPath = asset => `/assets/${encodeURIComponent(asset.asset_id)}`;
-const imageURL = asset => asset.content_url || `${assetPath(asset)}/content`;
+// Native image loads and direct links cannot carry the displayed owner's headers.
+async function imageData(path, signal) {
+  const res = await pageOwner.request(path, {signal});
+  if (!res.ok) throw Error(`无法读取图片（HTTP ${res.status}）。`);
+  const blob = await res.blob();
+  if (!["image/png", "image/jpeg", "image/webp"].includes(blob.type)) throw Error("图片格式不正确。");
+  const data = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(Error("无法读取图片。"));
+    reader.readAsDataURL(blob);
+  });
+  pageOwner.assertActive();
+  signal.throwIfAborted();
+  return data;
+}
+
+let thumbnails, original;
+const visible = new IntersectionObserver(entries => {
+  for (const {target, isIntersecting} of entries) if (isIntersecting && target.isConnected) {
+    visible.unobserve(target);
+    imageData(target.dataset.thumbnail, thumbnails.signal).then(data => { target.src = data; })
+      .catch(() => { target.alt = "缩略图暂不可读取"; });
+  }
+});
+const originalDialog = byId("image-original");
+byId("image-original-close").addEventListener("click", () => originalDialog.close());
+originalDialog.addEventListener("close", () => {
+  original?.abort();
+  byId("image-original-content").removeAttribute("src");
+});
+async function showOriginal(asset) {
+  original?.abort();
+  original = new AbortController();
+  const img = byId("image-original-content");
+  img.src = await imageData(`${assetPath(asset)}/content`, original.signal);
+  img.alt = asset.title || "原图";
+  originalDialog.showModal();
+}
 
 function action(label, callback) {
   const button = element("button", label);
@@ -69,6 +96,9 @@ function action(label, callback) {
 }
 
 function renderAssets(items) {
+  visible.disconnect();
+  thumbnails?.abort();
+  thumbnails = new AbortController();
   const root = byId("image-results");
   root.replaceChildren();
   byId("image-count").textContent = `${items.length} 张图片`;
@@ -79,14 +109,13 @@ function renderAssets(items) {
   for (const item of items) {
     const asset = item.asset || item;
     const card = element("article", undefined, "image-card");
-    const link = element("a");
-    link.href = imageURL(asset);
-    link.target = "_blank";
-    link.rel = "noopener";
+    const link = action("", () => showOriginal(asset));
+    link.className = "image-preview";
+    link.setAttribute("aria-label", `查看原图：${asset.title || asset.asset_id}`);
     const img = element("img");
-    img.src = asset.thumbnail_url || imageURL(asset);
+    img.dataset.thumbnail = `${assetPath(asset)}/thumbnail`;
     img.alt = asset.title || "图片资料";
-    img.loading = "lazy";
+    visible.observe(img);
     link.append(img);
     card.append(link);
     const body = element("div", undefined, "image-card-body");
@@ -108,11 +137,7 @@ function renderAssets(items) {
       body.append(element("p", `来源：${asset.source_document_id}${asset.source_page ? ` · 第 ${asset.source_page} 页` : ""}`, "image-meta"));
     }
     const actions = element("div", undefined, "image-card-actions");
-    const open = element("a", "查看原图 ↗");
-    open.href = imageURL(asset);
-    open.target = "_blank";
-    open.rel = "noopener";
-    actions.append(open);
+    actions.append(action("查看原图", () => showOriginal(asset)));
     if (imageAdmin) {
       actions.append(action("编辑说明", () => openEditor(asset)));
       actions.append(action("更新／重试索引", async () => {
@@ -275,11 +300,11 @@ byId("image-trace-form").addEventListener("submit", async event => {
 
 (async () => {
   try {
-    const session = await api("/console/session");
+    const session = await pageOwner.session();
     // The page tabs do not depend on the domain catalogue, so reveal them before it loads.
     byId("knowledge-open").hidden = false;
     byId("evaluation-open").hidden = !session.admin;
-    await RagDomains.load();
+    await RagDomains.load(pageOwner.request);
     imageAdmin = session.admin;
     imageCloud = session.capabilities.mode === "cloud";
     byId("image-account").textContent = session.username;

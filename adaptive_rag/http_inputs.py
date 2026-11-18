@@ -1,6 +1,6 @@
 """Strict request bodies shared by the HTTP adapters."""
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class Input(BaseModel):
@@ -26,11 +26,19 @@ class PublishInput(Input):
 
 
 class QueryInput(Input):
+    persist_conversation: bool = False
+    conversation_id: str | None = Field(default=None, min_length=1, max_length=128)
     question: str = Field(min_length=1, max_length=4000)
     sku: str | None = None
     generation: str | None = None
     top_k: int = Field(default=5, ge=1, le=20)
     history: list[str] = Field(default_factory=list, max_length=6)
+
+    @model_validator(mode="after")
+    def server_history_only(self):
+        if self.history and (self.persist_conversation or self.conversation_id):
+            raise ValueError("persistent conversations use server-managed history")
+        return self
 
 
 class DeleteInput(Input):

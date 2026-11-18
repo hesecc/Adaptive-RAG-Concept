@@ -23,6 +23,7 @@ from .domain import (
 from .config import Principal
 from .document_lifecycle import LIFECYCLE_SCHEMA
 from .data_access import domains_allowed, normalize_data_domains
+from .trace_history import STORAGE_VERSION, TraceHistory, backfill_history, index_trace, initialize_history, with_conversation
 from .storage import (
     SQLiteKnowledgeStore, SQLiteTraceSink, _CANDIDATE_SCHEMA, _SnapshotStore,
     _document_listing, _json,
@@ -139,7 +140,8 @@ class _PostgresDatabase:
             for statement in (_SCHEMA + _CANDIDATE_SCHEMA).split(";"):
                 if statement.strip():
                     connection.execute(statement)
-            if connection.execute("SELECT version FROM schema_metadata WHERE id=1").fetchone()["version"] != 1:
+            version = connection.execute("SELECT version FROM schema_metadata WHERE id=1").fetchone()["version"]
+            if version not in (1, STORAGE_VERSION):
                 raise ConflictError("unsupported PostgreSQL storage schema version")
             connection.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS data_domains TEXT NOT NULL DEFAULT '[]'")
             connection.execute("ALTER TABLE revisions ADD COLUMN IF NOT EXISTS created_at TEXT NOT NULL DEFAULT ''")
@@ -147,6 +149,7 @@ class _PostgresDatabase:
             for statement in LIFECYCLE_SCHEMA.replace("CREATE VIEW IF NOT EXISTS", "CREATE OR REPLACE VIEW").split(";"):
                 if statement.strip():
                     connection.execute(statement)
+            initialize_history(connection, version, postgres=True)
 
     def __repr__(self):
         return f"{type(self).__name__}(schema={self.schema!r}, dsn=<redacted>)"
@@ -161,6 +164,9 @@ class _PostgresDatabase:
                 if consistent_read:
                     # Manifest verification and content selection must see the same lifecycle state.
                     connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                elif tenant is not None or initialize:
+                    # The first read after an advisory-lock wait must see the prior writer's commit.
+                    connection.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
                 if initialize:
                     connection.execute("SELECT pg_advisory_xact_lock(%s)", (_lock_id(self.schema, "schema"),))
                     connection.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(self.schema)))
@@ -378,32 +384,36 @@ class PostgresKnowledgeStore(_SnapshotStore, _PostgresDatabase):
             self._event(connection, tenant_id, document_id, "set_access", actor)
 
 
-class PostgresTraceSink(_PostgresDatabase):
+class PostgresTraceSink(TraceHistory, _PostgresDatabase):
     """Immutable tenant-scoped traces using the existing secret-field policy."""
 
-    def save(self, trace: dict[str, Any]) -> None:
+    _placeholder = "%s"
+
+    def save(self, trace: dict[str, Any], *, conversation_id: str | None = None) -> None:
         if not isinstance(trace, dict):
             raise ValidationError("trace must be a dictionary")
+        trace = with_conversation(trace, conversation_id)
         tenant = identifier(trace.get("tenant_id"), "tenant_id")
         trace_id = identifier(trace.get("trace_id"), "trace_id")
         SQLiteTraceSink._reject_secrets(trace)
         value = _json(trace)
         with self._connection(tenant=tenant) as connection:
-            existing = connection.execute("SELECT value_json FROM traces WHERE tenant_id=%s AND trace_id=%s", (tenant, trace_id)).fetchone()
+            existing = connection.execute("SELECT envelope_json FROM traces WHERE tenant_id=%s AND trace_id=%s", (tenant, trace_id)).fetchone()
             if existing is not None:
-                if existing["value_json"] != value:
+                if existing["envelope_json"] != value:
                     raise ConflictError("trace_id already belongs to a different trace")
                 return
-            connection.execute("INSERT INTO traces VALUES (%s,%s,%s)", (tenant, trace_id, value))
+            connection.execute("INSERT INTO traces(tenant_id,trace_id,envelope_json) VALUES (%s,%s,%s)", (tenant, trace_id, value))
+            index_trace(connection, trace, self._placeholder)
 
     def get(self, tenant_id: str, trace_id: str) -> dict[str, Any]:
         identifier(tenant_id, "tenant_id")
         identifier(trace_id, "trace_id")
         with self._connection() as connection:
-            row = connection.execute("SELECT value_json FROM traces WHERE tenant_id=%s AND trace_id=%s", (tenant_id, trace_id)).fetchone()
+            row = connection.execute("SELECT envelope_json FROM traces WHERE tenant_id=%s AND trace_id=%s", (tenant_id, trace_id)).fetchone()
             if row is None:
                 raise NotFoundError("trace not found")
-            return json.loads(row["value_json"])
+            return json.loads(row["envelope_json"])
 
 
 def migrate_sqlite_to_postgres(source: Path, dsn: str, *, schema: str = "adaptive_rag") -> dict[str, int]:
@@ -426,7 +436,7 @@ def migrate_sqlite_to_postgres(source: Path, dsn: str, *, schema: str = "adaptiv
             if original.execute("PRAGMA integrity_check").fetchone()[0] != "ok" or original.execute("PRAGMA foreign_key_check").fetchone():
                 raise ConflictError("migration source failed SQLite integrity checks")
             version = original.execute("SELECT version FROM schema_metadata WHERE id=1").fetchone()
-            if version is None or version[0] != 1:
+            if version is None or version[0] not in (1, STORAGE_VERSION):
                 raise ConflictError("unsupported migration source schema version")
             with target._connection() as connection:
                 connection.execute(sql.SQL("LOCK TABLE {} IN ACCESS EXCLUSIVE MODE").format(
@@ -446,11 +456,15 @@ def migrate_sqlite_to_postgres(source: Path, dsn: str, *, schema: str = "adaptiv
                     counts[table] = len(rows)
                     if rows:
                         columns = tuple(rows[0].keys())
+                        if table == "traces" and version[0] == 1:
+                            columns = tuple("envelope_json" if c == "value_json" else c for c in columns)
                         statement = sql.SQL("INSERT INTO {} ({}) VALUES ({})").format(
                             sql.Identifier(table), sql.SQL(", ").join(sql.Identifier(c) for c in columns),
                             sql.SQL(", ").join(sql.Placeholder() for _ in columns))
                         with connection.cursor() as cursor:
                             cursor.executemany(statement, [tuple(row) for row in rows])
+                backfill_history(connection, postgres=True,
+                                 indexed_source=original if version[0] == STORAGE_VERSION else None)
                 return counts
     except sqlite3.Error:
         raise ValidationError("cannot read a compatible SQLite migration source") from None

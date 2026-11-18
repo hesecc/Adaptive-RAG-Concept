@@ -4,6 +4,7 @@ from dataclasses import asdict
 import re
 
 from .config import Settings
+from .conversations import ConversationHistory
 from .domain import AccessContext, NotFoundError, PdfIngestResult, ValidationError, identifier, stable_id
 from .figures import ParsedFigureRequest, attach_figures, figure_binding, read_bound_figure
 from .ingestion import IngestionService
@@ -25,6 +26,7 @@ class RagApplication:
         self.store = self.components["store"]
         self.objects = self.components["objects"]
         self.trace_sink = self.components["trace"]
+        self.conversations = ConversationHistory(self)
         fingerprint = stable_id("foundation-v1", {role: self.descriptions[role] for role in ("parser", "cleaner", "chunker")})
         self.ingestion = IngestionService(self.store, self.objects, self.components["parser"],
                                           self.components["cleaner"], self.components["chunker"], fingerprint)
@@ -132,13 +134,20 @@ class RagApplication:
         return self.trace_sink.get(tenant_id, trace_id)
 
     def get_accessible_trace(self, access: AccessContext, trace_id: str):
+        trace = self.get_trace(access.tenant_id, trace_id)
+        if "conversation_id" in trace:
+            return self.conversations.checked(access, trace_id, stored=trace)
+        return self._source_checked_trace(access, trace_id, trace)
+
+    def _source_checked_trace(self, access, trace_id, trace=None, chunk_scopes=None):
         """Administrative diagnostics still obey current source permissions.
 
         A trace can mention retrieval hits absent from the final evidence, and
         can survive a failed query. Check all those references, not only the
         final excerpts. The trusted local CLI retains its existing raw reader.
         """
-        trace = self.get_trace(access.tenant_id, trace_id)
+        if trace is None:
+            trace = self.get_trace(access.tenant_id, trace_id)
         if trace.get("candidate_preview"):
             raise NotFoundError("trace not found")
         generation = trace.get("generation")
@@ -151,7 +160,15 @@ class RagApplication:
         for lane in trace.get("retrieval_lanes", ()):
             chunk_ids.update(hit["chunk_id"] for hit in lane.get("hits", ()))
         if chunk_ids:
-            allowed = {chunk.chunk_id for chunk in self.store.list_chunks(snapshot, access, trace.get("sku"))}
+            scope = (generation, access, trace.get("sku"))
+            allowed = chunk_scopes.get(scope) if chunk_scopes is not None else None
+            if allowed is None:
+                allowed = {chunk.chunk_id for chunk in self.store.list_chunks(snapshot, access, trace.get("sku"))}
+                if chunk_scopes is not None:
+                    # Request-local, bounded cache; never reuse an ACL decision on a later request.
+                    if len(chunk_scopes) >= 8:
+                        chunk_scopes.clear()
+                    chunk_scopes[scope] = allowed
             if not chunk_ids <= allowed:
                 raise NotFoundError("trace sources are no longer accessible")
         parent_ids = set(trace.get("source_parent_ids", ()))

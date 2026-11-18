@@ -15,13 +15,13 @@ from time import monotonic
 from uuid import uuid4
 
 from .domain import (
-    CapabilityError, Coverage, Draft, Evidence, Hit, NotFoundError, Plan,
+    CapabilityError, ConversationFullError, Coverage, Draft, Evidence, Hit, NotFoundError, Plan,
     QueryRequest, QueryResult, RagError, SubQuery, ValidationError, Verification, safe_error,
 )
 from .figures import cut_before_figure, find_figures
 from .relevance import RelevanceGate
 from .retrieval import tokenize
-from .cloud import start_usage, usage_snapshot, reset_usage
+from .cloud import check_history_access, start_usage, usage_snapshot, reset_usage
 
 NOT_FOUND = "在你有权访问的知识库中，没有找到与问题相同或相似的内容。"
 NOT_FOUND_BY_WORDS = NOT_FOUND + "当前仅按词面匹配判断，换一种说法可能命中。"
@@ -129,11 +129,15 @@ class QueryPipeline:
             "trace_id": uuid4().hex, "tenant_id": request.access.tenant_id,
             "subject_id": request.access.subject_id, "started_at": datetime.now(timezone.utc).isoformat(),
             "question": request.question, "sku": request.sku, "history_turns": len(request.history),
-            "history_used": False, "generation": None, "stages": [],
+            "history_used": False, "persist_conversation": request.persist_conversation, "generation": None, "stages": [],
             "plugins": self.descriptions, "model_calls": 0, "network_calls": 0,
             "retrieved_chunk_ids": [], "retry_count": 0,
             "decisions": [], "retrieval_lanes": [], "rankings": [], "source_parent_ids": [],
         }
+
+        if request.persist_conversation:
+            trace["conversation_id"] = request.conversation_id or trace["trace_id"]
+            trace["history_trace_ids"] = list(request.history_trace_ids)
 
         if candidate_preview:
             # Keep even failed/early-stop diagnostics private, including after activation.
@@ -145,7 +149,7 @@ class QueryPipeline:
             if observer is not None:
                 observer(event, value)
 
-        emit("trace", {"trace_id": trace["trace_id"]})
+        emit("trace", {key: trace[key] for key in ("trace_id", "conversation_id") if key in trace})
 
         def stage_event(record):
             emit("stage", {key: record[key] for key in (
@@ -178,6 +182,11 @@ class QueryPipeline:
             stage_event(record)
             try:
                 async with asyncio.timeout(self.settings.stage_timeout_seconds):
+                    plugin = self.descriptions.get(name.partition(".")[0], {})
+                    # Built-in cloud transport checks each send, including retries. External
+                    # plugins may own their transport: check before handing data to them.
+                    if plugin.get("plugin") != "cloud" and (plugin.get("uses_network") or plugin.get("requires_model")):
+                        await check_history_access()
                     if inspect.iscoroutinefunction(function):
                         value = await function(*args)
                     else:
@@ -568,6 +577,9 @@ class QueryPipeline:
             try:
                 async with asyncio.timeout(max(0.001, min(self.settings.stage_timeout_seconds, deadline - monotonic()))):
                     await asyncio.to_thread(self.c["trace"].save, trace)
+            except ConversationFullError:
+                if not failed:
+                    raise
             except Exception as exc:
                 if not failed:
                     raise CapabilityError(f"trace persistence failed; trace_id={trace['trace_id']}") from exc

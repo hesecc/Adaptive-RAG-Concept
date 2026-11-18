@@ -50,7 +50,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             "chunker": {"chunk"},
             "store": {"stage", "get_job", "publish", "open_snapshot", "list_chunks", "get_parents"},
             "objects": {"put", "get"},
-            "trace": {"save", "get"},
+            "trace": {"save", "get", "list_conversations", "conversation_turns"},
             "decision": {"decide"},
             "planner": {"plan"},
             "lexical": {"search"},
@@ -84,7 +84,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         snapshot = application.publish("shop", staged.job_id, None)
         self.assertEqual(application.objects.get(sha256(source.encode("utf-8")).hexdigest()), source.encode("utf-8"))
         access = AccessContext("shop", "reader")
-        result = await application.query(QueryRequest(access, "amber warranty"))
+        result = await application.query(QueryRequest(access, "amber warranty", persist_conversation=True))
         self.assertEqual(result.status, "evidence_preview")
         self.assertEqual(result.generation, snapshot.generation)
         self.assertIsNone(result.answer)
@@ -94,6 +94,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evidence.text, result.evidence[0].text)
         self.assertEqual(evidence.source_hash, result.evidence[0].source_hash)
         trace = application.get_trace("shop", result.trace_id)
+        self.assertEqual(application.conversations.page(access, 1, 0)["items"][0]["conversation_id"], result.trace_id)
         self.assertEqual(trace["status"], result.status)
         self.assertEqual(trace["generation"], snapshot.generation)
         self.assertTrue(trace["retrieved_chunk_ids"])
@@ -109,7 +110,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             "store": ("stage", "get_job", "publish", "open_snapshot", "list_chunks",
                       "get_parents", "delete_document", "rollback", "set_access"),
             "objects": ("put", "get"),
-            "trace": ("save", "get"),
+            "trace": ("save", "get", "list_conversations", "conversation_turns"),
         }
         for role, methods in required.items():
             for missing in methods:

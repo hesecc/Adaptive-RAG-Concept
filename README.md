@@ -163,7 +163,8 @@ uv run adaptive-rag --env-file .env serve
 | POST | `/query` | 规则编排、证据预览及显式启用的云查询/生成/质量检查 |
 | POST | `/query/stream` | 登录用户的实时阶段事件，完成后返回结果与授权 Trace |
 | GET | `/jobs/{id}` | 管理员作业读取 |
-| GET | `/traces/{id}` | 同租户链路诊断，按当前源权限复核 |
+| GET | `/conversations`、`/conversations/{id}` | 分页列出本人的会话、按当前权限恢复各轮问答 |
+| GET | `/traces/{id}` | 链路诊断，复核当前源权限；新会话的记录仅本人可读 |
 | GET | `/evaluation`、`/evaluation/reports`、`/evaluation/reports/{id}` | 评测页面；管理员读取已保存的评测报告（只读，按租户隔离） |
 | GET | `/evidence/{generation}/{evidence_id}` | 按快照回源并复核实时 ACL |
 | GET | `/evidence/{generation}/{evidence_id}/images/{key}` | 读取该证据里的一张插图，按证据的实时 ACL 复核 |
@@ -173,9 +174,9 @@ uv run adaptive-rag --env-file .env serve
 
 启动同一个 HTTP 服务后，在浏览器打开 `http://127.0.0.1:8000/`，用分配的账号和密码登录，再输入问题运行。服务器部署时使用该实例的 HTTPS 根地址。工作台只向当前页面的同源服务请求数据，不需要填写 HTTP Key、云模型 Key 或 MinerU Key。
 
-界面参考 MinerU 解析台的白灰底色、蓝色操作按钮和细分隔线：左侧查看会话、检索设置与实际执行流程，中间进行对话并输入问题，右侧查看步骤详情、证据、模型调用及 JSON。正文和输入框保持 15–16px，完整 Trace ID 可复制并加载回放。
+左侧历史对话按当前账号持久保存，点开标题即可继续提问；「新对话」保留旧话题。中间显示问答，右侧查看选中轮次的步骤详情、证据、模型调用及 JSON。
 
-页面显示真实执行时间线、各步状态与服务端耗时，并可查看结构化返回、最终回答、逐条引用、证据回源、模型调用及平台返回的 Token 用量。实时事件先展示阶段元数据，结果经最终权限检查与 Trace 持久化后再展示内容；未启用或因预算跳过的步骤会明确标记。按 Trace ID 可重新加载历史记录并复核当前权限，也可下载本次运行 JSON。会话列表仅保留在当前页面；下载文件包含问题与证据，应按知识库数据管理。
+页面展示实际执行时间、逐条引用、证据回源、模型调用和 Token 用量。实时事件先展示阶段元数据，终态通过权限检查后才展示回答。回看不会重新调用模型，也不需要复制 Trace ID；下载的诊断 JSON 包含问题与证据，应按知识库数据管理。
 
 检索工作台用于问答和诊断。[知识文件管理](docs/file-center.md)（`/knowledge`）将文档、独立图片和回收站放在一个入口。管理员可管理本租户资料；普通成员可上传和管理自己的文件，文档需管理员发布才参与问答。网页支持文本、Markdown、HTML 和带文字层的 PDF；MinerU 插图解析继续走 CLI。另见[评测](docs/evaluation.md)与[工作台说明](docs/workbench.md)。
 

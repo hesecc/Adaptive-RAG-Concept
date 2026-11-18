@@ -351,7 +351,6 @@ input[type=checkbox]:disabled {
 .image-card-actions button,
 .user-actions button,
 .user-domain-editor button,
-#trace-form button,
 .source-button {
   display: inline-flex;
   align-items: center;
@@ -379,7 +378,6 @@ input[type=checkbox]:disabled {
 .image-card-actions button:hover:not(:disabled),
 .user-actions button:hover:not(:disabled),
 .user-domain-editor button:hover:not(:disabled),
-#trace-form button:hover:not(:disabled),
 .source-button:hover:not(:disabled) {
   background: var(--tint2);
   box-shadow: inset 0 0 0 1px var(--fg4);
@@ -392,7 +390,6 @@ input[type=checkbox]:disabled {
 .image-card-actions button:active:not(:disabled),
 .user-actions button:active:not(:disabled),
 .user-domain-editor button:active:not(:disabled),
-#trace-form button:active:not(:disabled),
 .source-button:active:not(:disabled) {
   transform: scale(.97);
 }
@@ -415,7 +412,6 @@ input[type=checkbox]:disabled {
 .image-card-actions button,
 .user-actions button,
 .user-domain-editor button,
-#trace-form button,
 .source-button,
 .raw-toolbar .secondary-button {
   min-height: 30px;
@@ -424,17 +420,15 @@ input[type=checkbox]:disabled {
 }
 
 .text-button,
-.trace-copy-button,
 .history-caption button,
 .topnav button,
 .stage-button,
-.recent-run {
+.conversation-row {
   border: 0;
   background: none;
 }
 
 .text-button,
-.trace-copy-button,
 .history-caption button {
   padding: 4px 11px;
   border-radius: 999px;
@@ -445,7 +439,6 @@ input[type=checkbox]:disabled {
 }
 
 .text-button:hover,
-.trace-copy-button:hover:not(:disabled),
 .history-caption button:hover,
 .topnav button:hover {
   background: var(--tint2);
@@ -715,41 +708,29 @@ input[type=checkbox]:disabled {
   display: none;
 }
 
-#recent-runs {
+#conversation-list {
   display: grid;
   gap: 2px;
-  max-height: 150px;
-  overflow: auto;
+  max-height: 180px;
+  overflow-y: auto;
 }
 
-.recent-run {
+.conversation-row {
   display: grid;
-  grid-template-columns: 22px minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
   width: 100%;
   padding: 8px 10px;
-  border-radius: 12px;
+  border-radius: 8px;
   color: var(--fg);
   text-align: left;
-  transition: background .15s;
 }
 
-.recent-run:hover {
-  background: var(--tint);
-}
-
-.recent-run.selected {
-  background: var(--tint2);
-  box-shadow: inset 0 0 0 1px var(--line);
-}
-
-.recent-run > span:first-child,
-.recent-run time {
-  font: 12px var(--mono);
-  color: var(--fg3);
-  font-variant-numeric: tabular-nums;
-}
+.conversation-row:hover { background: var(--tint); }
+.conversation-row[aria-current="true"] { background: var(--tint2); }
+.conversation-row time { font: 12px var(--mono); color: var(--fg3); }
+#conversation-more { margin-top: 6px; }
 
 .recent-title {
   overflow: hidden;
@@ -758,11 +739,7 @@ input[type=checkbox]:disabled {
   white-space: nowrap;
 }
 
-.trace-lookup {
-  margin-top: 10px;
-}
 
-.trace-lookup summary,
 .output-details summary,
 .evidence-card details summary,
 .content-panel summary {
@@ -773,7 +750,6 @@ input[type=checkbox]:disabled {
   font-size: 12.5px;
 }
 
-.trace-lookup summary::before,
 .output-details summary::before,
 .evidence-card details summary::before,
 .content-panel summary::before {
@@ -783,36 +759,18 @@ input[type=checkbox]:disabled {
   transition: transform .2s var(--out);
 }
 
-.trace-lookup[open] > summary::before,
 .output-details[open] > summary::before,
 .evidence-card details[open] > summary::before,
 .content-panel details[open] > summary::before {
   transform: rotate(90deg);
 }
 
-.trace-lookup summary:hover,
 .output-details summary:hover,
 .evidence-card details summary:hover,
 .content-panel summary:hover {
   color: var(--fg);
 }
 
-#trace-form {
-  display: flex;
-  gap: 6px;
-  margin-top: 8px;
-}
-
-#trace-id {
-  flex: 1;
-  height: 32px;
-  font: 12px var(--mono);
-}
-
-#trace-form button {
-  min-height: 32px;
-  padding: 0 14px;
-}
 
 .flow-section {
   flex: 1 0 auto;
@@ -1202,34 +1160,6 @@ input[type=checkbox]:disabled {
   letter-spacing: 0;
 }
 
-.trace-summary {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 4px 12px;
-  margin: 12px 28px 0;
-  padding: 6px 8px 6px 16px;
-  border-radius: 14px;
-  background: var(--paper-2);
-  box-shadow: inset 0 0 0 1px var(--line);
-}
-
-.trace-summary-label {
-  color: var(--fg3);
-  font-size: 12px;
-  white-space: nowrap;
-}
-
-#trace-label {
-  font: 12.5px/1.6 var(--mono);
-  color: var(--fg2);
-  overflow-wrap: anywhere;
-  user-select: all;
-}
-
-.trace-copy-button {
-  box-shadow: inset 0 0 0 1px var(--line2);
-}
 
 .chat-scroll {
   flex: 1;
@@ -2477,8 +2407,7 @@ pre {
     padding-right: 20px;
   }
 
-  .metrics,
-  .trace-summary {
+  .metrics {
     margin-left: 20px;
     margin-right: 20px;
   }
@@ -2491,13 +2420,6 @@ pre {
     font-size: 20px;
   }
 
-  .trace-summary {
-    grid-template-columns: minmax(0, 1fr) auto;
-  }
-
-  .trace-summary-label {
-    grid-column: 1 / -1;
-  }
 
   .workspace-tag {
     display: none;
@@ -2675,15 +2597,6 @@ pre {
     display: none;
   }
 
-  .trace-summary {
-    gap: 3px 8px;
-    margin: 10px 16px 0;
-    padding: 6px 8px 6px 12px;
-  }
-
-  #trace-label {
-    font-size: 12px;
-  }
 
   .chat-scroll {
     padding: 18px 16px;
@@ -2736,10 +2649,10 @@ pre {
     padding: 0 13px;
   }
 
-  .flow-column {
-    order: 1;
-    overflow: visible;
-  }
+  /* Keep history before the composer and diagnostics after it on a narrow screen. */
+  .flow-column { display: contents; }
+  .session-card { order: -1; }
+  .flow-section, .settings-section { order: 1; }
 
   .flow-section {
     flex-basis: auto;
@@ -2759,7 +2672,7 @@ pre {
     margin-bottom: 6px;
   }
 
-  #recent-runs {
+  #conversation-list {
     max-height: 120px;
   }
 

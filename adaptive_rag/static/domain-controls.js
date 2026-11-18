@@ -3,10 +3,10 @@
 window.RagDomains = (() => {
   let catalog = [];
   let loading;
-  async function load() {
+  async function load(request = fetch) {
     if (!loading) loading = (async () => {
       let response;
-      try { response = await fetch("/access/domains", {credentials: "same-origin", cache: "no-store"}); }
+      try { response = await request("/access/domains", {credentials: "same-origin", cache: "no-store"}); }
       catch { throw Error("无法读取数据分类，请检查网络后重试。"); }
       if (response.status === 429) throw Error("请求过于频繁，请稍后重试。");
       if (!response.ok) throw Error("无法读取数据分类，请刷新页面或重新登录。");

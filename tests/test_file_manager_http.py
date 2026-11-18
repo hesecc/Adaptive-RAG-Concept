@@ -42,6 +42,15 @@ class FileCenterHTTPTests(unittest.TestCase):
         self.assertEqual(result.status_code, 201, result.text)
         return result.json()
 
+    def test_stale_page_cannot_stage_under_the_replacement_cookie_or_read_its_files(self):
+        headers = {k: self.alice.get('/console/session').headers[k] for k in ('X-RAG-Principal', 'X-RAG-Tenant')}
+        stale = self.bob.post('/files/documents', headers=headers, json=self.body())
+        self.assertEqual(stale.status_code, 409)
+        self.assertNotEqual(stale.headers['X-RAG-Principal'], headers['X-RAG-Principal'])
+        self.assertEqual(self.bob.get('/files?view=mine').json()['files'], [])
+        self.assertEqual(self.bob.post('/files/documents', json=self.body()).status_code, 201)
+        self.assertEqual(self.bob.get('/files/document/handbook/content', headers=headers).status_code, 409)
+
     def test_upload_management_is_not_shared_query_permission(self):
         job = self.stage()
         self.assertEqual(self.admin.get('/files?view=all').json()['files'][0]['owner_name'], 'alice')

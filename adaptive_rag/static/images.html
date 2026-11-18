@@ -9,6 +9,7 @@
   <link rel="icon" href="/static/mark.svg" type="image/svg+xml" />
   <link rel="stylesheet" href="/static/app.css" />
   <link rel="stylesheet" href="/static/images.css" />
+  <script src="/static/page-owner.js" defer></script>
   <script src="/static/domain-controls.js" defer></script>
   <script src="/static/images.js" defer></script>
 </head>
@@ -53,6 +54,10 @@
       <form id="image-trace-form"><label for="image-trace-input">回放历史检索</label><input id="image-trace-input" placeholder="输入 Trace ID" required /><button class="secondary-button" type="submit">读取记录</button></form>
     </aside>
   </main>
+  <dialog id="image-original" class="modal wide-modal">
+    <div class="modal-heading"><h2>原图</h2><button id="image-original-close" class="icon-button" type="button" aria-label="关闭">×</button></div>
+    <img id="image-original-content" alt="" />
+  </dialog>
   <dialog id="image-editor" class="modal wide-modal">
     <div class="modal-heading"><h2 id="image-editor-heading">添加图片资料</h2><button id="image-editor-close" class="icon-button" type="button" aria-label="关闭">×</button></div>
     <form id="image-edit-form" class="image-edit-form">

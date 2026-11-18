@@ -7,6 +7,21 @@ const fileDetail = (() => {
   function stop() { request?.abort(); previewRequest?.abort(); root.replaceChildren(); }
   modal.addEventListener("close", () => { if (!modal.open) stop(); });
 
+  function download(label, path, id, signal) {
+    return action(label, async () => {
+      const blob = await (await response(path, {signal})).blob();
+      const extension = {"text/plain": "txt", "application/pdf": "pdf", "image/png": "png", "image/webp": "webp", "image/jpeg": "jpg"}[blob.type.split(";")[0]];
+      if (!extension) throw Error("无法下载此内容类型。");
+      if (signal.aborted) return;
+      pageOwner.assertActive();
+      const link = element("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = `${id}.${extension}`;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+    });
+  }
+
   async function preview(file, rev, container, signal) {
     const url = contentPath(file, rev);
     container.textContent = "正在读取预览…";
@@ -16,10 +31,7 @@ const fileDetail = (() => {
       if (type === "text/plain") {
         container.replaceChildren(element("pre", await res.text()));
       } else if (["image/jpeg", "image/png", "image/webp", "application/pdf"].includes(type)) {
-        const download = element("a", type === "application/pdf" ? "下载 PDF" : "下载原图");
-        download.href = url;
-        download.download = "";
-        container.replaceChildren(download);
+        container.replaceChildren(download(type === "application/pdf" ? "下载 PDF" : "下载原图", url, file.id, signal));
         if (type.startsWith("image/")) {
           const img = element("img");
           img.alt = file.title || file.id;
@@ -96,10 +108,7 @@ const fileDetail = (() => {
           previewRequest?.abort();
           previewRequest = new AbortController();
           if (info.kind === "document") {
-            const original = element("a", "下载原文件");
-            original.href = contentPath(info, select.value, true);
-            original.download = "";
-            holder.prepend(original);
+            holder.prepend(download("下载原文件", contentPath(info, select.value, true), info.id, previewRequest.signal));
           }
           preview(info, select.value, output, previewRequest.signal);
         };

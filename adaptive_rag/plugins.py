@@ -17,9 +17,9 @@ METHODS = {
 OPTIONAL = frozenset(("rewrite", "multi_query", "hyde", "dense", "gap", "generator"))
 REQUIRED_METHODS = {role: (method,) for role, method in METHODS.items()} | {
     "store": ("stage", "get_job", "publish", "open_snapshot", "list_chunks", "get_parents",
-              "delete_document", "rollback", "set_access"),
+              "delete_document", "rollback", "set_access", "access_epoch"),
     "objects": ("put", "get"),
-    "trace": ("save", "get"),
+    "trace": ("save", "get", "list_conversations", "conversation_turns"),
 }
 
 

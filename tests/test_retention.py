@@ -58,6 +58,9 @@ class RetentionTests(unittest.TestCase):
         for tenant in ('A', 'B'):
             self.rows('knowledge.sqlite3', 'INSERT INTO traces VALUES(?,?,?)', tenant, 'trace',
                       json.dumps({'evidence':[{'document_id':'doc'}]}))
+        for key, parent in [('follow-up', 'trace'), ('follow-up-2', 'follow-up')]:
+            self.rows('knowledge.sqlite3', 'INSERT INTO traces VALUES(?,?,?)', 'A', key,
+                      json.dumps({'history_trace_ids': [parent]}))
         deadline = self.trash_doc()
         self.assertEqual(self.collect(deadline - 0.001)['documents'], 0)
         self.assertEqual(self.collect(deadline)['documents'], 1)

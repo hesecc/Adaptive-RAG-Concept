@@ -65,6 +65,11 @@ unchanged so browser login works through the gateway. The application uses its
 own `an_rag_session` cookie; do not rename it or clear another project's cookies.
 Existing Bearer clients remain supported for maintenance.
 
+The `/knowledge` and `/images` shells require `/static/page-owner.js` before
+their page scripts. Include it in the release's static asset inventory (the
+package-data rule is `static/*.js`). Preserve `X-RAG-Tenant` and `X-RAG-Principal`
+in both directions, including on authenticated errors and binary responses.
+
 All release changes and container CLI writes must acquire the same
 `/opt/an-RAG/.maintenance.lock` used by the backup script. Do not run CLI writes
 or extra application processes during the cold snapshot. The lock is advisory;
@@ -131,6 +136,14 @@ This verifies files, databases and object recovery, **not** a production restore
 application boot from restored data, model quality, or off-host backup coverage.
 
 ## Rollback
+
+**Conversation-history upgrade:** SQLite and PostgreSQL knowledge schema v2 are
+incompatible with the previous image. Fence all writers before upgrading, keep
+a verified pre-upgrade backup, and disable image-only fallback. To roll back,
+restore the complete v1 backup to a separate target and reconcile newer access
+revocations and deletions before serving traffic. See the [upgrade and rollback
+procedure](../docs/deployment.md#会话索引升级与回退sqlite--postgresql); do not run
+the older data-domain downgrade script on v2.
 
 Hold the project maintenance lock, preserve the failed release evidence and
 set `RAG_IMAGE` back to the recorded previous image. Run the scoped Compose

@@ -3,6 +3,8 @@
 from html.parser import HTMLParser
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import unittest
 
 STATIC = Path(__file__).resolve().parents[1] / "adaptive_rag" / "static"
@@ -47,6 +49,12 @@ class PageShellTests(unittest.TestCase):
     def test_the_login_form_never_falls_back_to_a_get_request(self):
         # Submitted natively as GET, the form would put the password into the address bar and the history.
         self.assertEqual(tags().with_id("login-form").get("method"), "post")
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js required for conversation UI scenarios")
+    def test_conversation_ui_scenarios(self):
+        suite = Path(__file__).with_name("conversation_ui.test.cjs")
+        run = subprocess.run([shutil.which("node"), "--test", str(suite)], capture_output=True, timeout=45)
+        self.assertEqual(run.returncode, 0, (run.stdout + run.stderr).decode("utf-8", errors="replace"))
 
     def test_every_page_carries_the_same_four_navigation_tabs(self):
         # The image library once shipped with only two tabs, so the other two vanished until the user went back.

@@ -11,10 +11,13 @@ let trashFixture = false;
 let imageTrash = ["first", "second"].map(key => ({...imageFile, trash_id:key, title:"Archived " + key,
   status:"trashed", can_restore:true, deleted_by_name:"Remover", deleted_at:1700000000}));
 window.fetch = async (url, options = {}) => {
-  const obj = value => Response.json(value);
+  const owner = {"X-RAG-Principal": "sub1", "X-RAG-Tenant": "home"};
+  if (url !== "/console/session" && Object.entries(owner).some(([k, v]) => new Headers(options.headers).get(k) !== v))
+    throw Error("Missing displayed owner: " + url);
+  const obj = value => Response.json(value, {headers: owner});
   const body = options.body && JSON.parse(options.body);
   if (body) writes.push({url, method: options.method, body}); else reads.push(url);
-  if (url === "/console/session") return obj({subject_id: "sub1", admin: adminFixture, data_domains: ["public"]});
+  if (url === "/console/session") return obj({subject_id: "sub1", tenant_id: "home", admin: adminFixture, data_domains: ["public"]});
   if (url === "/access/domains") return obj({domains: [{id:"public",label:"Public"},{id:"finance",label:"Finance"}]});
   if (url.startsWith("/files?view=")) {
     const trash = {...documentFile, trash_id:"trash1", deleted_by_name:"Remover", deleted_at:1700000000, can_restore:true};
@@ -24,7 +27,7 @@ window.fetch = async (url, options = {}) => {
   if (url === "/files/document/guide/restore") trashFixture = false;
   if (url === "/files/image/pic/restore") imageTrash = imageTrash.filter(row => row.trash_id !== body.trash_id);
   if (body) return obj({});
-  if (url.includes("/content")) return new Response("<b>plain text</b>", {headers:{"Content-Type":"text/plain; charset=utf-8"}});
+  if (url.includes("/content")) return new Response("<b>plain text</b>", {headers:{...owner, "Content-Type":"text/plain; charset=utf-8"}});
   if (url === "/files/image/pic") return obj(imageFile);
   if (url === "/files/document/guide") return obj(documentFile);
   throw Error("Unexpected request: " + url);

@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 
 from .app import RagApplication
-from .config import load_settings
+from .config import DEFAULT_PLUGINS, load_settings
 from .domain import AccessContext, IngestRequest, QueryRequest, RagError, ValidationError
 from .evaluation import run_evaluation
 from .evaluation_reports import ReportStore
@@ -54,6 +54,36 @@ def parser() -> argparse.ArgumentParser:
     command = tenant_command("publish")
     command.add_argument("--job", required=True)
     command.add_argument("--expected-generation")
+
+    command = tenant_command("candidate-create", help="Build a candidate without changing the live generation")
+    command.add_argument("--job", required=True, action="append", help="Staged job ID; repeat for a batch")
+    command.add_argument("--expected-generation", help="Live base generation; omit only for an empty tenant")
+    for name, help_text in (
+        ("candidate-status", "Inspect candidate state"),
+        ("candidate-prewarm", "Plan candidate prewarming; no embedding calls unless --execute is given"),
+        ("prewarm", "Plan published-generation prewarming; use --execute to populate the dense cache"),
+        ("candidate-preview", "Preview candidate evidence through the trusted model-free interface"),
+        ("candidate-activate", "Activate a candidate using the expected live generation"),
+        ("candidate-abandon", "Discard a pending candidate and release its staged jobs"),
+    ):
+        command = tenant_command(name, help=help_text)
+        command.add_argument("--generation", required=True)
+        if name in {"prewarm", "candidate-prewarm"}:
+            mode = command.add_mutually_exclusive_group()
+            mode.add_argument("--dry-run", action="store_true", help="Plan only (default)")
+            mode.add_argument("--execute", action="store_true", help="Perform prewarming; may incur embedding charges")
+            command.add_argument("--max-chunks", type=int, help="Maximum missing cache keys to process in this run")
+            command.add_argument("--all-scopes", action="store_true", help="Trusted operator: include all non-revoked documents and SKUs; cannot combine with identity or SKU filters")
+        elif name == "candidate-preview":
+            command.add_argument("--question", required=True)
+            command.add_argument("--top-k", type=int, default=5)
+        elif name == "candidate-activate":
+            command.add_argument("--expected-generation", help="Live base generation; omit only for an empty tenant")
+        if name in {"prewarm", "candidate-prewarm", "candidate-preview"}:
+            command.add_argument("--sku")
+            command.add_argument("--subject", default=None, help="Subject for a scoped run (default: local)")
+            command.add_argument("--group", action="append", default=[])
+            command.add_argument("--data-domain", action="append", default=[])
 
     command = tenant_command("query")
     command.add_argument("--question", required=True)
@@ -101,9 +131,10 @@ def parser() -> argparse.ArgumentParser:
 
 
 def _access(args) -> AccessContext:
-    # Only the eval command takes --data-domain; the other local commands stay unrestricted.
+    # An explicit data-domain selection simulates the restricted identity in a local run.
     domains = getattr(args, "data_domain", None)
-    return AccessContext(args.tenant, args.subject, tuple(args.group), tuple(domains) if domains else None)
+    return AccessContext(args.tenant, "local" if args.subject is None else args.subject,
+                         tuple(args.group), tuple(domains) if domains else None)
 
 
 def _save_report(settings, report, kind, output):
@@ -117,6 +148,10 @@ def _save_report(settings, report, kind, output):
 
 
 def dispatch(args):
+    if getattr(args, "all_scopes", False) and (
+        args.subject is not None or args.group or args.data_domain or args.sku is not None
+    ):
+        raise ValidationError("--all-scopes cannot be combined with --subject, --group, --data-domain or --sku")
     environment = read_environment(args.env_file)
     if args.command == "parse-pdf":
         from .pdf import parse_pdf
@@ -151,7 +186,31 @@ def dispatch(args):
         saved = _save_report(settings, report, "permissions", args.output)
         return {"report_id": saved["report_id"], "kind": "permissions", "passed": saved["summary"]["passed"],
                 "summary": saved["summary"], "failures": failures(saved)}
+    if args.command == "candidate-preview":
+        # Keep configured storage, but never run cloud query plugins during operator preview.
+        storage = {role: settings.plugins[role] for role in ("store", "objects", "trace")}
+        settings = replace(settings, plugins=DEFAULT_PLUGINS | storage, allow_models=False)
     application = RagApplication(settings)
+    if args.command == "candidate-create":
+        return application.store.create_candidate_snapshot(args.tenant, tuple(args.job), args.expected_generation)
+    if args.command == "candidate-activate":
+        return application.store.activate_candidate_snapshot(args.tenant, args.generation, args.expected_generation)
+    if args.command == "candidate-abandon":
+        removed = application.store.abandon_candidate_snapshot(args.tenant, args.generation)
+        return {"generation": args.generation, "abandoned": removed}
+    if args.command == "candidate-status":
+        snapshot = application.store.open_snapshot(args.tenant, args.generation, allow_candidate=True)
+        live = application.store.open_snapshot(args.tenant)
+        return {"generation": snapshot.generation, "revisions": snapshot.revisions,
+                "live_generation": live.generation if live else None,
+                "unactivated": application.store.is_candidate_snapshot(args.tenant, args.generation)}
+    if args.command == "candidate-preview":
+        return asyncio.run(application.preview_candidate(QueryRequest(_access(args), args.question, sku=args.sku,
+                                                                     generation=args.generation, top_k=args.top_k)))
+    if args.command in {"prewarm", "candidate-prewarm"}:
+        return asyncio.run(application.prewarm(_access(args), args.generation, sku=args.sku, dry_run=not args.execute,
+                                              max_chunks=args.max_chunks, candidate=args.command == "candidate-prewarm",
+                                              all_scopes=args.all_scopes))
     if args.command == "assets-index":
         return asyncio.run(application.assets.process_pending(args.tenant, args.limit))
     if args.command == "ingest":

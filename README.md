@@ -28,6 +28,10 @@ uv run adaptive-rag eval --tenant demo --fixture examples/eval.jsonl --output .r
 
 CLI 是可信的本地管理入口，`--tenant` 不是远程认证。默认运行数据在 `.rag-data/`，可用全局 `--data-dir` 或 `--config` 更换。重复导入会复用相同 job；内容、元数据或处理配置变化会产生新 revision。导入只暂存，必须显式发布。除首次发布外，写入发布清单必须携带当前 `expected_generation`；并发冲突返回错误，由调用方读取最新状态后决定如何重试。
 
+## 批量热更新
+
+批量知识热更新不需要逐条发布：用可信 CLI 的 `candidate-create` 固定候选清单，`candidate-preview` 核对证据，`candidate-prewarm --all-scopes --dry-run` 查看全代预热范围，最后用 `candidate-activate` 一次切换。普通查询无法读取未激活代；预热默认不会请求模型。完整命令、并发冲突恢复和**禁止带待激活候选降级运行时**的约束见[知识库热更新](docs/hot-updates.md)。
+
 ## 显式启用云模型
 
 普通 CLI 不会自动读取根目录 `.env`。按 [.env.example](.env.example) 在本机填写配置，使用 `--env-file .env` 显式加载，并设置 `RAG_ENABLE_CLOUD=true`，才通过这一入口启用三个云插件。以下示例不含凭证，`RAG_CLOUD_API_KEY` 仅在本机填写：

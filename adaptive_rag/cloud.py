@@ -381,6 +381,67 @@ class CloudDenseRetriever:
                 connection.executemany("INSERT INTO vectors(namespace,cache_key,dimension,vector_json) VALUES(?,?,?,?) ON CONFLICT(namespace,cache_key) DO UPDATE SET dimension=excluded.dimension,vector_json=excluded.vector_json",
                                        [(self.namespace, key, len(vector), json.dumps(vector, separators=(",", ":"), allow_nan=False)) for key, vector in rows.items()])
 
+    def _cache_presence(self, keys, dimension):
+        # A cache survey needs identity and dimension metadata, not the vectors themselves.
+        markers = ",".join("?" for _ in keys)
+        with closing(self._connect()) as connection:
+            rows = connection.execute(f"SELECT cache_key, dimension FROM vectors WHERE namespace=? "
+                                      f"AND cache_key IN ({markers})", (self.namespace, *keys))
+            found = set()
+            for key, stored in rows:
+                if type(stored) is not int or not 1 <= stored <= 16_384 or dimension not in (None, stored):
+                    raise CapabilityError("vector cache dimension is invalid; rebuild the derived cache")
+                dimension = stored
+                found.add(key)
+        return found, dimension
+
+    async def _embed_documents(self, by_key, keys, dimension):
+        if self.embedder.dimension is None and dimension is not None:
+            self.embedder.dimension = dimension
+        # Identity is based on stored text; provider input contains captions, not storage keys.
+        vectors = await self.embedder.embed(tuple(readable_text(by_key[key].retrieval_text) for key in keys))
+        if dimension is not None and any(len(vector) != dimension for vector in vectors):
+            raise CapabilityError("embedding dimension changed; use a matching model/index version")
+        additions = dict(zip(keys, vectors, strict=True))
+        await asyncio.to_thread(self._write, additions)
+        return additions
+
+    async def prewarm_documents(self, chunks: Sequence[ChildChunk], *, dry_run: bool,
+                                max_chunks: int | None, authorize_batch: Callable) -> dict:
+        """Populate the query cache; each completed provider batch is a durable checkpoint."""
+        if type(dry_run) is not bool:
+            raise ValidationError("dry_run must be boolean")
+        budget = self.max_missing_chunks if max_chunks is None else max_chunks
+        _positive_int(budget, "max_chunks", 1, self.max_missing_chunks)
+        by_key = {self._key(chunk): chunk for chunk in chunks}
+        keys = tuple(by_key)
+        pending = []
+        missing = 0
+        dimension = self.embedder.dimension
+        size = self.embedder.settings.embedding_batch_size
+        for offset in range(0, len(keys), 500):
+            window = keys[offset:offset + 500]
+            cached, dimension = await asyncio.to_thread(self._cache_presence, window, dimension)
+            missing += len(window) - len(cached)
+            pending.extend([key for key in window if key not in cached][:budget - len(pending)])
+
+        planned = len(pending)
+        embedded = filled_elsewhere = 0
+        if not dry_run:
+            for offset in range(0, planned, size):
+                window = pending[offset:offset + size]
+                cached, dimension = await asyncio.to_thread(self._cache_presence, window, dimension)
+                filled_elsewhere += len(cached)
+                batch = [key for key in window if key not in cached]
+                if batch:
+                    await asyncio.to_thread(authorize_batch, tuple(by_key[key] for key in batch))
+                    await self._embed_documents(by_key, batch, dimension)
+                    dimension = self.embedder.dimension
+                    embedded += len(batch)
+        return {"authorized_chunks": len(chunks), "unique_chunks": len(keys),
+                "cached": len(keys) - missing, "missing": missing, "planned": planned,
+                "embedded": embedded, "remaining": missing - embedded - filled_elsewhere}
+
     async def search(self, query: SubQuery, chunks: Sequence[ChildChunk], limit: int) -> tuple[Hit, ...]:
         _positive_int(limit, "dense limit", 1, 100)
         if not chunks:
@@ -394,11 +455,7 @@ class CloudDenseRetriever:
         if len(missing) > self.max_missing_chunks:
             raise CapabilityError("cold dense retrieval exceeds its document embedding budget")
         if missing:
-            # The cache key above stays on the stored text; the model sees a figure's caption, not its storage key.
-            vectors = await self.embedder.embed(tuple(readable_text(by_key[key].retrieval_text) for key in missing))
-            additions = dict(zip(missing, vectors))
-            await asyncio.to_thread(self._write, additions)
-            cached.update(additions)
+            cached.update(await self._embed_documents(by_key, missing, len(query_vector)))
         qnorm = math.hypot(*query_vector)
         qvector = tuple(v / qnorm for v in query_vector)
         scored = []

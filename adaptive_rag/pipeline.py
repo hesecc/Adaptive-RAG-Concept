@@ -7,6 +7,7 @@ not a security sandbox; declarations prevent accidental model adapter loading.
 import asyncio
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
+from functools import partial
 from hashlib import sha256
 import inspect
 import re
@@ -110,7 +111,15 @@ class QueryPipeline:
                                    dense=bool(descriptions["dense"]["enabled"]))
                      if settings.relevance_gate else None)
 
-    async def run(self, request: QueryRequest, capabilities: dict, observer=None) -> QueryResult:
+    async def run(self, request: QueryRequest, capabilities: dict, observer=None, *, candidate_preview=False) -> QueryResult:
+        store = self.c["store"]
+        open_snapshot, list_chunks, get_parents = store.open_snapshot, store.list_chunks, store.get_parents
+        if candidate_preview:
+            if not request.generation:
+                raise ValidationError("candidate preview requires a generation")
+            open_snapshot = partial(open_snapshot, allow_candidate=True)
+            list_chunks = partial(list_chunks, allow_candidate=True)
+            get_parents = partial(get_parents, allow_candidate=True)
         usage_token = start_usage()
         started = monotonic()
         deadline = started + self.settings.timeout_seconds
@@ -125,6 +134,10 @@ class QueryPipeline:
             "retrieved_chunk_ids": [], "retry_count": 0,
             "decisions": [], "retrieval_lanes": [], "rankings": [], "source_parent_ids": [],
         }
+
+        if candidate_preview:
+            # Keep even failed/early-stop diagnostics private, including after activation.
+            trace["candidate_preview"] = True
 
         def emit(event, value):
             # The observer is trusted transport code. Only timing metadata is
@@ -230,6 +243,17 @@ class QueryPipeline:
             return value["action"]
 
         async def execute():
+            async def resolve_snapshot():
+                value = await stage("snapshot", open_snapshot, request.access.tenant_id, request.generation)
+                output("snapshot", {"generation": value.generation if value else None})
+                if request.generation is not None and value is None:
+                    raise NotFoundError("snapshot not found")
+                if value is not None:
+                    trace["generation"] = value.generation
+                return value
+
+            # Reject unavailable explicit generations before invoking any model-backed planner.
+            snapshot = await resolve_snapshot() if request.generation is not None else None
             if await decision("preflight") == "stop":
                 return result("policy_stopped", "规则策略停止本次查询。")
             def checked_plan(value):
@@ -266,12 +290,11 @@ class QueryPipeline:
                 else:
                     disabled(role)
             trace["query_variants"] = [asdict(q) for q in variants]
-            snapshot = await stage("snapshot", self.c["store"].open_snapshot, request.access.tenant_id, request.generation)
-            output("snapshot", {"generation": snapshot.generation if snapshot else None})
+            if request.generation is None:
+                snapshot = await resolve_snapshot()
             if snapshot is None:
                 return result("no_index", "当前租户尚无已发布知识版本。")
-            trace["generation"] = snapshot.generation
-            chunks = await stage("authorized_chunks", self.c["store"].list_chunks, snapshot, request.access, request.sku)
+            chunks = await stage("authorized_chunks", list_chunks, snapshot, request.access, request.sku)
             allowed = {chunk.chunk_id: chunk for chunk in chunks}
             trace["authorized_chunk_count"] = len(chunks)
             output("authorized_chunks", {"authorized_chunk_count": len(chunks), "sku": request.sku})
@@ -347,7 +370,7 @@ class QueryPipeline:
                         if parent.tenant_id != request.access.tenant_id or digest(parent.text) != parent.content_hash:
                             raise ValidationError("parent adapter returned invalid source integrity")
                     return values
-                parents = await stage("parent_backfill", self.c["store"].get_parents, snapshot, selected, request.access,
+                parents = await stage("parent_backfill", get_parents, snapshot, selected, request.access,
                                       validate=checked_parents)
                 by_id = {parent.parent_id: parent for parent in parents}
                 sources(selected)
@@ -372,7 +395,7 @@ class QueryPipeline:
                     if {p.parent_id for p in values} != {e.parent_id for e in evidence}:
                         raise NotFoundError("evidence access changed during query; retry")
                     return values
-                parents = await stage("final_access_check", self.c["store"].get_parents, snapshot,
+                parents = await stage("final_access_check", get_parents, snapshot,
                                       tuple(e.parent_id for e in evidence), request.access, validate=checked_access)
                 output("final_access_check", {"authorized_parent_count": len(parents), "valid": True})
                 return result(status, message, evidence, missing, draft)

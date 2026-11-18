@@ -14,7 +14,6 @@ from pathlib import Path
 import re
 import sqlite3
 from typing import Any, Iterator, Sequence
-from uuid import uuid4
 
 from .domain import (
     AccessContext, CapabilityError, ChildChunk, ConflictError, ForbiddenError,
@@ -22,7 +21,10 @@ from .domain import (
     Snapshot, ValidationError, identifier, stable_id,
 )
 from .data_access import domains_allowed, normalize_data_domains
-from .storage import SQLiteKnowledgeStore, SQLiteTraceSink, _document_listing, _json
+from .storage import (
+    SQLiteKnowledgeStore, SQLiteTraceSink, _CANDIDATE_SCHEMA, _SnapshotStore,
+    _document_listing, _json,
+)
 
 
 def validate_prepared_document(document: PreparedDocument) -> None:
@@ -32,7 +34,7 @@ def validate_prepared_document(document: PreparedDocument) -> None:
 
 _TABLES = (
     "documents", "revisions", "parents", "children", "jobs", "snapshots",
-    "snapshot_revisions", "current_snapshots", "traces",
+    "snapshot_revisions", "current_snapshots", "traces", "candidate_snapshots", "candidate_revisions", "candidate_jobs",
 )
 
 _SCHEMA = """
@@ -131,7 +133,7 @@ class _PostgresDatabase:
         self.connect_timeout = connect_timeout
         with self._connection(initialize=True) as connection:
             connection.execute("SELECT pg_advisory_xact_lock(%s)", (_lock_id(self.schema, "schema"),))
-            for statement in _SCHEMA.split(";"):
+            for statement in (_SCHEMA + _CANDIDATE_SCHEMA).split(";"):
                 if statement.strip():
                     connection.execute(statement)
             if connection.execute("SELECT version FROM schema_metadata WHERE id=1").fetchone()["version"] != 1:
@@ -143,12 +145,15 @@ class _PostgresDatabase:
         return f"{type(self).__name__}(schema={self.schema!r}, dsn=<redacted>)"
 
     @contextmanager
-    def _connection(self, *, initialize: bool = False, tenant: str | None = None) -> Iterator[Any]:
+    def _connection(self, *, initialize: bool = False, tenant: str | None = None, consistent_read: bool = False) -> Iterator[Any]:
         psycopg, sql, dict_row = _driver()
         try:
             with psycopg.connect(self._dsn, connect_timeout=self.connect_timeout, row_factory=dict_row) as connection:
                 # Qualify through a transaction-local search_path; pg_catalog is
                 # implicit. No public/user schema can shadow adapter relations.
+                if consistent_read:
+                    # Manifest verification and content selection must see the same lifecycle state.
+                    connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
                 if initialize:
                     connection.execute("SELECT pg_advisory_xact_lock(%s)", (_lock_id(self.schema, "schema"),))
                     connection.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(self.schema)))
@@ -164,7 +169,7 @@ class _PostgresDatabase:
             raise CapabilityError("PostgreSQL operation failed; check database availability and configuration") from None
 
 
-class PostgresKnowledgeStore(_PostgresDatabase):
+class PostgresKnowledgeStore(_SnapshotStore, _PostgresDatabase):
     """KnowledgeStore backed by tenant-serialized PostgreSQL write transactions."""
 
     def stage(self, document: PreparedDocument) -> IngestResult:
@@ -246,15 +251,13 @@ class PostgresKnowledgeStore(_PostgresDatabase):
         row = connection.execute("SELECT generation FROM current_snapshots WHERE tenant_id=%s", (tenant,)).fetchone()
         return row["generation"] if row else None
 
-    @staticmethod
-    def _snapshot(connection, tenant: str, generation: str) -> Snapshot:
-        row = connection.execute("SELECT created_at FROM snapshots WHERE tenant_id=%s AND generation=%s",
-                                 (tenant, generation)).fetchone()
-        if row is None:
-            raise NotFoundError("snapshot not found")
-        revisions = connection.execute("SELECT document_id,revision_id FROM snapshot_revisions "
-            "WHERE tenant_id=%s AND generation=%s ORDER BY document_id", (tenant, generation)).fetchall()
-        return Snapshot(tenant, generation, tuple((r["document_id"], r["revision_id"]) for r in revisions), row["created_at"])
+    _placeholder = "%s"
+
+    def _snapshot_read(self):
+        return self._connection(consistent_read=True)
+
+    def _snapshot_write(self, tenant_id):
+        return self._connection(tenant=tenant_id)
 
     @classmethod
     def _compare_generation(cls, connection, tenant, expected):
@@ -265,24 +268,13 @@ class PostgresKnowledgeStore(_PostgresDatabase):
             raise ConflictError("current generation changed; reopen snapshot before retrying")
         return current
 
-    @staticmethod
-    def _create_snapshot(connection, tenant: str, revisions: dict[str, str]) -> Snapshot:
-        generation = uuid4().hex
-        created_at = datetime.now(timezone.utc).isoformat()
-        connection.execute("INSERT INTO snapshots VALUES (%s,%s,%s)", (tenant, generation, created_at))
-        with connection.cursor() as cursor:
-            cursor.executemany("INSERT INTO snapshot_revisions VALUES (%s,%s,%s,%s)",
-                [(tenant, generation, doc, rev) for doc, rev in sorted(revisions.items())])
-        connection.execute("INSERT INTO current_snapshots VALUES (%s,%s) ON CONFLICT(tenant_id) "
-            "DO UPDATE SET generation=excluded.generation", (tenant, generation))
-        return Snapshot(tenant, generation, tuple(sorted(revisions.items())), created_at)
-
     def publish(self, tenant_id: str, job_id: str, expected_generation: str | None) -> Snapshot:
         identifier(tenant_id, "tenant_id")
         identifier(job_id, "job_id")
         with self._connection(tenant=tenant_id) as connection:
             current = self._compare_generation(connection, tenant_id, expected_generation)
             job = self._job(connection, tenant_id, job_id)
+            self._reject_candidate_job(connection, tenant_id, job)
             previous = self._snapshot(connection, tenant_id, current) if current else None
             revisions = dict(previous.revisions) if previous else {}
             if previous and revisions.get(job["document_id"]) == job["revision_id"]:
@@ -293,41 +285,20 @@ class PostgresKnowledgeStore(_PostgresDatabase):
             connection.execute("UPDATE jobs SET state='published' WHERE tenant_id=%s AND job_id=%s", (tenant_id, job_id))
             return snapshot
 
-    def open_snapshot(self, tenant_id: str, generation: str | None = None) -> Snapshot | None:
-        identifier(tenant_id, "tenant_id")
-        if generation is not None:
-            identifier(generation, "generation")
-        with self._connection() as connection:
-            generation = generation if generation is not None else self._current(connection, tenant_id)
-            return self._snapshot(connection, tenant_id, generation) if generation else None
-
-    @classmethod
-    def _trusted_snapshot(cls, connection, snapshot: Snapshot, access: AccessContext) -> Snapshot:
-        if not isinstance(snapshot, Snapshot) or not isinstance(access, AccessContext):
-            raise ValidationError("snapshot and access context are required")
-        identifier(snapshot.tenant_id, "tenant_id")
-        identifier(snapshot.generation, "generation")
-        access.__post_init__()
-        if snapshot.tenant_id != access.tenant_id:
-            raise ForbiddenError("snapshot belongs to a different tenant")
-        actual = cls._snapshot(connection, access.tenant_id, snapshot.generation)
-        if actual != snapshot:
-            raise ForbiddenError("snapshot manifest does not match the published snapshot")
-        return actual
-
     @staticmethod
     def _allowed(row, access: AccessContext) -> bool:
         subjects = json.loads(row["allowed_subjects"])
         return (not row["revoked"] and domains_allowed(json.loads(row["data_domains"]), access.data_domains)
                 and (not subjects or bool(access.subjects.intersection(subjects))))
 
-    def list_chunks(self, snapshot: Snapshot, access: AccessContext, sku: str | None = None) -> tuple[ChildChunk, ...]:
+    def list_chunks(self, snapshot: Snapshot, access: AccessContext, sku: str | None = None, *,
+                    allow_candidate: bool = False) -> tuple[ChildChunk, ...]:
         if sku is not None:
             identifier(sku, "sku")
-        with self._connection() as connection:
-            actual = self._trusted_snapshot(connection, snapshot, access)
+        with self._snapshot_read() as connection:
+            actual = self._trusted_snapshot(connection, snapshot, access, allow_candidate=allow_candidate)
             rows = connection.execute("SELECT c.value_json,d.allowed_subjects,d.revoked,d.data_domains FROM children c "
-                "JOIN snapshot_revisions s USING(tenant_id,document_id,revision_id) "
+                f"JOIN {self._revision_source(allow_candidate)} s USING(tenant_id,document_id,revision_id) "
                 "JOIN documents d USING(tenant_id,document_id) WHERE s.tenant_id=%s AND s.generation=%s "
                 "ORDER BY c.document_id,c.chunk_id", (actual.tenant_id, actual.generation)).fetchall()
             chunks = []
@@ -340,14 +311,15 @@ class PostgresKnowledgeStore(_PostgresDatabase):
                         chunks.append(child)
             return tuple(chunks)
 
-    def get_parents(self, snapshot: Snapshot, parent_ids: Sequence[str], access: AccessContext) -> tuple[ParentChunk, ...]:
+    def get_parents(self, snapshot: Snapshot, parent_ids: Sequence[str], access: AccessContext, *,
+                    allow_candidate: bool = False) -> tuple[ParentChunk, ...]:
         if isinstance(parent_ids, (str, bytes)):
             raise ValidationError("parent_ids must be a sequence of identifiers")
         wanted = tuple(dict.fromkeys(identifier(v, "parent_id") for v in parent_ids))
-        with self._connection() as connection:
-            actual = self._trusted_snapshot(connection, snapshot, access)
+        with self._snapshot_read() as connection:
+            actual = self._trusted_snapshot(connection, snapshot, access, allow_candidate=allow_candidate)
             rows = connection.execute("SELECT p.value_json,p.parent_id,d.allowed_subjects,d.revoked,d.data_domains FROM parents p "
-                "JOIN snapshot_revisions s USING(tenant_id,document_id,revision_id) JOIN documents d USING(tenant_id,document_id) "
+                f"JOIN {self._revision_source(allow_candidate)} s USING(tenant_id,document_id,revision_id) JOIN documents d USING(tenant_id,document_id) "
                 "WHERE s.tenant_id=%s AND s.generation=%s AND p.parent_id=ANY(%s)",
                 (actual.tenant_id, actual.generation, list(wanted))).fetchall()
             found = {}
@@ -457,8 +429,14 @@ def migrate_sqlite_to_postgres(source: Path, dsn: str, *, schema: str = "adaptiv
                     sql.SQL(", ").join(sql.Identifier(t) for t in _TABLES)))
                 if any(connection.execute(sql.SQL("SELECT 1 FROM {} LIMIT 1").format(sql.Identifier(t))).fetchone() for t in _TABLES):
                     raise ConflictError("PostgreSQL migration target must be empty")
+                tables = {r[0] for r in original.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                candidate_tables = {"candidate_snapshots", "candidate_revisions", "candidate_jobs"}
+                legacy = tables.isdisjoint(candidate_tables)
                 counts = {}
                 for table in _TABLES:
+                    if legacy and table in candidate_tables:
+                        counts[table] = 0
+                        continue
                     rows = original.execute(f'SELECT * FROM "{table}"').fetchall()
                     counts[table] = len(rows)
                     if rows:

@@ -86,6 +86,45 @@ class RagApplication:
     async def query(self, request, observer=None):
         return await self.pipeline.run(request, self.capabilities(), observer)
 
+    async def preview_candidate(self, request):
+        """Trusted operator only. Preview is lexical even in a cloud-enabled deployment."""
+        from .domain import CapabilityError
+        if any(d["requires_model"] for d in self.descriptions.values()):
+            raise CapabilityError("candidate preview requires a model-free query configuration")
+        if not self.store.is_candidate_snapshot(request.access.tenant_id, request.generation):
+            raise NotFoundError("unactivated candidate not found")
+        return await self.pipeline.run(request, self.capabilities(), candidate_preview=True)
+
+    async def prewarm(self, access, generation, *, sku=None, dry_run=True, max_chunks=None, candidate=False,
+                      all_scopes=False):
+        from .domain import CapabilityError
+        from .prewarm import prewarm_generation
+        identifier(generation, "generation")
+        if any(type(flag) is not bool for flag in (dry_run, candidate, all_scopes)):
+            raise ValidationError("dry_run, candidate and all_scopes must be booleans")
+        if all_scopes and (sku is not None or access != AccessContext(access.tenant_id)):
+            raise ValidationError("all-scopes prewarm cannot be combined with identity or SKU filters")
+        if max_chunks is not None and (type(max_chunks) is not int or max_chunks < 1):
+            raise ValidationError("max_chunks must be a positive integer")
+        if candidate and not self.store.is_candidate_snapshot(access.tenant_id, generation):
+            raise NotFoundError("unactivated candidate not found")
+        if not self.descriptions["dense"]["enabled"]:
+            if not dry_run:
+                raise CapabilityError("real prewarm requires a configured cloud document dense retriever")
+            # No namespace exists to inspect; report scope without claiming any cache readiness.
+            flags = {"allow_candidate": True} if candidate else {}
+            snapshot = self.store.open_snapshot(access.tenant_id, generation, **flags)
+            if snapshot is None:
+                raise NotFoundError("snapshot not found")
+            chunks = (self.store.list_prewarm_chunks(snapshot, **flags) if all_scopes else
+                      self.store.list_chunks(snapshot, access, sku, **flags))
+            return {"generation": generation, "dry_run": True, "status": "dense_disabled",
+                    "authorized_chunks": len(chunks), "scope": "all_scopes" if all_scopes else "principal",
+                    "embedded": 0, "model_calls": 0}
+        return await prewarm_generation(self.store, self.components["dense"], access, generation,
+                                        sku=sku, dry_run=dry_run, max_chunks=max_chunks,
+                                        allow_candidate=candidate, all_scopes=all_scopes)
+
     def get_job(self, tenant_id, job_id):
         return self.store.get_job(tenant_id, job_id)
 
@@ -100,6 +139,8 @@ class RagApplication:
         final excerpts. The trusted local CLI retains its existing raw reader.
         """
         trace = self.get_trace(access.tenant_id, trace_id)
+        if trace.get("candidate_preview"):
+            raise NotFoundError("trace not found")
         generation = trace.get("generation")
         if generation is None:
             return trace

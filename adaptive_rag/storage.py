@@ -4,7 +4,7 @@ SQLite connections belong to one operation, not one application or HTTP thread.
 Snapshots retain their manifest forever; access is deliberately *not* snapshotted.
 """
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -134,6 +134,29 @@ class FileObjectStore:
         return content
 
 
+_CANDIDATE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS candidate_snapshots (
+    tenant_id TEXT NOT NULL, generation TEXT NOT NULL, base_generation TEXT,
+    request_key TEXT NOT NULL, created_at TEXT NOT NULL,
+    activated INTEGER NOT NULL DEFAULT 0 CHECK (activated IN (0,1)),
+    PRIMARY KEY (tenant_id, generation), UNIQUE (tenant_id, request_key),
+    FOREIGN KEY (tenant_id, base_generation) REFERENCES snapshots (tenant_id, generation)
+);
+CREATE TABLE IF NOT EXISTS candidate_revisions (
+    tenant_id TEXT NOT NULL, generation TEXT NOT NULL, document_id TEXT NOT NULL, revision_id TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, generation, document_id),
+    FOREIGN KEY (tenant_id, generation) REFERENCES candidate_snapshots (tenant_id, generation) ON DELETE CASCADE,
+    FOREIGN KEY (tenant_id, document_id, revision_id) REFERENCES revisions (tenant_id, document_id, revision_id)
+);
+CREATE TABLE IF NOT EXISTS candidate_jobs (
+    tenant_id TEXT NOT NULL, generation TEXT NOT NULL, job_id TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, generation, job_id),
+    FOREIGN KEY (tenant_id, generation) REFERENCES candidate_snapshots (tenant_id, generation) ON DELETE CASCADE,
+    FOREIGN KEY (tenant_id, job_id) REFERENCES jobs (tenant_id, job_id)
+);
+CREATE INDEX IF NOT EXISTS candidate_jobs_by_job ON candidate_jobs (tenant_id, job_id);
+"""
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_metadata (
     id INTEGER PRIMARY KEY CHECK (id=1), version INTEGER NOT NULL
@@ -221,7 +244,7 @@ class _Database:
                     if code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED) or time.monotonic() >= deadline:
                         raise
                     time.sleep(0.02)
-            connection.executescript(_SCHEMA)
+            connection.executescript(_SCHEMA + _CANDIDATE_SCHEMA)
             version = connection.execute("SELECT version FROM schema_metadata WHERE id=1").fetchone()[0]
             if version != 1:
                 raise ConflictError("unsupported storage schema version")
@@ -260,7 +283,236 @@ class _Database:
             connection.close()
 
 
-class SQLiteKnowledgeStore(_Database):
+class _SnapshotStore:
+    """Shared snapshot lifecycle. Each adapter serializes writes for a tenant."""
+
+    _placeholder = "?"
+
+    @classmethod
+    def _sql(cls, statement):
+        return statement.replace("?", cls._placeholder)
+
+    @staticmethod
+    def _revision_source(allow_candidate):
+        if allow_candidate is True:
+            return "(SELECT * FROM snapshot_revisions UNION ALL SELECT * FROM candidate_revisions)"
+        return "snapshot_revisions"
+
+    @classmethod
+    def _snapshot(cls, connection, tenant, generation, *, allow_candidate=False):
+        query = "SELECT created_at FROM snapshots WHERE tenant_id=? AND generation=?"
+        params = (tenant, generation)
+        if allow_candidate is True:
+            query += " UNION ALL SELECT created_at FROM candidate_snapshots WHERE tenant_id=? AND generation=? AND activated=0"
+            params += params
+        row = connection.execute(cls._sql(query), params).fetchone()
+        if row is None:
+            raise NotFoundError("snapshot not found")
+        source = cls._revision_source(allow_candidate)
+        revisions = connection.execute(cls._sql(
+            f"SELECT document_id,revision_id FROM {source} AS manifest WHERE tenant_id=? AND generation=?"),
+            (tenant, generation))
+        # Match manifest creation order, independent of database collation.
+        entries = tuple(sorted((r["document_id"], r["revision_id"]) for r in revisions))
+        return Snapshot(tenant, generation, entries, row["created_at"])
+
+    @classmethod
+    def _set_current(cls, connection, tenant, generation):
+        connection.execute(cls._sql("INSERT INTO current_snapshots VALUES (?,?) ON CONFLICT(tenant_id) "
+                                    "DO UPDATE SET generation=excluded.generation"), (tenant, generation))
+
+    @classmethod
+    def _write_manifest(cls, connection, tenant, generation, revisions):
+        created_at = datetime.now(timezone.utc).isoformat()
+        entries = tuple(sorted(revisions.items()))
+        connection.execute(cls._sql("INSERT INTO snapshots VALUES (?,?,?)"), (tenant, generation, created_at))
+        with closing(connection.cursor()) as cursor:
+            cursor.executemany(cls._sql("INSERT INTO snapshot_revisions VALUES (?,?,?,?)"),
+                               [(tenant, generation, doc, rev) for doc, rev in entries])
+        return Snapshot(tenant, generation, entries, created_at)
+
+    @classmethod
+    def _create_snapshot(cls, connection, tenant, revisions):
+        snapshot = cls._write_manifest(connection, tenant, uuid4().hex, revisions)
+        cls._set_current(connection, tenant, snapshot.generation)
+        return snapshot
+
+    def open_snapshot(self, tenant_id: str, generation: str | None = None, *, allow_candidate: bool = False) -> Snapshot | None:
+        identifier(tenant_id, "tenant_id")
+        if generation is not None:
+            identifier(generation, "generation")
+        with self._snapshot_read() as connection:
+            generation = generation if generation is not None else self._current(connection, tenant_id)
+            return self._snapshot(connection, tenant_id, generation, allow_candidate=allow_candidate) if generation else None
+
+    @classmethod
+    def _trusted_snapshot(cls, connection, snapshot: Snapshot, access: AccessContext, *, allow_candidate=False) -> Snapshot:
+        if not isinstance(snapshot, Snapshot) or not isinstance(access, AccessContext):
+            raise ValidationError("snapshot and access context are required")
+        identifier(snapshot.tenant_id, "tenant_id")
+        identifier(snapshot.generation, "generation")
+        access.__post_init__()
+        if snapshot.tenant_id != access.tenant_id:
+            raise ForbiddenError("snapshot belongs to a different tenant")
+        return cls._verify_manifest(connection, snapshot, allow_candidate=allow_candidate)
+
+    @classmethod
+    def _verify_manifest(cls, connection, snapshot, *, allow_candidate):
+        actual = cls._snapshot(connection, snapshot.tenant_id, snapshot.generation, allow_candidate=allow_candidate)
+        if actual != snapshot:
+            raise ForbiddenError("snapshot manifest does not match the published snapshot")
+        return actual
+
+    def list_prewarm_chunks(self, snapshot: Snapshot, *, allow_candidate: bool = False) -> tuple[ChildChunk, ...]:
+        """Trusted operator enumeration, never query authorization or a readiness assertion."""
+        if not isinstance(snapshot, Snapshot):
+            raise ValidationError("snapshot required")
+        identifier(snapshot.tenant_id, "tenant_id")
+        identifier(snapshot.generation, "generation")
+        with self._snapshot_read() as connection:
+            actual = self._verify_manifest(connection, snapshot, allow_candidate=allow_candidate)
+            source = self._revision_source(allow_candidate)
+            rows = connection.execute(self._sql("SELECT c.value_json FROM children c "
+                f"JOIN {source} s USING(tenant_id,document_id,revision_id) JOIN documents d USING(tenant_id,document_id) "
+                "WHERE s.tenant_id=? AND s.generation=? AND d.revoked=0 ORDER BY c.document_id,c.chunk_id"),
+                (actual.tenant_id, actual.generation))
+            chunks = []
+            for row in rows:
+                value = json.loads(row["value_json"])
+                value["sku_ids"] = tuple(value["sku_ids"])
+                chunks.append(ChildChunk(**value))
+            return tuple(chunks)
+
+    def check_prewarm_access(self, tenant_id: str, document_ids: Sequence[str], *, access: AccessContext | None) -> bool:
+        """Recheck live policies for a preselected batch; None is the trusted all-scopes operator."""
+        identifier(tenant_id, "tenant_id")
+        if access is not None:
+            if not isinstance(access, AccessContext):
+                raise ValidationError("access context required")
+            if access.tenant_id != tenant_id:
+                raise ForbiddenError("prewarm batch belongs to a different tenant")
+        if isinstance(document_ids, (str, bytes)) or not isinstance(document_ids, Sequence):
+            raise ValidationError("document_ids must be a sequence of identifiers")
+        ids = tuple(dict.fromkeys(identifier(doc, "document_id") for doc in document_ids))
+        with self._snapshot_read() as connection:
+            for start in range(0, len(ids), 500):
+                batch = ids[start:start + 500]
+                markers = ",".join("?" for _ in batch)
+                rows = connection.execute(self._sql("SELECT allowed_subjects,data_domains,revoked FROM documents "
+                    f"WHERE tenant_id=? AND document_id IN ({markers})"), (tenant_id, *batch)).fetchall()
+                if len(rows) != len(batch) or any(row["revoked"] or (access is not None and not self._allowed(row, access))
+                                                  for row in rows):
+                    return False
+        return True
+
+    def is_candidate_snapshot(self, tenant_id: str, generation: str) -> bool:
+        """True only for an unactivated generation belonging to this tenant."""
+        identifier(tenant_id, "tenant_id")
+        identifier(generation, "generation")
+        with self._connection() as connection:
+            return connection.execute(self._sql("SELECT 1 FROM candidate_snapshots WHERE tenant_id=? "
+                "AND generation=? AND activated=0"), (tenant_id, generation)).fetchone() is not None
+
+    def create_candidate_snapshot(self, tenant_id: str, job_ids: Sequence[str], expected_generation: str | None) -> Snapshot:
+        """Overlay a set of staged jobs on the expected base; order does not affect retry identity."""
+        identifier(tenant_id, "tenant_id")
+        if isinstance(job_ids, (str, bytes)) or not isinstance(job_ids, Sequence) or not job_ids:
+            raise ValidationError("job_ids must be a nonempty sequence of identifiers")
+        ids = sorted(identifier(job_id, "job_id") for job_id in job_ids)
+        if len(set(ids)) != len(ids):
+            raise ValidationError("duplicate job in candidate")
+        with self._snapshot_write(tenant_id) as connection:
+            base = self._compare_generation(connection, tenant_id, expected_generation)
+            request_key = stable_id("candidate", tenant_id, base, ids)
+            existing = connection.execute(self._sql("SELECT generation FROM candidate_snapshots WHERE tenant_id=? AND request_key=?"),
+                                          (tenant_id, request_key)).fetchone()
+            if existing:
+                return self._snapshot(connection, tenant_id, existing["generation"], allow_candidate=True)
+            generation = uuid4().hex
+            changes = {}
+            # Bound the number of bind parameters even for large SQLite batches.
+            for start in range(0, len(ids), 500):
+                batch = ids[start:start + 500]
+                markers = ",".join("?" for _ in batch)
+                rows = connection.execute(self._sql("SELECT document_id,revision_id,state FROM jobs "
+                    f"WHERE tenant_id=? AND job_id IN ({markers})"), (tenant_id, *batch)).fetchall()
+                if len(rows) != len(batch):
+                    raise NotFoundError("ingestion job not found")
+                for row in rows:
+                    if row["state"] != "staged":
+                        raise ConflictError("candidate requires staged jobs")
+                    if row["document_id"] in changes:
+                        raise ValidationError("candidate contains multiple jobs for one document")
+                    changes[row["document_id"]] = row["revision_id"]
+            revisions = dict(self._snapshot(connection, tenant_id, base).revisions) if base else {}
+            revisions.update(changes)
+            created_at = datetime.now(timezone.utc).isoformat()
+            connection.execute(self._sql("INSERT INTO candidate_snapshots (tenant_id,generation,base_generation,request_key,created_at) "
+                                         "VALUES (?,?,?,?,?)"), (tenant_id, generation, base, request_key, created_at))
+            entries = tuple(sorted(revisions.items()))
+            with closing(connection.cursor()) as cursor:
+                cursor.executemany(self._sql("INSERT INTO candidate_revisions VALUES (?,?,?,?)"),
+                                   [(tenant_id, generation, doc, rev) for doc, rev in entries])
+                cursor.executemany(self._sql("INSERT INTO candidate_jobs VALUES (?,?,?)"),
+                                   [(tenant_id, generation, job_id) for job_id in ids])
+            return Snapshot(tenant_id, generation, entries, created_at)
+
+    def activate_candidate_snapshot(self, tenant_id: str, generation: str, expected_generation: str | None) -> Snapshot:
+        """Activate only on the recorded base; a lost response can be retried while still current."""
+        identifier(tenant_id, "tenant_id")
+        identifier(generation, "generation")
+        if expected_generation is not None:
+            identifier(expected_generation, "expected_generation")
+        with self._snapshot_write(tenant_id) as connection:
+            row = connection.execute(self._sql("SELECT base_generation,activated FROM candidate_snapshots "
+                "WHERE tenant_id=? AND generation=?"), (tenant_id, generation)).fetchone()
+            if row is None:
+                raise NotFoundError("candidate snapshot not found")
+            if row["activated"]:
+                if expected_generation not in (row["base_generation"], generation):
+                    raise ConflictError("candidate base generation does not match")
+                self._compare_generation(connection, tenant_id, generation)
+                return self._snapshot(connection, tenant_id, generation)
+            if expected_generation != row["base_generation"]:
+                raise ConflictError("candidate base generation does not match")
+            self._compare_generation(connection, tenant_id, expected_generation)
+            key = (tenant_id, generation)
+            connection.execute(self._sql("INSERT INTO snapshots SELECT tenant_id,generation,created_at FROM candidate_snapshots "
+                                         "WHERE tenant_id=? AND generation=?"), key)
+            connection.execute(self._sql("INSERT INTO snapshot_revisions SELECT * FROM candidate_revisions "
+                                         "WHERE tenant_id=? AND generation=?"), key)
+            connection.execute(self._sql("DELETE FROM candidate_revisions WHERE tenant_id=? AND generation=?"), key)
+            connection.execute(self._sql("UPDATE jobs SET state='published' WHERE tenant_id=? AND job_id IN "
+                "(SELECT job_id FROM candidate_jobs WHERE tenant_id=? AND generation=?)"),
+                (tenant_id, tenant_id, generation))
+            connection.execute(self._sql("UPDATE candidate_snapshots SET activated=1 WHERE tenant_id=? AND generation=?"),
+                               (tenant_id, generation))
+            self._set_current(connection, tenant_id, generation)
+            return self._snapshot(connection, tenant_id, generation)
+
+    def abandon_candidate_snapshot(self, tenant_id: str, generation: str) -> bool:
+        """Drop a pending manifest and its job reservations. A repeated abandon returns False."""
+        identifier(tenant_id, "tenant_id")
+        identifier(generation, "generation")
+        with self._snapshot_write(tenant_id) as connection:
+            row = connection.execute(self._sql("SELECT activated FROM candidate_snapshots WHERE tenant_id=? AND generation=?"),
+                                     (tenant_id, generation)).fetchone()
+            if row is None:
+                return False
+            if row["activated"]:
+                raise ConflictError("cannot abandon a published candidate")
+            connection.execute(self._sql("DELETE FROM candidate_snapshots WHERE tenant_id=? AND generation=?"),
+                               (tenant_id, generation))
+            return True
+
+    def _reject_candidate_job(self, connection, tenant, job):
+        if job["state"] == "staged" and connection.execute(self._sql(
+            "SELECT 1 FROM candidate_jobs j JOIN candidate_snapshots c USING(tenant_id,generation) "
+            "WHERE j.tenant_id=? AND j.job_id=? AND c.activated=0"), (tenant, job["job_id"])).fetchone():
+            raise ConflictError("job belongs to a candidate; activate the candidate snapshot")
+
+
+class SQLiteKnowledgeStore(_SnapshotStore, _Database):
     """Revision manifests and current access policy in one transactional store."""
 
     @staticmethod
@@ -412,18 +664,11 @@ class SQLiteKnowledgeStore(_Database):
         row = connection.execute("SELECT generation FROM current_snapshots WHERE tenant_id=?", (tenant,)).fetchone()
         return row[0] if row else None
 
-    @staticmethod
-    def _snapshot(connection: sqlite3.Connection, tenant: str, generation: str) -> Snapshot:
-        row = connection.execute(
-            "SELECT created_at FROM snapshots WHERE tenant_id=? AND generation=?", (tenant, generation),
-        ).fetchone()
-        if row is None:
-            raise NotFoundError("snapshot not found")
-        revisions = connection.execute(
-            "SELECT document_id,revision_id FROM snapshot_revisions "
-            "WHERE tenant_id=? AND generation=? ORDER BY document_id", (tenant, generation),
-        ).fetchall()
-        return Snapshot(tenant, generation, tuple((r[0], r[1]) for r in revisions), row[0])
+    def _snapshot_read(self):
+        return self._connection()
+
+    def _snapshot_write(self, tenant_id):
+        return self._connection(write=True)
 
     @staticmethod
     def _compare_generation(connection: sqlite3.Connection, tenant: str, expected: str | None) -> str | None:
@@ -434,27 +679,13 @@ class SQLiteKnowledgeStore(_Database):
             raise ConflictError("current generation changed; reopen snapshot before retrying")
         return current
 
-    @staticmethod
-    def _create_snapshot(connection: sqlite3.Connection, tenant: str, revisions: dict[str, str]) -> Snapshot:
-        generation = uuid4().hex
-        created_at = datetime.now(timezone.utc).isoformat()
-        connection.execute("INSERT INTO snapshots VALUES (?,?,?)", (tenant, generation, created_at))
-        connection.executemany(
-            "INSERT INTO snapshot_revisions VALUES (?,?,?,?)",
-            [(tenant, generation, doc, revision) for doc, revision in sorted(revisions.items())],
-        )
-        connection.execute(
-            "INSERT INTO current_snapshots VALUES (?,?) ON CONFLICT(tenant_id) "
-            "DO UPDATE SET generation=excluded.generation", (tenant, generation),
-        )
-        return Snapshot(tenant, generation, tuple(sorted(revisions.items())), created_at)
-
     def publish(self, tenant_id: str, job_id: str, expected_generation: str | None) -> Snapshot:
         identifier(tenant_id, "tenant_id")
         identifier(job_id, "job_id")
         with self._connection(write=True) as connection:
             current = self._compare_generation(connection, tenant_id, expected_generation)
             job = self._job(connection, tenant_id, job_id)
+            self._reject_candidate_job(connection, tenant_id, job)
             previous = self._snapshot(connection, tenant_id, current) if current else None
             revisions = dict(previous.revisions) if previous else {}
             if previous and revisions.get(job["document_id"]) == job["revision_id"]:
@@ -467,42 +698,21 @@ class SQLiteKnowledgeStore(_Database):
             )
             return snapshot
 
-    def open_snapshot(self, tenant_id: str, generation: str | None = None) -> Snapshot | None:
-        identifier(tenant_id, "tenant_id")
-        if generation is not None:
-            identifier(generation, "generation")
-        with self._connection() as connection:
-            generation = generation if generation is not None else self._current(connection, tenant_id)
-            return self._snapshot(connection, tenant_id, generation) if generation else None
-
-    @staticmethod
-    def _trusted_snapshot(connection: sqlite3.Connection, snapshot: Snapshot, access: AccessContext) -> Snapshot:
-        if not isinstance(snapshot, Snapshot) or not isinstance(access, AccessContext):
-            raise ValidationError("snapshot and access context are required")
-        identifier(snapshot.tenant_id, "tenant_id")
-        identifier(snapshot.generation, "generation")
-        access.__post_init__()
-        if snapshot.tenant_id != access.tenant_id:
-            raise ForbiddenError("snapshot belongs to a different tenant")
-        actual = SQLiteKnowledgeStore._snapshot(connection, access.tenant_id, snapshot.generation)
-        if actual != snapshot:
-            raise ForbiddenError("snapshot manifest does not match the published snapshot")
-        return actual
-
     @staticmethod
     def _allowed(row: sqlite3.Row, access: AccessContext) -> bool:
         subjects = json.loads(row["allowed_subjects"])
         return (not row["revoked"] and domains_allowed(json.loads(row["data_domains"]), access.data_domains)
                 and (not subjects or bool(access.subjects.intersection(subjects))))
 
-    def list_chunks(self, snapshot: Snapshot, access: AccessContext, sku: str | None = None) -> tuple[ChildChunk, ...]:
+    def list_chunks(self, snapshot: Snapshot, access: AccessContext, sku: str | None = None, *,
+                    allow_candidate: bool = False) -> tuple[ChildChunk, ...]:
         if sku is not None:
             identifier(sku, "sku")
-        with self._connection() as connection:
-            actual = self._trusted_snapshot(connection, snapshot, access)
+        with self._snapshot_read() as connection:
+            actual = self._trusted_snapshot(connection, snapshot, access, allow_candidate=allow_candidate)
             rows = connection.execute(
                 "SELECT c.value_json,d.allowed_subjects,d.revoked,d.data_domains FROM children c "
-                "JOIN snapshot_revisions s USING(tenant_id,document_id,revision_id) "
+                f"JOIN {self._revision_source(allow_candidate)} s USING(tenant_id,document_id,revision_id) "
                 "JOIN documents d USING(tenant_id,document_id) "
                 "WHERE s.tenant_id=? AND s.generation=? ORDER BY c.document_id,c.chunk_id",
                 (actual.tenant_id, actual.generation),
@@ -518,16 +728,17 @@ class SQLiteKnowledgeStore(_Database):
                     chunks.append(child)
             return tuple(chunks)
 
-    def get_parents(self, snapshot: Snapshot, parent_ids: Sequence[str], access: AccessContext) -> tuple[ParentChunk, ...]:
+    def get_parents(self, snapshot: Snapshot, parent_ids: Sequence[str], access: AccessContext, *,
+                    allow_candidate: bool = False) -> tuple[ParentChunk, ...]:
         if isinstance(parent_ids, (str, bytes)):
             raise ValidationError("parent_ids must be a sequence of identifiers")
         wanted = tuple(dict.fromkeys(identifier(value, "parent_id") for value in parent_ids))
-        with self._connection() as connection:
-            actual = self._trusted_snapshot(connection, snapshot, access)
+        with self._snapshot_read() as connection:
+            actual = self._trusted_snapshot(connection, snapshot, access, allow_candidate=allow_candidate)
             # No dynamic SQL/variable-count limit: read only the true snapshot.
             rows = connection.execute(
                 "SELECT p.value_json,p.parent_id,d.allowed_subjects,d.revoked,d.data_domains FROM parents p "
-                "JOIN snapshot_revisions s USING(tenant_id,document_id,revision_id) "
+                f"JOIN {self._revision_source(allow_candidate)} s USING(tenant_id,document_id,revision_id) "
                 "JOIN documents d USING(tenant_id,document_id) "
                 "WHERE s.tenant_id=? AND s.generation=?", (actual.tenant_id, actual.generation),
             ).fetchall()

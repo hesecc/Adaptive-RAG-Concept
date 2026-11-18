@@ -12,6 +12,10 @@
 
 ## Application公共接口（API/CLI调用）
 
+热更新增加仅供可信操作员使用的存储操作：`create_candidate_snapshot(tenant_id, job_ids, expected_generation)` 固定候选清单；`activate_candidate_snapshot(tenant_id, generation, expected_generation)` 在同一事务内校验基代并切换指针。未激活代不是历史发布代，普通 `open_snapshot/list_chunks/get_parents`、回滚目标及证据读取均不可使用。已激活代和先前发布代仍受实时 ACL 约束。
+
+仅本地操作员可显式预览候选；候选查询产生的 trace 从创建起不向 HTTP 暴露（包括失败、提前结束及激活后）。普通 HTTP 管理员也不能通过指定 generation 或请求预览标志绕开隔离。显式预热只填充文档派生向量缓存，不调用查询规划、查询向量、重排或生成。默认检查主体可见范围；可信 CLI 的 `--all-scopes` 才检查指定代所有未撤销文档（包括受限 ACL、数据域及 SKU）。缓存命中不授予任何读取权限。详见[热更新操作和限制](hot-updates.md)。
+
 - RagApplication(settings: Settings, registry: PluginRegistry | None = None)
 - ingest(request: IngestRequest) -> IngestResult
 - ingest_pdf(path, *, backend="local", pdf_settings=None, pdf_checkpoint=None, **metadata) -> IngestResult

@@ -14,7 +14,7 @@ import httpx
 from adaptive_rag.app import RagApplication
 from adaptive_rag.config import Principal, Settings
 from adaptive_rag.domain import CapabilityError, ValidationError
-from adaptive_rag.mineru_formats import ORIGINAL_MIME
+from adaptive_rag.mineru_formats import ORIGINAL_MIME, validate_office
 from adaptive_rag.pdf import PdfSettings
 from test_pdf import archive_bytes, pdf_bytes
 
@@ -42,6 +42,20 @@ def compound(stream_name):
 
 
 class MinerUFormatTests(unittest.TestCase):
+    def test_workbook_default_content_type_and_override_precedence(self):
+        mime = ORIGINAL_MIME['xlsx'] + '.main+xml'
+        def workbook(default, override=None):
+            entries = f'<Default Extension="xml" ContentType="{default}"/>'
+            if override:
+                entries += f'<Override PartName="/xl/workbook.xml" ContentType="{override}"/>'
+            manifest = f'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">{entries}</Types>'
+            return archive_bytes([('[Content_Types].xml', manifest), ('xl/workbook.xml', '<workbook/>')])
+        validate_office(workbook(mime), 'xlsx')
+        validate_office(workbook('application/xml', mime), 'xlsx')
+        for raw in (workbook('application/xml'), workbook(mime, 'application/xml')):
+            with self.assertRaises(ValidationError):
+                validate_office(raw, 'xlsx')
+
     def setUp(self):
         directory = TemporaryDirectory()
         self.addCleanup(directory.cleanup)

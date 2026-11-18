@@ -62,10 +62,20 @@ def _ooxml_matches(raw: bytes, ext: str) -> bool:
             xml = stream.read(512_001)
         root = ElementTree.fromstring(xml, parser=ElementTree.XMLParser(target=_ManifestTree()))
         ns = "{http://schemas.openxmlformats.org/package/2006/content-types}"
+        if root.tag != ns + "Types":
+            return False
+        # OPC resolves an explicit part override before the extension default.
         main_types = {ORIGINAL_MIME[kind] + ".main+xml" for kind in _MAIN_PART}
-        declared = [(entry.get("PartName"), entry.get("ContentType")) for entry in root.iterfind(ns + "Override")
-                    if entry.get("ContentType") in main_types]
-        return root.tag == ns + "Types" and declared == [("/" + main, ORIGINAL_MIME[ext] + ".main+xml")]
+        overrides = []
+        for entry in root.iterfind(ns + "Override"):
+            part, mime = entry.get("PartName"), entry.get("ContentType")
+            if part == "/" + main:
+                overrides.append(mime)
+            elif mime in main_types:
+                return False
+        defaults = [entry.get("ContentType") for entry in root.iterfind(ns + "Default")
+                    if entry.get("Extension", "").lower() == "xml"]
+        return (overrides or defaults) == [ORIGINAL_MIME[ext] + ".main+xml"]
 
 
 def _ole_matches(raw: bytes, ext: str) -> bool:

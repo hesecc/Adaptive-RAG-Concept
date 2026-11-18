@@ -69,6 +69,29 @@ def extract(raw):
     return MinerUPdfParser(PdfSettings())._markdown(raw)
 
 
+def mineru_client(path, result):
+    digest = sha256(path.read_bytes()).hexdigest()
+
+    def handler(request):
+        if request.url.path.endswith("/file-urls/batch"):
+            return httpx.Response(200, json={"code": 0, "data": {"batch_id": "batch-1", "file_urls": [
+                "https://mineru.oss-cn-shanghai.aliyuncs.com/upload?signature=secret"]}})
+        if request.method == "PUT":
+            return httpx.Response(200)
+        if "extract-results" in request.url.path:
+            return httpx.Response(200, json={"code": 0, "data": {"extract_result": [{
+                "state": "done", "file_name": path.name, "data_id": digest,
+                "full_zip_url": "https://cdn-mineru.openxlab.org.cn/result.zip?signature=secret"}]}})
+        return httpx.Response(200, content=result)
+
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def ingest_archive(app, path, result, **metadata):
+    with mineru_client(path, result) as client, patch("adaptive_rag.pdf.httpx.Client", return_value=client):
+        return app.ingest_pdf(path, backend="mineru", pdf_settings=PdfSettings(api_key="test-key"), **metadata)
+
+
 MARKDOWN = ("# Attention\n\n"
             "![](images/one.png)  \n\n"
             "![](images/two.png)  \n\n"
@@ -258,21 +281,7 @@ class MinerUArchiveTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         path = Path(directory.name) / "fixture.pdf"
         path.write_bytes(pdf_bytes())
-        digest, result = sha256(path.read_bytes()).hexdigest(), archive(MARKDOWN, IMAGES, CONTENT_LIST)
-
-        def handler(request):
-            if request.url.path.endswith("/file-urls/batch"):
-                return httpx.Response(200, json={"code": 0, "data": {"batch_id": "batch-1", "file_urls": [
-                    "https://mineru.oss-cn-shanghai.aliyuncs.com/upload?signature=secret"]}})
-            if request.method == "PUT":
-                return httpx.Response(200)
-            if "extract-results" in request.url.path:
-                return httpx.Response(200, json={"code": 0, "data": {"extract_result": [{
-                    "state": "done", "file_name": path.name, "data_id": digest,
-                    "full_zip_url": "https://cdn-mineru.openxlab.org.cn/result.zip?signature=secret"}]}})
-            return httpx.Response(200, content=result)
-
-        client = httpx.Client(transport=httpx.MockTransport(handler))
+        client = mineru_client(path, archive(MARKDOWN, IMAGES, CONTENT_LIST))
         self.addCleanup(client.close)
         parsed = parse_pdf(path, "mineru", PdfSettings(api_key="private-test-key-never-output", poll_interval_seconds=.001),
                            client=client)
@@ -296,10 +305,11 @@ class AttachFiguresTests(unittest.TestCase):
     def test_references_become_markers_and_the_bytes_are_stored_by_content(self):
         figures = [Figure("images/one.png", IMAGES["images/one.png"], "Figure 1", 3),
                    Figure("images/two.png", IMAGES["images/two.png"], "", None)]
-        text, summary = attach_figures("A\n\n![](images/one.png)  \n\nB ![x](images/two.png) C", figures, self.store)
+        text, summary, validated = attach_figures("A\n\n![](images/one.png)  \n\nB ![x](images/two.png) C", figures, self.store)
         one, two = (sha256(IMAGES[name]).hexdigest() for name in ("images/one.png", "images/two.png"))
         self.assertEqual(text, f'A\n\n![Figure 1](ragfig:{one} "第 3 页")  \n\nB ![](ragfig:{two}) C')
         self.assertEqual(self.stored, {one: IMAGES["images/one.png"], two: IMAGES["images/two.png"]})
+        self.assertEqual(validated, (one, two))
         self.assertEqual(summary, {"referenced": 2, "stored": 2, "skipped": 0})
 
     def test_a_picture_that_cannot_be_used_is_removed_but_its_caption_text_stays(self):
@@ -307,7 +317,8 @@ class AttachFiguresTests(unittest.TestCase):
                    Figure("images/vector.png", b"<svg xmlns='http://www.w3.org/2000/svg'/>", "", None),
                    Figure("images/ok.png", IMAGES["images/one.png"], "Fine", 2)]
         markdown = "Intro\n\n![](images/text.png)\n\n![](images/vector.png)\n\nFigure 2: the caption.\n\n![](images/ok.png)\n![](images/gone.png)"
-        text, summary = attach_figures(markdown, figures, self.store)
+        text, summary, validated = attach_figures(markdown, figures, self.store)
+        self.assertEqual(validated, tuple(self.stored))
         self.assertNotIn("images/", text)
         self.assertIn("Figure 2: the caption.", text)
         self.assertIn("ragfig:" + sha256(IMAGES["images/one.png"]).hexdigest(), text)
@@ -317,7 +328,8 @@ class AttachFiguresTests(unittest.TestCase):
     def test_a_picture_used_twice_gets_the_same_key_and_is_stored_once_per_reference_path(self):
         content = IMAGES["images/one.png"]
         figures = [Figure("images/a.png", content, "A", 1), Figure("images/b.png", content, "B", 2)]
-        text, summary = attach_figures("![](images/a.png)\n![](images/a.png)\n![](images/b.png)", figures, self.store)
+        text, summary, validated = attach_figures("![](images/a.png)\n![](images/a.png)\n![](images/b.png)", figures, self.store)
+        self.assertEqual(validated, (sha256(content).hexdigest(),))
         self.assertEqual({image.key for image in find_figures(text)}, {sha256(content).hexdigest()})
         self.assertEqual(text.count("ragfig:"), 3)
         self.assertEqual(summary["referenced"], 2)
@@ -325,7 +337,7 @@ class AttachFiguresTests(unittest.TestCase):
 
     def test_text_without_archive_references_is_returned_unchanged(self):
         self.assertEqual(attach_figures("plain text", [], self.store),
-                         ("plain text", {"referenced": 0, "stored": 0, "skipped": 0}))
+                         ("plain text", {"referenced": 0, "stored": 0, "skipped": 0}, ()))
         # Only archive-relative paths are rewritten; a link to another site is left as the author wrote it.
         linked = "No pictures. ![alt](https://example.test/x.png) stays."
         self.assertEqual(attach_figures(linked, [], self.store)[0], linked)
@@ -386,8 +398,8 @@ class FigureQueryTests(unittest.IsolatedAsyncioTestCase):
         item = result.evidence[0]
         fetched = app.get_evidence(self.access, result.generation, item.evidence_id)
         self.assertEqual((fetched.text, fetched.images), (item.text, item.images))
-        self.assertEqual(app.get_evidence_image(self.access, result.generation, item.evidence_id, key),
-                         (IMAGES["images/one.png"], "image/png"))
+        with self.assertRaises(NotFoundError):
+            app.get_evidence_image(self.access, result.generation, item.evidence_id, key)
 
     async def test_the_storage_key_alone_is_not_a_reason_to_show_a_source(self):
         app = self.application()
@@ -478,11 +490,8 @@ class PdfFigureIngestTests(unittest.IsolatedAsyncioTestCase):
         self.access = AccessContext("demo", "reader")
 
     def ingest(self, raw_archive):
-        markdown, figures, metadata = extract(raw_archive)
-        parsed = ParsedPdf(markdown, 1, "mineru", .01, {"source_sha256": sha256(self.raw).hexdigest(), **metadata}, figures)
-        with patch("adaptive_rag.pdf.parse_pdf", return_value=parsed):
-            return self.app.ingest_pdf(self.pdf, backend="mineru", tenant_id="demo", document_id="paper", version="v1",
-                                       title="Attention paper")
+        return ingest_archive(self.app, self.pdf, raw_archive, tenant_id="demo", document_id="paper", version="v1",
+                              title="Attention paper")
 
     async def test_an_archive_becomes_a_searchable_document_with_citable_pictures(self):
         markdown = "# Model\n\nThe encoder has six layers.\n\n![](images/one.png)  \n\n![](images/broken.png)  \n\nFigure 1: Encoder.\n"
@@ -508,6 +517,53 @@ class PdfFigureIngestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.app.objects.get(sha256(self.raw).hexdigest()), self.raw)
         self.assertEqual(self.app.objects.get(sha256(IMAGES["images/one.png"]).hexdigest()), IMAGES["images/one.png"])
         self.assertEqual(result.figures["stored"], 1)
+
+    async def test_legacy_revision_stays_text_only_after_an_identical_pdf_is_reparsed(self):
+        image = IMAGES["images/one.png"]
+        key = self.app.objects.put(image)
+        old = self.app.ingest(IngestRequest("demo", "paper", "v1", "Encoder layers.\n\n" + marker(key),
+                              title="Attention paper", source_parser="mineru", source_object_key=sha256(self.raw).hexdigest()))
+        old_gen = self.app.publish("demo", old.job_id, None).generation
+        parsed = self.ingest(archive("Encoder layers.\n\n![](images/one.png)", {"images/one.png": image}))
+        self.assertNotEqual(old.revision_id, parsed.revision_id)
+        new_gen = self.app.publish("demo", parsed.job_id, old_gen).generation
+        app = RagApplication(self.app.settings)
+        prior, = (await app.query(QueryRequest(self.access, "Encoder layers", generation=old_gen))).evidence
+        current, = (await app.query(QueryRequest(self.access, "Encoder layers", generation=new_gen))).evidence
+        self.assertEqual((prior.text, prior.images), (current.text, current.images))
+        with patch.object(app.objects, "get", wraps=app.objects.get) as get:
+            with self.assertRaises(NotFoundError):
+                app.get_evidence_image(self.access, old_gen, prior.evidence_id, key)
+            self.assertNotIn((key,), [call.args for call in get.call_args_list])
+        self.assertEqual(app.get_evidence_image(self.access, new_gen, current.evidence_id, key), (image, "image/png"))
+
+    async def test_pdf_manifest_only_includes_validated_archive_references(self):
+        foreign = self.app.objects.put(IMAGES["images/two.png"])
+        job = self.ingest(archive("Encoder layers.\n\n![](images/one.png)\n\n" + marker(foreign),
+                                  {"images/one.png": IMAGES["images/one.png"]}))
+        generation = self.app.publish("demo", job.job_id, None).generation
+        item, = (await self.app.query(QueryRequest(self.access, "Encoder layers"))).evidence
+        parsed, literal = item.images
+        self.assertEqual(literal.key, foreign)
+        with self.assertRaises(NotFoundError):
+            self.app.get_evidence_image(self.access, generation, item.evidence_id, foreign)
+        self.assertEqual(self.app.get_evidence_image(self.access, generation, item.evidence_id, parsed.key),
+                         (IMAGES["images/one.png"], "image/png"))
+
+    async def test_a_bound_figure_is_not_bound_to_another_document_or_tenant(self):
+        job = self.ingest(archive("Encoder.\n\n![](images/one.png)", {"images/one.png": IMAGES["images/one.png"]}))
+        source_gen = self.app.publish("demo", job.job_id, None).generation
+        source, = (await self.app.query(QueryRequest(self.access, "Encoder"))).evidence
+        image, = source.images
+        for tenant, document, previous in (("demo", "notes", source_gen), ("second", "paper", None)):
+            with self.subTest(tenant=tenant, document=document):
+                job = self.app.ingest(IngestRequest(tenant, document, "v1", "Appendix.\n\n" + marker(image.key)))
+                generation = self.app.publish(tenant, job.job_id, previous).generation
+                access = AccessContext(tenant, "reader")
+                item, = (await self.app.query(QueryRequest(access, "Appendix"))).evidence
+                self.assertEqual(item.images, (image,))
+                with self.assertRaises(NotFoundError):
+                    self.app.get_evidence_image(access, generation, item.evidence_id, image.key)
 
     async def test_the_same_pdf_ingested_again_is_a_duplicate_with_the_same_keys(self):
         raw_archive = archive("![](images/one.png)\n\nbody", {"images/one.png": IMAGES["images/one.png"]})
@@ -564,9 +620,18 @@ class EvidenceImageHTTPTests(unittest.TestCase):
     def image_url(self, item, key):
         return f"/evidence/{self.generation}/{item['evidence_id']}/images/{key}"
 
+    def publish_pdf(self, document_id, intro, image, caption, page, domains=()):
+        path = self.settings.data_dir / "fixture.pdf"
+        path.write_bytes(pdf_bytes())
+        result = archive(intro + "\n\n![](images/chart.png)", {"images/chart.png": image}, [
+            {"type": "image", "img_path": "images/chart.png", "image_caption": [caption], "page_idx": page - 1}])
+        job = ingest_archive(self.app, path, result, tenant_id="company", document_id=document_id,
+                             version="v1", title=document_id, data_domains=tuple(domains))
+        self.generation = self.app.publish("company", job.job_id, self.generation).generation
+
     def test_the_figure_is_listed_on_the_evidence_and_served_with_its_own_media_type(self):
-        self.publish("revenue", f"# Revenue\n\nQuarterly revenue.\n\n{marker(self.red_key, 'Figure 1: Revenue by quarter', 7)}")
-        self.publish("scores", f"# Scores\n\nHead scores.\n\n{marker(self.blue_key, 'Figure 2: Scores by head', 9)}")
+        self.publish_pdf("revenue", "# Revenue\n\nQuarterly revenue.", self.red, "Figure 1: Revenue by quarter", 7)
+        self.publish_pdf("scores", "# Scores\n\nHead scores.", self.blue, "Figure 2: Scores by head", 9)
         item, = self.evidence(self.admin, "Revenue by quarter")
         self.assertEqual(item["images"], [{"key": self.red_key, "caption": "Figure 1: Revenue by quarter", "page": 7}])
         shown = self.admin.get(f"/evidence/{self.generation}/{item['evidence_id']}").json()
@@ -582,8 +647,8 @@ class EvidenceImageHTTPTests(unittest.TestCase):
         self.assertEqual((jpeg.status_code, jpeg.headers["content-type"], jpeg.content), (200, "image/jpeg", self.blue))
 
     def test_a_key_opens_nothing_unless_that_evidence_shows_it(self):
-        self.publish("revenue", f"# Revenue\n\nQuarterly revenue.\n\n{marker(self.red_key, 'Figure 1: Revenue by quarter', 7)}")
-        self.publish("scores", f"# Scores\n\nHead scores.\n\n{marker(self.blue_key, 'Figure 2: Scores by head', 9)}")
+        self.publish_pdf("revenue", "# Revenue\n\nQuarterly revenue.", self.red, "Figure 1: Revenue by quarter", 7)
+        self.publish_pdf("scores", "# Scores\n\nHead scores.", self.blue, "Figure 2: Scores by head", 9)
         item, = self.evidence(self.admin, "Revenue by quarter")
         self.assertEqual(self.admin.get(self.image_url(item, self.blue_key)).status_code, 404)
         library = self.app.objects.put(picture((1, 2, 3)))  # stored, but no document shows it
@@ -601,7 +666,7 @@ class EvidenceImageHTTPTests(unittest.TestCase):
 
     def test_signed_out_callers_and_other_data_domains_get_nothing(self):
         operator, finance = self.reader("operator", ["operations"]), self.reader("finance", ["finance"])
-        self.publish("budget", f"# Budget\n\nBudget chart.\n\n{marker(self.blue_key, 'Figure 3: Budget split', 2)}", ["finance"])
+        self.publish_pdf("budget", "# Budget\n\nBudget chart.", self.blue, "Figure 3: Budget split", 2, ["finance"])
         item, = self.evidence(self.admin, "Budget split")
         url = self.image_url(item, self.blue_key)
         self.assertEqual(self.client().get(url).status_code, 401)
@@ -621,7 +686,7 @@ class EvidenceImageHTTPTests(unittest.TestCase):
         self.assertEqual(self.admin.get(self.image_url(missing, "d" * 64)).status_code, 404)
         hostile, = self.evidence(self.admin, "Webpage payload")
         response = self.admin.get(self.image_url(hostile, html))
-        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.status_code, 404)
         self.assertNotIn("text/html", response.headers["content-type"])
         self.assertNotIn(b"alert(1)", response.content)
 

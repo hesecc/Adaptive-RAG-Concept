@@ -6,16 +6,17 @@ A figure travels with its document as one Markdown image line,
 
 so the caption is ordinary chunk text (searched, embedded, cited) and the figure
 stays with the passage around it. The image bytes sit in the content-addressed
-object store under the same sha256. Nothing else records the link: the document
-revision is the source of truth, and the evidence built from it lists its figures.
+object store under the same sha256. Markers are display text. Only PDF ingestion
+writes the separate revision binding that authorizes reading those bytes.
 """
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from hashlib import sha256
 import re
 import unicodedata
 
-from .domain import EvidenceImage, ValidationError
+from .domain import Evidence, EvidenceImage, IngestRequest, NotFoundError, ValidationError, stable_id
 
 MAX_CAPTION = 160
 
@@ -95,8 +96,40 @@ def sniff_media_type(content: bytes) -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class ParsedFigureRequest(IngestRequest):
+    """Include parser provenance in the immutable revision hash, even for otherwise identical Markdown."""
+    parser_figure_keys: tuple[str, ...] = ()
+
+
+def figure_binding(tenant_id: str, document_id: str, version: str, revision_id: str, key: str) -> bytes:
+    """One immutable manifest entry. Its wire format is neither UTF-8 text, a PDF nor an image,
+    so none of the untrusted upload paths can write an entry as ordinary user content.
+    """
+    scope_hash = stable_id(tenant_id, document_id, version, revision_id, key)
+    return b"\xffRAG-figure-binding-v1\x00" + scope_hash.encode("ascii")
+
+
+def read_bound_figure(evidence: Evidence, key: str, get: Callable[[str], bytes]) -> tuple[bytes, str]:
+    if not any(image.key == key for image in evidence.images):
+        raise NotFoundError("image not found in this evidence")
+    entry = figure_binding(evidence.tenant_id, evidence.document_id, evidence.version, evidence.revision_id, key)
+    try:
+        bound = get(sha256(entry).hexdigest())
+    except NotFoundError:
+        raise NotFoundError("image not found in this evidence") from None
+    if bound != entry:
+        raise NotFoundError("image not found in this evidence")
+    # Both object adapters verify SHA-256 on get. These are the same bytes validated at ingest.
+    content = get(key)
+    media_type = sniff_media_type(content)
+    if media_type is None:
+        raise ValidationError("stored figure is not a supported image")
+    return content, media_type
+
+
 def attach_figures(markdown: str, figures: Sequence[Figure],
-                   store: Callable[[bytes], str]) -> tuple[str, dict[str, int]]:
+                   store: Callable[[bytes], str]) -> tuple[str, dict[str, int], tuple[str, ...]]:
     """Store the figures the Markdown points at and rewrite each reference into a marker.
 
     A reference to a figure that is missing, too large or not a static PNG, JPEG or
@@ -123,4 +156,6 @@ def attach_figures(markdown: str, figures: Sequence[Figure],
 
     rewritten = ARCHIVE_REFERENCE.sub(replace, markdown)
     stored = sum(key is not None for key in keys.values())
-    return rewritten, {"referenced": len(keys), "stored": stored, "skipped": len(keys) - stored}
+    # Do not collect manifest entries from the rewritten Markdown: it can contain literal markers.
+    validated = tuple(dict.fromkeys(key for key in keys.values() if key is not None))
+    return rewritten, {"referenced": len(keys), "stored": stored, "skipped": len(keys) - stored}, validated

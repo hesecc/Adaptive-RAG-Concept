@@ -128,4 +128,5 @@ class ConversationHistory:
             values["history_trace_ids"] = tuple(key for key, _, _ in recent)
             values["history"] = [text for _, question, answer in recent for text in (question, answer)]
         values["history"] = tuple(values["history"])
+        values["skip_query_steps"] = tuple(values["skip_query_steps"])
         return QueryRequest(access=access, **values)

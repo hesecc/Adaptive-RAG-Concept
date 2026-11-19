@@ -49,6 +49,34 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(read.content_hash, evidence.content_hash)
         self.assertIn("disabled", {item["status"] for item in trace["stages"]})
 
+    async def test_optional_preferences_are_request_local_and_keep_verification(self):
+        calls = []
+        registry = default_registry()
+
+        class Rewrite:
+            async def transform(self, queries, request):
+                calls.append(request.access.subject_id)
+                return queries
+
+        registry.register("rewrite", "fixture", lambda _: Rewrite())
+        app = RagApplication(replace(self.settings, plugins={"rewrite": "fixture"}), registry)
+        self.publish(app)
+        first, second = await asyncio.gather(
+            app.query(QueryRequest(self.access, "退货期限", skip_query_steps=("rewrite",))),
+            app.query(QueryRequest(AccessContext("shop", "other"), "退货期限")),
+        )
+        self.assertEqual(calls, ["other"])
+        self.assertTrue(app.capabilities()["plugins"]["rewrite"]["enabled"])
+        for result in (first, second):
+            self.assertEqual(result.status, "evidence_preview")
+            trace = app.get_trace("shop", result.trace_id)
+            names = {stage["name"] for stage in trace["stages"]}
+            self.assertIn("authorized_chunks", names)
+            self.assertIn("verifier", names)
+        trace = app.get_trace("shop", first.trace_id)
+        rewrite = next(item for item in trace["stages"] if item["name"] == "rewrite")
+        self.assertEqual((rewrite["status"], rewrite["reason"]), ("skipped", "user_preference"))
+
     async def test_evidence_preserves_source_heading_context_after_restart(self):
         self.publish(content="# 部署验收用虚构售后政策\n\n## 质保与材料\n申请质保必须提供购买凭证。")
         app = RagApplication(self.settings)

@@ -49,6 +49,20 @@ class ConversationAPITests(unittest.TestCase):
         return httpx.Response(200, json={"choices": [{"finish_reason": "stop",
                               "message": {"content": json.dumps(reply)}}]})
 
+    def test_http_preferences_cannot_modify_mandatory_steps_or_enable_plugins(self):
+        for endpoint in ("/query", "/query/stream"):
+            for settings in ({"skip_query_steps": ["verifier"]}, {"skip_query_steps": ["lexical"]},
+                             {"skip_query_steps": ["authorized_chunks"]}, {"plugins": {"hyde": "cloud"}},
+                             {"top_k": 21}):
+                result = self.owner.post(endpoint, json={"question": "CATALOG314", **settings})
+                self.assertEqual(result.status_code, 422, result.text)
+        self.assertFalse(self.calls)
+        response = self.owner.post("/query", json={"question": "CATALOG314", "skip_query_steps": ["hyde"]})
+        self.assertEqual(response.status_code, 200, response.text)
+        trace = self.owner.get("/traces/" + response.json()["trace_id"]).json()
+        hyde = next(item for item in trace["stages"] if item["name"] == "hyde")
+        self.assertEqual(hyde["status"], "disabled")
+
     def client(self):
         client = TestClient(self.api)
         self.addCleanup(client.close)

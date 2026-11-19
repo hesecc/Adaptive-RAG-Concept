@@ -129,6 +129,7 @@ class QueryPipeline:
             "trace_id": uuid4().hex, "tenant_id": request.access.tenant_id,
             "subject_id": request.access.subject_id, "started_at": datetime.now(timezone.utc).isoformat(),
             "question": request.question, "sku": request.sku, "history_turns": len(request.history),
+            "retrieval_preferences": {"top_k": request.top_k, "skip_query_steps": list(request.skip_query_steps)},
             "history_used": False, "persist_conversation": request.persist_conversation, "generation": None, "stages": [],
             "plugins": self.descriptions, "model_calls": 0, "network_calls": 0,
             "retrieved_chunk_ids": [], "retry_count": 0,
@@ -289,6 +290,9 @@ class QueryPipeline:
             trace["reserved_repair_lanes"] = reserve
             for role in ("rewrite", "multi_query", "hyde"):
                 if self.descriptions[role]["enabled"]:
+                    if role in request.skip_query_steps:
+                        disabled(role, reason="user_preference")
+                        continue
                     if variant_budget <= len(variants):
                         disabled(role, reason="retrieval_lane_budget")
                         continue

@@ -19,6 +19,7 @@ const sse = events => new Response(events.map(([name, data]) => 'event: ' + name
 
 class Element {
   constructor(tag) { this.tag = tag; this.children = []; this.events = {}; this.value = ''; this.dataset = {}; }
+  style = {};
   classList = {toggle() {}, remove() {}};
   get textContent() { return this.children.map(n => n.textContent ?? n).join(''); }
   set textContent(value) { this.children = [String(value)]; }
@@ -30,6 +31,7 @@ class Element {
   fire(type) { return this.events[type]({preventDefault() {}}); }
   focus() {} reset() {} showModal() { this.open = true; } close() { this.open = false; }
   buttons() { return this.children.flatMap(n => n.tag === 'button' ? [n] : n.buttons?.() || []); }
+  tags(tag) { return this.children.flatMap(n => n.tag === tag ? [n, ...n.tags(tag)] : n.tags?.(tag) || []); }
 }
 
 const alice = {subject_id: 'alice', tenant_id: 'home'};
@@ -44,7 +46,7 @@ async function workbench(route, bookmark = null, owner = alice, browser = {}) {
   const get = key => { assert.ok(nodes.has(key), 'missing element ' + key); return nodes.get(key); };
   const document = {querySelector: get, querySelectorAll: sel => sel.includes('#conversation-list button') ?
     [...get('#conversation-list').buttons(), ...get('#chat-history').buttons()] : [],
-    addEventListener() {}, createElement: tag => new Element(tag), createTextNode: String};
+    addEventListener() {}, createElement: tag => new Element(tag), createElementNS: (_, tag) => new Element(tag), createTextNode: String};
   const history = {state: {ragConversation: bookmark}, replaceState(value) { this.state = value; }};
   const calls = [];
   const domains = {text: () => '', load: async () => {}, render() {}};
@@ -63,6 +65,7 @@ async function workbench(route, bookmark = null, owner = alice, browser = {}) {
   Object.assign(context, context.window);
   context.window = context;
   if (browser.useDomainControls) vm.runInNewContext(fs.readFileSync(path.join(staticDir, 'domain-controls.js'), 'utf8'), context);
+  vm.runInNewContext(fs.readFileSync(path.join(staticDir, 'answer-visuals.js'), 'utf8'), context);
   vm.runInNewContext(script, context);
   await flush();
   const submit = async text => { get('#question').value = text; await get('#query-form').fire('submit'); await flush(); };
@@ -105,6 +108,100 @@ test('claims appear once in answer order and each inline source opens its own au
     assert.ok(get('#source-content').textContent.includes('authorized original: doc-' + expected));
     get('#source-dialog').close();
   }
+});
+
+test('formats claims safely and charts only complete cited source data', async () => {
+  const table = '| 日期 | 数量 |\n|---|---|\n|2026-01|12|\n|2026-02|18|\n|2026-04|25|';
+  const result = {...citedResult, claims: [{text: '## 摘要\n\n- **增长**\n- <img src=x onerror=alert(1)>', evidence_ids: [sourceA]}],
+    evidence: [{...excerpts[0], text: table}, {...excerpts[1], text: table.replace('数量', '未引用数据')}]};
+  const {get, submit} = await citedWorkbench(result);
+  await submit('数量变化？');
+  const panel = get('#panel-answer');
+  assert.equal(panel.tags('h4')[0].textContent, '摘要');
+  assert.equal(panel.tags('strong')[0].textContent, '增长');
+  assert.equal(panel.tags('img').length, 0);
+  assert.ok(panel.textContent.includes('<img src=x onerror=alert(1)>'));
+  assert.equal(panel.tags('svg').length, 1);
+  assert.equal(panel.tags('td').at(-1).textContent, '25');
+  assert.ok(!panel.textContent.includes('未引用数据'));
+  assert.equal(panel.tags('figure')[0].buttons()[0].textContent, '来源 1');
+});
+
+async function previewCharts(text, {status = 'evidence_preview', truncated = false, locator} = {}) {
+  const result = {...citedResult, status, answer: null, claims: [], evidence: [{...excerpts[0], text, truncated, locator}]};
+  const {get, submit} = await citedWorkbench(result);
+  await submit('看原表');
+  return get('#panel-answer').tags('figure');
+}
+test('signed bars use a common zero baseline and retain the exact source values', async () => {
+  const [fig] = await previewCharts('| 地区 | 净增长 |\n|---|---|\n|北|-10|\n|东|0|\n|南|30|');
+  const tracks = fig.tags('div').filter(n => n.className === 'answer-bar-track');
+  assert.deepEqual(tracks.map(t => t.children.map(c => c.style.insetInlineStart)), [['0%', '25%'], ['25%', '25%'], ['25%', '25%']]);
+  assert.deepEqual(tracks.map(t => t.children[0].style.inlineSize), ['25%', '0%', '75%']);
+  assert.deepEqual(fig.tags('strong').map(n => n.textContent), ['-10', '0', '30']);
+});
+test('wide calendar table: two separate measures, time-scaled x axis, unmodified source order', async () => {
+  const figures = await previewCharts('|月份|出货量|准时率|\n|---|---|---|\n|2026-04|34|80%|\n|2026-01|11|75%|\n|2026-02|12|70%|');
+  assert.deepEqual(figures.map(f => f.tags('figcaption')[0].textContent), ['出货量 · 趋势', '准时率 · 趋势']);
+  for (const f of figures) {
+    const xs = f.tags('circle').map(n => Number(n.cx));
+    assert.ok(Math.abs((xs[1] - xs[0]) / (xs[2] - xs[0]) - 31 / 90) < .00001);
+    assert.deepEqual(f.tags('td').slice(0, 3).map(n => n.textContent), ['2026-04', '34', '80%']);
+  }
+});
+test('flow requires consecutive declared steps, never infers them from prose', async () => {
+  const table = '|步骤|操作|\n|---|---|\n|1|核对资料|\n|2|提交申请|\n|3|复核签字|';
+  const [flow] = await previewCharts(table);
+  assert.deepEqual(flow.tags('li').map(n => n.textContent), ['核对资料', '提交申请', '复核签字']);
+  assert.equal((await previewCharts(table.replace('|2|', '|4|'))).length, 0);
+});
+test('does not visualize mixed units, identifier columns, malformed, fenced or insufficient evidence', async () => {
+  const t = '|地区|指标|\n|---|---|\n|北|10|\n|东|20|\n|南|30|';
+  for (const bad of [t.replace('10', '10%'), t.replace('指标', '产品编号'), t.replace('20', '020'),
+      t + '\n|西|40', t + '\n|其\\|他|40|', '```md\n' + t + '\n```']) {
+    assert.equal((await previewCharts(bad)).length, 0, bad);
+  }
+  for (const flags of [{truncated: true}, {locator: 'lines:2-21;structure_fragment:table;chars:0-128'},
+      {status: 'insufficient'}, {status: 'empty'}])
+    assert.equal((await previewCharts(t, flags)).length, 0);
+});
+test('quarters with explicit years form a timeline, ambiguous periods do not', async () => {
+  const t = '|季度|营收|\n|---|---|\n|2026年第一季度|10|\n|2026-Q2|20|\n|2027Q1|30|';
+  assert.equal((await previewCharts(t))[0].tags('svg').length, 1);
+  assert.equal((await previewCharts(t.replace('2027Q1', '第一季度'))).length, 0);
+});
+
+test('personal retrieval settings persist separately by tenant and stable subject', async () => {
+  const storage = new Map(), requests = [];
+  const browser = {localStorage: {getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value)}};
+  const route = (url, options) => {
+    if (url.startsWith('/conversations?')) return page([]);
+    assert.equal(url, '/query/stream'); requests.push(JSON.parse(options.body));
+    return sse([['result', {result: trace('run').final_result, trace: trace('run') }]]);
+  };
+  const owner = {...alice, capabilities: {plugins: {rewrite: {enabled: true}, hyde: {enabled: false}}}};
+  const first = await workbench(route, null, owner, browser);
+  assert.equal(first.get('#query-hyde').disabled, true);
+  first.get('#top-k').value = '10'; first.get('#top-k').fire('change');
+  first.get('#sku').value = 'sku-1'; first.get('#sku').fire('change');
+  first.get('#query-rewrite').checked = false; first.get('#query-rewrite').fire('change');
+  for (const other of [{...owner, subject_id: 'bob'}, {...owner, tenant_id: 'other'}]) {
+    const tab = await workbench(route, null, other, browser);
+    await tab.submit('unaffected');
+    assert.equal(requests.at(-1).top_k, 5);
+    assert.equal(tab.get('#sku').value, '');
+    assert.equal(requests.at(-1).skip_query_steps, undefined);
+  }
+  const restored = await workbench(route, null, owner, browser);
+  restored.get('#new-chat').fire('click');
+  await restored.submit('personal');
+  assert.equal(requests.at(-1).top_k, 10);
+  assert.equal(requests.at(-1).sku, 'sku-1');
+  assert.deepEqual(requests.at(-1).skip_query_steps, ['rewrite']);
+  restored.get('#query-options-reset').fire('click');
+  await restored.submit('reset');
+  assert.equal(requests.at(-1).top_k, 5);
+  assert.equal(requests.at(-1).skip_query_steps, undefined);
 });
 
 test('legacy answers convert only complete line-end evidence tokens, preserving literal brackets and math', async () => {

@@ -1332,6 +1332,74 @@ input[type=checkbox]:disabled {
   font-weight: 550;
 }
 
+.query-options {
+  margin: 12px 0 0;
+  padding: 9px 0 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+  min-inline-size: 0;
+}
+.query-options legend { padding-inline-end: 8px; font-size: 13px; color: var(--fg2); }
+.query-options label { display: flex; align-items: center; gap: 8px; font-size: 13px; min-height: 30px; }
+.query-options label small { margin-inline-start: auto; color: var(--fg3); }
+.query-options-note { margin: 8px 0; font-size: 12px; color: var(--fg3); line-height: 1.55; }
+
+.answer-prose > * { margin-block: 0; }
+.answer-prose > * + * { margin-block-start: .65em; }
+.answer-prose h4 { font-size: 1.08em; line-height: 1.4; font-weight: 700; }
+.answer-prose :is(ol, ul) { padding-inline-start: 1.6em; }
+.answer-prose li + li { margin-block-start: .25em; }
+.answer-prose code { font: .9em/1.6 var(--mono); background: var(--paper-2); }
+.answer-prose pre {
+  padding: 10px 12px;
+  overflow-x: auto;
+  background: var(--paper-2);
+  border-inline-start: 2px solid var(--rule2);
+  white-space: pre;
+  overflow-wrap: normal;
+}
+.answer-citations { display: flex; flex-wrap: wrap; gap: 6px; margin-block-start: 3px; }
+.answer-citations .citation-button { margin-inline-start: 0; }
+.answer-visuals { border-block-start: 1px solid var(--rule); margin-block-start: 18px; padding-block-start: 12px; }
+.answer-visuals h3 { font-size: 15px; }
+.answer-viz { margin: 8px 0 0; padding-block: 8px; min-width: 0; }
+.answer-viz + .answer-viz { border-block-start: 1px solid var(--rule); }
+.answer-viz figcaption { font-size: 14px; font-weight: 650; margin-block-end: 6px; overflow-wrap: anywhere; }
+.answer-viz details { margin-block: 8px; font-size: 13px; }
+.answer-viz summary { cursor: pointer; width: fit-content; color: var(--ink2); }
+.answer-table-scroll { overflow-x: auto; max-inline-size: 100%; }
+.answer-table-scroll table { border-collapse: collapse; width: 100%; font-size: 13px; line-height: 1.5; white-space: normal; }
+.answer-table-scroll :is(td, th) { text-align: start; padding: 7px 9px; border-bottom: 1px solid var(--rule); }
+.answer-table-scroll th { background: var(--paper-2); }
+.answer-trend-plot { display: grid; grid-template-columns: fit-content(40%) minmax(0, 1fr); gap: 3px 8px; font: 12px/1.25 var(--ui); color: var(--ink2); font-variant-numeric: tabular-nums; }
+.answer-trend { display: block; width: 100%; height: 120px; color: #176558; }
+.answer-trend-ticks, .answer-trend-dates { display: flex; justify-content: space-between; gap: 6px; overflow-wrap: anywhere; }
+.answer-trend-ticks { flex-direction: column; text-align: end; }
+.answer-trend-ticks > :only-child { margin-block: auto; }
+.answer-trend-dates { grid-column: 2; }
+.answer-trend-dates > :last-child { text-align: end; }
+.answer-gridline { stroke: var(--rule2); stroke-dasharray: 4; }
+.answer-trend polyline { fill: none; stroke: currentColor; stroke-width: 2.5; }
+.answer-trend circle { fill: currentColor; }
+.answer-bars, .answer-flow { margin: 0; padding: 0; list-style: none; }
+.answer-bars li { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(30px, 3fr) minmax(0, 1fr); gap: 8px; align-items: center; min-height: 28px; font-size: 13px; overflow-wrap: anywhere; }
+.answer-bars strong { text-align: end; font-variant-numeric: tabular-nums; }
+.answer-bar-track { height: 10px; position: relative; background: var(--paper-2); }
+.answer-bar-track span { position: absolute; height: 100%; background: #176558; }
+.answer-bar-track i { position: absolute; border-inline-start: 1px solid var(--ink2); height: 100%; }
+.answer-flow { counter-reset: answer-step; display: grid; gap: 11px; }
+.answer-flow li {
+  counter-increment: answer-step;
+  position: relative;
+  padding: 6px 9px 6px 36px;
+  background: var(--paper-2);
+  border-inline-start: 2px solid #176558;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.answer-flow li::before { content: counter(answer-step); position: absolute; inset-inline-start: 11px; font-weight: 650; }
+.answer-flow li:not(:last-child)::after { content: ""; position: absolute; inset-inline-start: 15px; inset-block-start: 100%; height: 11px; border-inline-start: 1px solid var(--ink3); }
+
 .citation-button {
   display: inline-block;
   margin-inline-start: .45em;

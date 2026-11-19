@@ -1,5 +1,7 @@
 """Strict request bodies shared by the HTTP adapters."""
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
@@ -33,6 +35,7 @@ class QueryInput(Input):
     generation: str | None = None
     top_k: int = Field(default=5, ge=1, le=20)
     history: list[str] = Field(default_factory=list, max_length=6)
+    skip_query_steps: list[Literal["rewrite", "multi_query", "hyde"]] = Field(default_factory=list, max_length=3)
 
     @model_validator(mode="after")
     def server_history_only(self):

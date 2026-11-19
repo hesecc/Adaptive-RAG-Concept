@@ -12,6 +12,7 @@
     <link rel="icon" href="/static/mark.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/static/app.css" />
     <script src="/static/domain-controls.js" defer></script>
+    <script src="/static/answer-visuals.js" defer></script>
     <script type="module" src="/static/app.js">
     </script>
   </head>
@@ -232,6 +233,14 @@
                   <input id="sku" maxlength="128" placeholder="商品范围" />
                 </label>
               </div>
+              <fieldset class="query-options">
+                <legend>可选检索步骤</legend>
+                <label><input type="checkbox" id="query-rewrite" disabled /> 查询改写 <small id="query-rewrite-state"></small></label>
+                <label><input type="checkbox" id="query-multi_query" disabled /> 多路扩展 <small id="query-multi_query-state"></small></label>
+                <label><input type="checkbox" id="query-hyde" disabled /> HyDE <small id="query-hyde-state"></small></label>
+              </fieldset>
+              <p class="query-options-note">仅当前账号、当前浏览器。<br />权限、基础检索、证据核验及资源上限由服务端锁定。</p>
+              <button id="query-options-reset" class="secondary-button" type="button">恢复默认</button>
             </details>
             <details class="capability-card">
               <summary>

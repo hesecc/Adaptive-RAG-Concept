@@ -240,6 +240,9 @@ class Snapshot:
     created_at: str
 
 
+OPTIONAL_QUERY_STEPS = ("rewrite", "multi_query", "hyde")
+
+
 @dataclass(frozen=True)
 class QueryRequest:
     access: AccessContext
@@ -251,6 +254,7 @@ class QueryRequest:
     persist_conversation: bool = False
     conversation_id: str | None = None
     history_trace_ids: tuple[str, ...] = ()
+    skip_query_steps: tuple[str, ...] = ()
 
     def __post_init__(self):
         if not isinstance(self.access, AccessContext):
@@ -258,6 +262,10 @@ class QueryRequest:
         nonempty(self.question, "question", 4000)
         if isinstance(self.top_k, bool) or not isinstance(self.top_k, int) or not 1 <= self.top_k <= 20:
             raise ValidationError("top_k must be an integer between 1 and 20")
+        if (not isinstance(self.skip_query_steps, tuple) or len(self.skip_query_steps) > len(OPTIONAL_QUERY_STEPS)
+                or any(step not in OPTIONAL_QUERY_STEPS for step in self.skip_query_steps)
+                or len(set(self.skip_query_steps)) != len(self.skip_query_steps)):
+            raise ValidationError("only optional query preprocessing steps may be skipped")
         if self.sku is not None:
             identifier(self.sku, "sku")
         if self.generation is not None:

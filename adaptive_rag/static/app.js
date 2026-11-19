@@ -367,6 +367,48 @@ async function api(path, options = {}, owner = state.user) {
   return response;
 }
 
+const optionalQuerySteps = ["rewrite", "multi_query", "hyde"];
+const topKChoices = [3, 5, 10, 20];
+const skuPattern = /^[\p{L}\p{N}_.:-]{1,128}$/u;
+function preferenceKey(user) {
+  return "rag.retrieval.v1:" + JSON.stringify([user.tenant_id, user.subject_id]);
+}
+function restoreQueryPreferences(reset = false) {
+  let value;
+  if (state.user && !reset) {
+    try { value = JSON.parse(localStorage.getItem(preferenceKey(state.user))); } catch {}
+  }
+  $("#top-k").value = String(topKChoices.includes(value?.top_k) ? value.top_k : 5);
+  $("#sku").value = typeof value?.sku === "string" && skuPattern.test(value.sku) ? value.sku : "";
+  for (const step of optionalQuerySteps) {
+    const enabled = state.capabilities?.plugins?.[step]?.enabled === true;
+    const input = $("#query-" + step);
+    input.disabled = !enabled;
+    input.checked = enabled && !(Array.isArray(value?.skip_query_steps) && value.skip_query_steps.includes(step));
+    $("#query-" + step + "-state").textContent = enabled ? "" : "服务端未启用";
+  }
+}
+function queryPreferences() {
+  const selection = Number($("#top-k").value);
+  return { top_k: topKChoices.includes(selection) ? selection : 5,
+    skip_query_steps: optionalQuerySteps.filter(step =>
+      state.capabilities?.plugins?.[step]?.enabled === true && !$("#query-" + step).checked) };
+}
+function saveQueryPreferences() {
+  if (!state.user) return;
+  const sku = $("#sku").value.trim();
+  try {
+    localStorage.setItem(preferenceKey(state.user), JSON.stringify({ ...queryPreferences(),
+      sku: skuPattern.test(sku) ? sku : "" }));
+  } catch {}
+}
+for (const id of ["top-k", "sku", ...optionalQuerySteps.map(step => "query-" + step)])
+  $("#" + id).addEventListener("change", saveQueryPreferences);
+$("#query-options-reset").addEventListener("click", () => {
+  restoreQueryPreferences(true);
+  saveQueryPreferences();
+});
+
 function showLogin(message = "") {
   state.sessionEpoch++;
   state.usersEpoch++;
@@ -378,6 +420,7 @@ function showLogin(message = "") {
   state.connected = false;
   state.user = null;
   state.capabilities = null;
+  restoreQueryPreferences(true);
   clearData();
   $$("dialog[open]").forEach((node) => node.close());
   $("#users-list").replaceChildren();
@@ -408,6 +451,7 @@ function acceptSession(session) {
   state.user = session;
   state.connected = true;
   state.capabilities = session.capabilities;
+  restoreQueryPreferences();
   $("#account-name").textContent = session.username || session.subject_id;
   $(".account-avatar").textContent = (session.username || "U").slice(0, 1).toUpperCase();
   $("#account-role").textContent = session.admin ? "管理员" : "成员";
@@ -784,7 +828,6 @@ function clearData() {
   $("#run-button").disabled = false;
   $("#chat-history").replaceChildren();
   $("#question").value = "";
-  $("#sku").value = "";
   $("#char-count").textContent = "0 / 4000";
   $("#run-status").textContent = "待运行";
   $("#timeline-heading").textContent = "准备就绪，等待一个好问题";
@@ -820,7 +863,7 @@ $("#query-form").addEventListener("submit", async (event) => {
     return;
   }
   const sku = $("#sku").value.trim();
-  if (sku && !/^[\p{L}\p{N}_.:-]{1,128}$/u.test(sku)) {
+  if (sku && !skuPattern.test(sku)) {
     toast("SKU 仅支持字母、数字、下划线、点、冒号和连字符。");
     return;
   }
@@ -840,6 +883,8 @@ $("#query-form").addEventListener("submit", async (event) => {
   const current = () =>
     epoch === state.viewEpoch && session === state.sessionEpoch;
   let terminal = false;
+  const { top_k, skip_query_steps } = queryPreferences();
+  saveQueryPreferences();
   try {
     const response = await api("/query/stream", {
       method: "POST",
@@ -849,7 +894,8 @@ $("#query-form").addEventListener("submit", async (event) => {
       },
       body: JSON.stringify({
         question,
-        top_k: Number($("#top-k").value),
+        top_k,
+        ...(skip_query_steps.length ? { skip_query_steps } : {}),
         persist_conversation: true,
         ...(state.conversationId ? { conversation_id: state.conversationId } : {}),
         ...(sku ? { sku } : {}),
@@ -1243,7 +1289,7 @@ function renderInspector(index) {
       el(
         "p",
         "output-summary",
-        `${["disabled", "skipped"].includes(stage.status) ? "跳过原因" : "处理原因"}：${stage.reason}`,
+        `${["disabled", "skipped"].includes(stage.status) ? "跳过原因" : "处理原因"}：${stage.reason === "user_preference" ? "已在个人检索设置中关闭" : stage.reason}`,
       ),
     );
   const section = el("div", "inspector-section");
@@ -1318,31 +1364,47 @@ function renderStageOutput(target, output) {
 // Compact history has only the exported answer string. Match the suffix emitted
 // by make_evidence + CloudGenerator, never arbitrary numbers or bracketed text.
 function legacyParagraphs(answer) {
-  return answer.split(/\r?\n/).map(line => {
+  const paragraphs = [];
+  let lines = [];
+  for (const line of answer.split(/\r?\n/)) {
     const suffix = line.match(/(?:[ \t]+\[[0-9a-f]{64}\.\d+\.[0-9a-f]{16}\])+[ \t]*$/);
-    return suffix ? {text: line.slice(0, suffix.index), evidence_ids: [...suffix[0].matchAll(/\[([^\]]+)\]/g)].map(m => m[1])}
-      : {text: line, evidence_ids: []};
-  }).filter(part => part.text.trim());
+    lines.push(suffix ? line.slice(0, suffix.index) : line);
+    if (suffix) {
+      paragraphs.push({text: lines.join("\n"), evidence_ids: [...suffix[0].matchAll(/\[([^\]]+)\]/g)].map(m => m[1])});
+      lines = [];
+    }
+  }
+  if (lines.some(line => line.trim())) paragraphs.push({text: lines.join("\n"), evidence_ids: []});
+  return paragraphs;
+}
+
+function answerCitation(item, position) {
+  const button = el("button", "citation-button", "来源 " + position);
+  button.type = "button";
+  button.title = [item.document_id, ...(item.heading_path || [])].filter(Boolean).join(" / ");
+  button.setAttribute("aria-label", "查看来源 " + position + " 的原文");
+  button.addEventListener("click", () => showSource(item));
+  return button;
 }
 
 function answerReader(result) {
   const reader = el("div", "answer-reader");
   const evidence = new Map((result.evidence || []).map((item, i) => [item.evidence_id, {item, number: i + 1}]));
-  const paragraphs = result.claims?.length ? result.claims : legacyParagraphs(result.answer);
+  const paragraphs = result.claims?.length ? result.claims : legacyParagraphs(result.answer || "");
   for (const claim of paragraphs) {
-    const paragraph = el("p", "answer-paragraph", claim.text);
+    const paragraph = el("div", "answer-paragraph");
+    const visuals = globalThis.RagAnswerVisuals;
+    paragraph.append(visuals?.prose(claim.text) || el("p", "", claim.text));
+    const citations = el("div", "answer-citations");
     for (const id of new Set(claim.evidence_ids || [])) {
       const source = evidence.get(id);
-      if (!source) continue;
-      const button = el("button", "citation-button", "来源 " + source.number);
-      button.type = "button";
-      button.title = [source.item.document_id, ...(source.item.heading_path || [])].filter(Boolean).join(" / ");
-      button.setAttribute("aria-label", "查看来源 " + source.number + " 的原文");
-      button.addEventListener("click", () => showSource(source.item));
-      paragraph.append(button);
+      if (source) citations.append(answerCitation(source.item, source.number));
     }
+    if (citations.childElementCount) paragraph.append(citations);
     reader.append(paragraph);
   }
+  const charts = globalThis.RagAnswerVisuals?.charts(result, answerCitation);
+  if (charts) reader.append(charts);
   return reader;
 }
 
@@ -1375,6 +1437,7 @@ function renderAnswer() {
         noAnswerNotes[result.status] || "本次没有返回可确认的最终答案。",
       ),
     );
+  if (!result.answer && result.status === "evidence_preview") target.append(answerReader(result));
   // Figures of the passages the answer rests on. A closest-match list ("insufficient") is not an answer,
   // so its figures stay on the evidence cards.
   if (["answered", "partial", "evidence_preview"].includes(result.status)) {
@@ -1833,7 +1896,9 @@ function renderChatHistory() {
     label.append(el("span", "assistant-mark", "A"), document.createTextNode("Adaptive RAG"));
     const selected = message.trace_id === state.traceId;
     const result = selected && state.result ? state.result : message;
-    answer.append(label, result.answer ? answerReader(result) : el("p", "history-answer", result.message || noAnswerNotes[result.status] || "本轮没有返回回答。"));
+    answer.append(label);
+    if (!result.answer) answer.append(el("p", "history-answer", result.message || noAnswerNotes[result.status] || "本轮没有返回回答。"));
+    if (result.answer || (selected && result.status === "evidence_preview")) answer.append(answerReader(result));
     const footer = el("div", "history-caption");
     footer.append(el("span", "", statuses[message.status] || message.status));
     const button = el("button", "", selected ? "正在查看本轮流程" : "查看本轮流程 →");

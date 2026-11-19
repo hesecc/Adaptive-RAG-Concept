@@ -20,6 +20,7 @@ from .domain import (
 )
 from .figures import cut_before_figure, find_figures
 from .relevance import RelevanceGate
+from .intent import Intent, TERMINAL, exact_identifier, matches_identifier, product_code_hint
 from .retrieval import tokenize
 from .cloud import check_history_access, start_usage, usage_snapshot, reset_usage
 
@@ -50,15 +51,37 @@ class RulePlanner:
     def __init__(self, max_subqueries=3):
         self.max_subqueries = max_subqueries
 
+    @staticmethod
+    def guard_route(question: str, has_sku: bool) -> str | None:
+        text = question.strip()
+        if re.fullmatch(r"(?:你好|您好|hi|hello|谢谢|thanks)[!！。 .]*", text, re.I):
+            return "direct"
+        if re.fullmatch(r"(?:请)?(?:帮我)?(?:转(?:接)?人工(?:客服)?|联系人工客服)[。！! .]*", text):
+            return "handoff"
+        # A documented procedure is not a request to execute a live lookup.
+        live = re.search(r"实时库存|当前库存|订单状态|实时价格|物流状态|(?:包裹|快递|订单|物流)(?:现在|目前|已经|到底)?(?:到哪|发货了[吗没])|current stock|order status|where is my (?:package|order)", text, re.I)
+        policy = re.search(r"有哪些|的含义|是什么意思|字段说明|定义|操作流程|操作指南|如何查询|怎么查询|how (?:do i|to) (?:check|track)", text, re.I)
+        specific = re.search(r"订单号|[A-Za-z]*\d{5,}", text)
+        if live and (not policy or specific):
+            return "realtime"
+        if (not has_sku and not product_code_hint(text)
+                and re.search(r"这款|该款|这个商品|这件商品|this product|this item", text, re.I)):
+            return "clarify"
+        return None
+
+    @staticmethod
+    def explicit_parts(question: str) -> tuple[str, ...]:
+        return tuple(part.strip() for part in re.split(r"[？?；;\n]+", question) if part.strip())
+
     async def plan(self, request: QueryRequest) -> Plan:
         text = request.question.strip()
-        if re.fullmatch(r"(?:你好|您好|hi|hello|谢谢|thanks)[!！。 .]*", text, re.I):
-            return Plan((), request.sku, "capability_unavailable", "无模型模式不生成闲聊回复。")
-        if re.search(r"实时库存|当前库存|订单状态|实时价格|物流状态|current stock|order status", text, re.I):
-            return Plan((), request.sku, "capability_unavailable", "此问题需要尚未接入的实时业务工具。")
-        if request.sku is None and re.search(r"这款|该款|这个商品|这件商品|this product|this item", text, re.I):
-            return Plan((), None, "clarify", "请通过 sku 参数明确商品，再检索商品知识。")
-        parts = tuple(part.strip() for part in re.split(r"[？?；;\n]+", text) if part.strip())
+        guarded = self.guard_route(text, request.sku is not None)
+        if guarded:
+            if guarded == "direct":
+                return Plan((), request.sku, "capability_unavailable", "无模型模式不生成闲聊回复。")
+            action, message = TERMINAL[guarded]
+            return Plan((), request.sku, action, message)
+        parts = self.explicit_parts(text)
         if len(parts) > self.max_subqueries:
             raise ValidationError(f"question exceeds {self.max_subqueries} explicit subquestions; split the request")
         return Plan(tuple(SubQuery(f"q{i}", part) for i, part in enumerate(parts or (text,), 1)), request.sku)
@@ -237,18 +260,29 @@ class QueryPipeline:
             trace["final_result"] = asdict(value)
             return value
 
+        intent = None  # Request-local. Never mutate the registry or the user's preferences.
+
         async def decision(checkpoint, missing=()):
+            nonlocal intent
             def checked(value):
                 if not isinstance(value, dict) or value.get("action") not in {"continue", "retry", "stop"}:
                     raise ValidationError("decision plugin returned an invalid action")
                 return value
             value = await stage(f"decision.{checkpoint}", self.c["decision"].decide, {
+                **({"question": request.question, "has_history": bool(request.history), "has_sku": request.sku is not None}
+                   if checkpoint == "preflight" and self.descriptions["decision"]["plugin"] == "deepseek" else {}),
                 "checkpoint": checkpoint, "missing_query_ids": tuple(missing),
                 "gap_enabled": self.descriptions["gap"]["enabled"],
                 "retry_count": trace["retry_count"],
             }, validate=checked)
-            trace["decisions"].append({"checkpoint": checkpoint, "action": value["action"]})
-            output(f"decision.{checkpoint}", {"checkpoint": checkpoint, "action": value["action"],
+            detail = {"checkpoint": checkpoint, "action": value["action"]}
+            if checkpoint == "preflight" and isinstance(value.get("intent"), Intent):
+                intent = value["intent"]
+                detail.update(route=intent.route, selected_steps=list(intent.steps), source=intent.source)
+                if intent.reason:
+                    detail["fallback_reason"] = intent.reason
+            trace["decisions"].append(detail)
+            output(f"decision.{checkpoint}", {**detail,
                    "missing_query_ids": list(missing), "retry_count": trace["retry_count"]})
             return value["action"]
 
@@ -266,16 +300,30 @@ class QueryPipeline:
             snapshot = await resolve_snapshot() if request.generation is not None else None
             if await decision("preflight") == "stop":
                 return result("policy_stopped", "规则策略停止本次查询。")
+            if intent and intent.route in TERMINAL:
+                return result(*TERMINAL[intent.route])
+
+            identifier_filter = None
+            if intent and intent.route == "exact":
+                identifier_filter = exact_identifier(request.question, request.sku)
+                if not identifier_filter:
+                    return result("clarify", "请提供一个明确的商品型号或 SKU，再查找对应资料。")
+
             def checked_plan(value):
                 if not isinstance(value, Plan) or value.sku != request.sku or value.action not in {"retrieve", "clarify", "capability_unavailable"}:
                     raise ValidationError("planner returned an invalid plan or changed trusted SKU")
                 return replace(value, queries=self._queries(value.queries)) if value.action == "retrieve" else value
-            plan = await stage("planner", self.c["planner"].plan, request, validate=checked_plan)
+            planner = self.c["planner"]
+            if intent and ("decompose" not in intent.steps or len(RulePlanner.explicit_parts(request.question)) > 1):
+                # Never let a semantic planner merge or silently drop an already explicit obligation.
+                planner = RulePlanner(self.settings.max_subqueries)
+            plan = await stage("planner", planner.plan, request, validate=checked_plan)
             if plan.action != "retrieve":
                 output("planner", {"action": plan.action, "queries": []})
                 return result(plan.action, plan.message)
             queries = plan.queries
-            output("planner", {"action": plan.action, "queries": [asdict(q) for q in queries]})
+            output("planner", {"action": plan.action, "queries": [asdict(q) for q in queries],
+                               "implementation": "rules" if isinstance(planner, RulePlanner) else self.descriptions["planner"]["plugin"]})
             original = {q.query_id: q for q in queries}
             trace["subqueries"] = [asdict(q) for q in queries]
             variants = queries
@@ -293,6 +341,9 @@ class QueryPipeline:
                     if role in request.skip_query_steps:
                         disabled(role, reason="user_preference")
                         continue
+                    if intent and role not in intent.steps:
+                        disabled(role, reason="intent_not_selected")
+                        continue
                     if variant_budget <= len(variants):
                         disabled(role, reason="retrieval_lane_budget")
                         continue
@@ -308,9 +359,15 @@ class QueryPipeline:
             if snapshot is None:
                 return result("no_index", "当前租户尚无已发布知识版本。")
             chunks = await stage("authorized_chunks", list_chunks, snapshot, request.access, request.sku)
+            authorized_count = len(chunks)
+            if identifier_filter is not None:
+                chunks = tuple(chunk for chunk in chunks if matches_identifier(chunk, identifier_filter))
             allowed = {chunk.chunk_id: chunk for chunk in chunks}
-            trace["authorized_chunk_count"] = len(chunks)
-            output("authorized_chunks", {"authorized_chunk_count": len(chunks), "sku": request.sku})
+            trace["authorized_chunk_count"] = authorized_count
+            output("authorized_chunks", {"authorized_chunk_count": authorized_count, "sku": request.sku,
+                   **({"identifier_match_count": len(chunks)} if identifier_filter is not None else {})})
+            if identifier_filter is not None and not chunks:
+                return result("empty", "在你有权访问的资料中，未找到与该型号或 SKU 完整匹配的内容。", missing=tuple(original))
             for role in ("dense",):
                 if not self.descriptions[role]["enabled"]:
                     disabled(role)

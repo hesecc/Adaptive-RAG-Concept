@@ -1,6 +1,6 @@
 # 可插拔基座实施契约
 
-默认配置保持 `model_free`：不发起模型请求，输出 `evidence_preview`、`answer=null`、`model_calls=0`。云 Embedding、Reranker、Generator，查询预处理、语义质量检查及 PDF 本地/MinerU 解析均通过显式入口选择。Laya 决策模型继续只保留 `DecisionPolicy` 接口，当前实现为规则，不下载或部署模型。
+默认配置保持 `model_free`：不发起模型请求，输出 `evidence_preview`、`answer=null`、`model_calls=0`。云 Embedding、Reranker、Generator，查询预处理、语义质量检查及 PDF 本地/MinerU 解析均通过显式入口选择。`DecisionPolicy` 默认使用本地规则，可显式选用 DeepSeek 官方 API 作意图判断；不下载或部署 Laya。
 
 核心使用Python 3.11+，本地SQLite与内容寻址文件对象存储。HTTP使用FastAPI，CLI和HTTP调用同一应用接口。三个云模型已通过角色适配器接入；MySQL/Milvus/远程对象存储仍需后续实现相应适配器。当前 dense 为授权候选的精确余弦检索与 SQLite 派生向量缓存，不是生产 ANN 索引。
 
@@ -37,7 +37,7 @@ Settings位于adaptive_rag/config.py，可Settings(data_dir=Path(...))，load_se
 
 `Evidence.heading_path` 为可选的源标题路径，默认空元组；父块回填及 `get_evidence` 从同一受权父块获取。该元数据与正文、正文哈希和证据 ID 分开，旧数据无需重建或数据库迁移。生成、充分性检查和答案核验共用云证据序列化，标题路径在一次请求内均分 8,000 字符预算，裁剪时带 `heading_path_truncated`。标题仅解释来源范围，不能代替缺失的事实、授予访问权限或作为指令执行。
 
-普通 CLI 不会自动加载 `.env`。本地启用需显式传 `--env-file .env`，并在所选文件中设置 `RAG_ENABLE_CLOUD=true`；部署系统也可显式注入进程环境，进程环境优先于文件。该开关选择 `dense/cloud`、`reranker/cloud`、`generator/cloud`，并允许对应模型与网络工厂。以下开关默认 `false`，只接受 `true` / `false`，任一开启都要求 `RAG_ENABLE_CLOUD=true`：
+普通 CLI 不会自动加载 `.env`。本地通过百炼启用云能力需显式传 `--env-file .env`，并在所选文件中设置 `RAG_ENABLE_CLOUD=true`；部署系统也可显式注入进程环境，进程环境优先于文件。该开关选择 `dense/cloud`、`reranker/cloud`、`generator/cloud`，并允许对应模型与网络工厂。以下开关默认 `false`，只接受 `true` / `false`，可与百炼或 `RAG_ENABLE_DEEPSEEK_ANSWERS=true` 搭配。下表为百炼组合：
 
 | 开关 | 插件选择 |
 | --- | --- |
@@ -46,11 +46,11 @@ Settings位于adaptive_rag/config.py，可Settings(data_dir=Path(...))，load_se
 | `RAG_ENABLE_MULTI_QUERY` | `multi_query/cloud` |
 | `RAG_ENABLE_HYDE` | `hyde/cloud` |
 
-这些模块复用配置的云生成模型，不接入 Laya。多查询和 HyDE 可分别开启，不要求查询预处理或质量检查同时开启。权限过滤、快照和预算不由模型改变。
+DeepSeek 问答组合将上表中的聊天插件选择为 `deepseek`，并始终启用 `judge`、`verifier`、`gap`；它不改变向量和重排插件。意图判断由独立的 `RAG_ENABLE_DEEPSEEK_INTENT` 启用，输入输出及故障行为见 [DeepSeek 问答流程](deepseek-rag.md)。多查询和 HyDE 可分别开启，不要求查询预处理或质量检查同时开启。权限过滤、快照和预算不由模型改变。
 
 配置名称为 `RAG_CLOUD_BASE_URL`、`RAG_CLOUD_API_KEY`、`RAG_LLM_MODEL`、`RAG_EMBEDDING_MODEL`、`RAG_RERANK_MODEL`；无凭证示例与命令见 [README](../README.md#显式启用云模型)。云适配器自身不发现或读取密钥文件。平台地址显式配置，禁止凭密钥或模型名猜测目的地；仅允许 HTTPS（本机测试可 HTTP），不跟随重定向。百炼生成与向量走兼容地址，重排走独立原生地址，详见 [接口核对](research/bailian-api-notes.md)。
 
-模型请求仅对 429/5xx 最多重试一次；鉴权失败、重定向、网络错误和超时不自动重试，避免不明计费结果下重复调用。查询 usage/trace 记录实际请求尝试（含重试）、模型/端点、状态、耗时和平台返回的 token；字符预算仍单独存在，不能换称 token。默认模式计量为零，云模式的全局 capabilities 不假报固定次数。
+DeepSeek 调用不自动重试。百炼模型请求仅对 429/5xx 最多重试一次；鉴权失败、重定向、网络错误和超时不自动重试，避免不明计费结果下重复调用。查询 usage/trace 记录实际请求尝试（含重试）、模型/端点、状态、耗时和平台返回的 token；字符预算仍单独存在，不能换称 token。默认模式计量为零，云模式的全局 capabilities 不假报固定次数。
 
 `.env`、受控 TOML 与凭证只在本机或服务器保管，不进 Git、镜像、公开日志或 trace。HTTP 的 `RAG_HTTP_API_TOKEN` 与云模型/MinerU Key 相互独立；该环境变量会按 `RAG_HTTP_TENANT`、`RAG_HTTP_SUBJECT` 创建一个管理员身份，多身份仍由可信配置映射。
 

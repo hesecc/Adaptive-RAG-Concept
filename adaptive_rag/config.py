@@ -71,6 +71,8 @@ class Settings:
     allow_network: bool = False
     cloud: Any = field(default=None, repr=False)
     infrastructure: Any = field(default=None, repr=False)
+    intent: Any = field(default=None, repr=False)
+    deepseek_answers: Any = field(default=None, repr=False)
 
     def __post_init__(self):
         object.__setattr__(self, "data_dir", Path(self.data_dir).resolve())
@@ -130,6 +132,8 @@ def load_settings(path: str | Path | None = None) -> Settings:
         known = set(Settings.__dataclass_fields__)
         known.remove("cloud")  # Credentials are injected, never serialized in TOML.
         known.remove("infrastructure")
+        known.remove("intent")
+        known.remove("deepseek_answers")
         known.remove("admin_password")
         if set(values) - known:
             raise ValidationError(f"unknown settings: {', '.join(sorted(set(values) - known))}")

@@ -1,6 +1,7 @@
 """Explicit role registry and safe defaults. Never imports a name from input."""
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Callable
 
 from .config import DEFAULT_PLUGINS, Settings
@@ -114,6 +115,12 @@ def default_registry() -> PluginRegistry:
     registry.register("trace", "postgres", postgres_trace, uses_network=True)
     registry.register("objects", "s3", s3_objects, uses_network=True)
 
+    def intent_policy(settings):
+        from .intent import DeepSeekIntentPolicy
+        return DeepSeekIntentPolicy(settings)
+
+    registry.register("decision", "deepseek", intent_policy, uses_network=True, requires_model=True)
+
     def cloud_transport(settings):
         from .cloud import CloudSettings, CloudTransport
         if not isinstance(settings.cloud, CloudSettings):
@@ -128,26 +135,27 @@ def default_registry() -> PluginRegistry:
         from .cloud import CloudReranker
         return CloudReranker(cloud_transport(settings))
 
-    def generate(settings):
+    registry.register("dense", "cloud", dense, requires_model=True, uses_network=True)
+    registry.register("reranker", "cloud", rerank, requires_model=True, uses_network=True)
+
+    def chat_adapter(settings, role, provider):
         from .cloud import CloudGenerator
-        return CloudGenerator(cloud_transport(settings))
+        from .query import CloudPlanner, CloudQueryTransform
+        from .quality import CloudEvidenceJudge, CloudVerifier, CloudGapTransform
+        if provider == "deepseek":
+            from .intent import DeepSeekTransport
+            transport = DeepSeekTransport(settings.deepseek_answers)
+        else:
+            transport = cloud_transport(settings)
+        if role == "planner":
+            return CloudPlanner(transport, settings.max_subqueries)
+        if role in ("rewrite", "multi_query", "hyde"):
+            return CloudQueryTransform(transport, role)
+        return {"generator": CloudGenerator, "judge": CloudEvidenceJudge,
+                "gap": CloudGapTransform, "verifier": CloudVerifier}[role](transport)
 
-    for role, factory in (("dense", dense), ("reranker", rerank), ("generator", generate)):
-        registry.register(role, "cloud", factory, requires_model=True, uses_network=True)
-    def planner(settings):
-        from .query import CloudPlanner
-        return CloudPlanner(cloud_transport(settings), settings.max_subqueries)
-
-    registry.register("planner", "cloud", planner, requires_model=True, uses_network=True)
-    for role in ("rewrite", "multi_query", "hyde"):
-        def transform(settings, mode=role):
-            from .query import CloudQueryTransform
-            return CloudQueryTransform(cloud_transport(settings), mode)
-        registry.register(role, "cloud", transform, requires_model=True, uses_network=True)
-    for role, class_name in (("judge", "CloudEvidenceJudge"), ("gap", "CloudGapTransform"),
-                             ("verifier", "CloudVerifier")):
-        def quality(settings, name=class_name):
-            from . import quality as adapters
-            return getattr(adapters, name)(cloud_transport(settings))
-        registry.register(role, "cloud", quality, requires_model=True, uses_network=True)
+    for provider in ("cloud", "deepseek"):
+        for role in ("planner", "rewrite", "multi_query", "hyde", "judge", "gap", "generator", "verifier"):
+            registry.register(role, provider, partial(chat_adapter, role=role, provider=provider),
+                              requires_model=True, uses_network=True)
     return registry

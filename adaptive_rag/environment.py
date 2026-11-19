@@ -83,8 +83,9 @@ def apply_environment(settings: Settings, values: Mapping[str, str]) -> Settings
     optional = {name: _enabled(values, name) for name in (
         "RAG_ENABLE_QUERY_PREPARATION", "RAG_ENABLE_QUALITY_CHECKS",
         "RAG_ENABLE_MULTI_QUERY", "RAG_ENABLE_HYDE")}
-    if any(optional.values()) and not cloud_enabled:
-        raise ValidationError("query preparation and quality checks require RAG_ENABLE_CLOUD=true")
+    deepseek_answers = _enabled(values, "RAG_ENABLE_DEEPSEEK_ANSWERS")
+    if any(optional.values()) and not (cloud_enabled or deepseek_answers):
+        raise ValidationError("query preparation and quality checks require RAG_ENABLE_CLOUD or RAG_ENABLE_DEEPSEEK_ANSWERS")
     if values.get("RAG_DATA_DIR"):
         updates["data_dir"] = Path(values["RAG_DATA_DIR"])
     if cloud_enabled:
@@ -100,6 +101,23 @@ def apply_environment(settings: Settings, values: Mapping[str, str]) -> Settings
             selected["hyde"] = "cloud"
         updates.update(allow_models=True, allow_network=True, cloud=load_cloud_settings(values),
                        plugins=selected,
+                       timeout_seconds=120.0, stage_timeout_seconds=90.0)
+    if _enabled(values, "RAG_ENABLE_DEEPSEEK_INTENT"):
+        from .intent import DeepSeekSettings
+        intent = DeepSeekSettings(values.get("DEEPSEEK_API_KEY", ""), values.get("RAG_DEEPSEEK_INTENT_MODEL") or "deepseek-flash")
+        updates.update(intent=intent, allow_models=True, allow_network=True,
+                       plugins=updates.get("plugins", settings.plugins) | {"decision": "deepseek"})
+    if deepseek_answers:
+        from .intent import AnswerSettings
+        answers = AnswerSettings(values.get("DEEPSEEK_API_KEY", ""), values.get("RAG_DEEPSEEK_ANSWER_MODEL") or "deepseek-flash")
+        selected = updates.get("plugins", settings.plugins) | dict.fromkeys(("generator", "judge", "verifier", "gap"), "deepseek")
+        if optional["RAG_ENABLE_QUERY_PREPARATION"]:
+            selected.update(planner="deepseek", rewrite="deepseek")
+        if optional["RAG_ENABLE_MULTI_QUERY"]:
+            selected["multi_query"] = "deepseek"
+        if optional["RAG_ENABLE_HYDE"]:
+            selected["hyde"] = "deepseek"
+        updates.update(deepseek_answers=answers, allow_models=True, allow_network=True, plugins=selected,
                        timeout_seconds=120.0, stage_timeout_seconds=90.0)
     if values.get("RAG_HTTP_API_TOKEN"):
         principal = Principal(values.get("RAG_HTTP_TENANT", "demo"), values.get("RAG_HTTP_SUBJECT", "admin"), admin=True)

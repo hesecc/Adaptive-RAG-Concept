@@ -532,3 +532,26 @@ test('late detail and trace cannot replace a new chat; late list cannot survive 
   assert.equal(get('#conversation-list').textContent, '');
   assert.equal(get('#app-shell').hidden, true);
 });
+
+test('preflight inspector distinguishes a suggested transform from actual execution and explains fallback', async () => {
+  const outputs = [
+    [{route: 'kb', source: 'deepseek', selected_steps: ['rewrite']}, /DeepSeek 意图判断：检索知识库/, /建议：改写.*个人设置/],
+    [{route: 'exact', source: 'rule_fallback', selected_steps: [], fallback_reason: 'cloud_timeout'}, /已回退到规则：按标识符查资料/, /回退原因：等待意图服务超时/],
+  ];
+  for (const [output, routeLabel, detail] of outputs) {
+    const record = {...trace('cited'), stages: [{index: 0, name: 'decision.preflight', status: 'ok', duration_ms: 1,
+      output: {...output, checkpoint: 'preflight'}}], final_result: citedResult};
+    const wb = await workbench(url => {
+      if (url.startsWith('/conversations?')) return page([]);
+      if (url === '/query/stream') return sse([['result', {result: citedResult, trace: record}]]);
+      throw Error('unexpected ' + url);
+    });
+    await wb.submit('保修');
+    const button = wb.get('#timeline').buttons()[0];
+    assert.ok(button);
+    button.fire('click');
+    const description = wb.get('#inspector-body').textContent;
+    assert.match(description, routeLabel);
+    assert.match(description, detail);
+  }
+});

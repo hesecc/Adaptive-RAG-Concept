@@ -228,7 +228,8 @@ class RagApplication:
         return {"mode": "cloud" if cloud_mode else "model_free",
                 "model_calls": None if cloud_mode else 0, "network_calls": None if cloud_mode else 0,
                 "call_counts_basis": "per-request trace" if cloud_mode else "disabled",
+                "image_semantic_search": bool(self.settings.allow_models and self.settings.cloud is not None),
                 "generation_enabled": self.descriptions["generator"]["enabled"],
-                "semantic_support_verification": self.settings.plugins["verifier"] == "cloud",
-                "history_resolution": any(self.settings.plugins[role] == "cloud" for role in ("planner", "rewrite")),
+                "semantic_support_verification": self.settings.plugins["verifier"] in ("cloud", "deepseek"),
+                "history_resolution": any(self.settings.plugins[role] in ("cloud", "deepseek") for role in ("planner", "rewrite")),
                 "plugins": self.descriptions}

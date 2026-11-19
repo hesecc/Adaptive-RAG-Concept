@@ -1,6 +1,6 @@
 # Adaptive RAG Concept
 
-可运行、可插拔的 RAG 基座，覆盖知识生命周期、检索、证据与评测。默认 `model_free`，不发起模型请求；查询返回 `evidence_preview`、`answer: null`。显式开启后可使用云端 Embedding、Reranker 和带引用的答案生成，也可分别启用会话改写、问题分解、查询扩展与语义质量检查；PDF 可选择本地或 MinerU 云解析。Laya 决策模型继续只保留接口，当前决策策略为规则，本阶段不下载或部署模型。
+可运行、可插拔的 RAG 基座，覆盖知识生命周期、检索、证据与评测。默认 `model_free`，不发起模型请求；查询返回 `evidence_preview`、`answer: null`。显式开启后可使用云端 Embedding、Reranker 和带引用的答案生成，也可分别启用会话改写、问题分解、查询扩展与语义质量检查；PDF 可选择本地或 MinerU 云解析。意图判断默认走本地规则；可单独接入 DeepSeek 官方 API，也可让它基于授权证据生成并核验答案，无需安装 Laya。见 [DeepSeek 配置与完整使用流程](docs/deepseek-rag.md)。
 
 ## 快速开始
 
@@ -54,7 +54,7 @@ uv run adaptive-rag --env-file .env trace --tenant demo --id $result.trace_id
 
 这会将 `dense`、`reranker`、`generator` 选为 `cloud`；仅开启 `RAG_ENABLE_CLOUD` 时，计划仍用规则、质量检查仍限出处完整性。没有证据时不会调用生成模型。云端适配按显式平台地址发送凭证，百炼重排使用独立原生接口，协议依据见 [百炼接口核对](docs/research/bailian-api-notes.md)。
 
-以下增强开关默认全部为 `false`，均要求同时设置 `RAG_ENABLE_CLOUD=true`；格式只接受 `true` / `false`，开启后会增加相应的云生成模型请求：
+以下增强开关默认全部为 `false`，需要启用百炼 (`RAG_ENABLE_CLOUD=true`) 或 DeepSeek 问答 (`RAG_ENABLE_DEEPSEEK_ANSWERS=true`)；仅启用意图路由不够。开关只接受 `true` / `false`。DeepSeek 问答始终启用语义质量检查，其他增强仍需显式开启；每个实际执行的模型步骤会增加调用。
 
 | 开关 | 启用内容 | 边界 |
 | --- | --- | --- |
@@ -117,7 +117,7 @@ flowchart LR
 | 入库 | plain、ATX Markdown、惰性 HTML；PDF 本地/MinerU 转 Markdown（MinerU 插图随文档保存）；结构保护父子切块与配置指纹 | `Parser` / `Cleaner` / `Chunker` |
 | 知识生命周期 | 暂存、显式发布、不可变快照、CAS、删除、回滚 | `KnowledgeStore` |
 | 原文与 trace | 默认内容寻址文件、SQLite；可选 S3 兼容对象存储、PostgreSQL | `ObjectStore` / `TraceSink` |
-| 计划与控制 | 默认规则、可选云语义分解；最多 3 子问题、12 总通道、一次共享补救；Laya 未接入 | `Planner` / `DecisionPolicy` |
+| 计划与控制 | 默认规则、可选云语义分解；最多 3 子问题、12 总通道、一次共享补救；可选 DeepSeek 意图路由选择知识检索、精确型号或非知识路径 | `Planner` / `DecisionPolicy` |
 | 查询变换 | 已有云改写、多查询、HyDE、定向 gap 实现，按独立开关显式开启 | `QueryTransform` |
 | 检索 | 默认 BM25 + RRF；显式启用云 Embedding 与本地精确余弦 dense | `Retriever` / `Fusion` |
 | 排序 | 默认保序截断；可选云 Reranker | `Reranker` |
@@ -213,7 +213,7 @@ uv run adaptive-rag --env-file .env serve
 
 `eval-permissions` 用一份合成语料检查每种身份能检索到哪些文档，不调用模型；发现越权或缺失时退出码为 3。两个命令的报告都保存在数据目录的 `evaluations/` 下，管理员在 `/evaluation` 查看。用法、报告格式和边界见 [评测](docs/evaluation.md)，分层方案和工具选型见[评测方案](docs/research/evaluation-tooling-assessment.md)。
 
-已接入的三个模型均走云平台 API Key，默认仍关闭；查询增强和质量审查复用生成模型，不增加本地模型部署。HTTP 429/5xx 最多重试一次，鉴权错误、重定向和超时不自动重试；向量缓存按模型及维度配置隔离。检索指标不验证生成答案、审查器判定或整体拒答质量。下一步用业务标注集评测答案、解析和检索质量，对增强开关做消融，再决定配额、生产索引及扩容；Laya 决策模型后续单独部署与微调，本阶段不启用。原专题分析见 [RAG 流程与实现实践报告](docs/research/RAG流程与实现实践报告.md)。
+百炼 Embedding、Reranker、生成器和 DeepSeek 官方 API 均为显式启用，凭据分开；查询增强和质量审查复用生成模型，不增加本地模型部署。百炼 HTTP 429/5xx 最多重试一次，DeepSeek 不自动重试，鉴权错误、重定向和超时不自动重试；向量缓存按模型及维度配置隔离。检索指标不验证生成答案、审查器判定或整体拒答质量。下一步用业务标注集评测答案、解析和检索质量，对增强开关做消融，再决定配额、生产索引及扩容；意图路由同样需要用真实业务样本验证，不以模型自报的置信度为依据。原专题分析见 [RAG 流程与实现实践报告](docs/research/RAG流程与实现实践报告.md)。
 
 ## 云服务器与 Docker
 

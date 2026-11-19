@@ -306,13 +306,13 @@ byId("image-trace-form").addEventListener("submit", async event => {
     byId("evaluation-open").hidden = !session.admin;
     await RagDomains.load(pageOwner.request);
     imageAdmin = session.admin;
-    imageCloud = session.capabilities.mode === "cloud";
+    imageCloud = session.capabilities.image_semantic_search === true;
     byId("image-account").textContent = session.username;
     byId("image-domains").textContent = `数据权限：${RagDomains.text(session.data_domains)}`;
     byId("image-admin").hidden = !imageAdmin;
     byId("image-mode").textContent = imageCloud
       ? "语义检索使用当前文本 Embedding；图片说明保存后需完成索引。"
-      : "当前为无模型模式：按文字描述检索，模型调用为零。";
+      : "图片库按文字描述检索，不调用模型。";
     await refresh();
   } catch (error) {
     notice(error.message, true);

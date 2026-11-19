@@ -25,13 +25,16 @@ import math
 from pathlib import Path
 import sqlite3
 from time import monotonic
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 import httpx
 
 from .domain import CapabilityError, ChildChunk, Claim, Draft, Evidence, Hit, Plan, SubQuery, ValidationError
 from .figures import readable_text
+
+if TYPE_CHECKING:
+    from .intent import DeepSeekSettings
 
 
 _usage: ContextVar[dict | None] = ContextVar("cloud_usage", default=None)
@@ -150,6 +153,12 @@ class CloudSettings:
         for name in ("chat_path", "embeddings_path", "rerank_path"):
             object.__setattr__(self, name, _endpoint(getattr(self, name)))
 
+    def url_for(self, path: str) -> str:
+        if path not in {self.chat_path, self.embeddings_path, self.rerank_path}:
+            raise ValidationError("cloud endpoint is not configured")
+        root = self.rerank_base_url if path == self.rerank_path and self.rerank_base_url else self.base_url
+        return root + path
+
 
 def load_cloud_settings(environ: Mapping[str, str]) -> CloudSettings:
     """Read a caller-owned mapping, never the filesystem or process environment."""
@@ -187,16 +196,13 @@ class CloudTransport:
     client_factory receives normal httpx.AsyncClient keyword arguments and is
     replaceable by a MockTransport-backed factory in protocol tests.
     """
-    def __init__(self, settings: CloudSettings, client_factory: Callable | None = None):
+    def __init__(self, settings: "CloudSettings | DeepSeekSettings", client_factory: Callable | None = None):
         self.settings = settings
         self._client_factory = client_factory or httpx.AsyncClient
 
     async def post(self, path: str, payload: dict) -> dict:
         path = _endpoint(path)
-        if path not in {self.settings.chat_path, self.settings.embeddings_path, self.settings.rerank_path}:
-            raise ValidationError("cloud endpoint is not configured")
-        root = self.settings.rerank_base_url if path == self.settings.rerank_path and self.settings.rerank_base_url else self.settings.base_url
-        url = root + path
+        url = self.settings.url_for(path)
         async with self._client_factory(timeout=self.settings.timeout_seconds, follow_redirects=False, trust_env=False) as client:
             for attempt in range(self.settings.max_retries + 1):
                 await check_history_access()
@@ -241,7 +247,7 @@ class CloudTransport:
                                     raise CapabilityError("cloud response exceeds the configured JSON size limit")
                             try:
                                 value = json.loads(body)
-                            except (ValueError, UnicodeError):
+                            except (ValueError, UnicodeError, RecursionError):
                                 record["status"] = "invalid_response"
                                 raise CapabilityError("cloud returned invalid JSON") from None
                             if not isinstance(value, dict) or "error" in value or "code" in value:
@@ -575,7 +581,7 @@ async def json_chat_object(transport: CloudTransport, instruction: str, request:
         if not isinstance(value, dict):
             raise ValueError
         return value
-    except (KeyError, TypeError, ValueError, AttributeError, IndexError):
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError, RecursionError):
         raise CapabilityError(error_message) from None
 
 

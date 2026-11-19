@@ -98,6 +98,7 @@ const statuses = {
   no_index: "暂无知识索引",
   empty: "未找到相似内容",
   clarify: "需要补充信息",
+  direct_reply: "对话提示",
   capability_unavailable: "能力暂不可用",
   policy_stopped: "策略已停止",
 };
@@ -133,6 +134,7 @@ function notice(message = "", type = "") {
 const failedStatuses = ["error", "timeout", "cancelled"];
 // What the answer and evidence panels say when a query ends without an answer.
 const noAnswerNotes = {
+  direct_reply: "这是工作台提示，没有使用知识库资料。",
   evidence_preview: "当前模式返回证据预览，尚未启用答案生成。",
   empty:
     "知识库中没有找到与问题相同或相似的内容，所以没有生成回答。可以换一种说法，或请管理员补充资料。",
@@ -708,6 +710,7 @@ function renderPlugins() {
   $("#mode-label").textContent =
     state.capabilities.mode === "cloud" ? "云端已接入" : "无模型模式";
   for (const role of [
+    "decision",
     "planner",
     "lexical",
     "dense",
@@ -1289,7 +1292,7 @@ function renderInspector(index) {
       el(
         "p",
         "output-summary",
-        `${["disabled", "skipped"].includes(stage.status) ? "跳过原因" : "处理原因"}：${stage.reason === "user_preference" ? "已在个人检索设置中关闭" : stage.reason}`,
+        `${["disabled", "skipped"].includes(stage.status) ? "跳过原因" : "处理原因"}：${stage.reason === "user_preference" ? "已在个人检索设置中关闭" : stage.reason === "intent_not_selected" ? "本轮意图无需此步骤" : stage.reason}`,
       ),
     );
   const section = el("div", "inspector-section");
@@ -1316,6 +1319,21 @@ function renderInspector(index) {
 }
 
 function renderStageOutput(target, output) {
+  if (output?.checkpoint === "preflight" && output.route) {
+    const routes = {kb: "检索知识库", exact: "按标识符查资料", realtime: "实时业务查询", direct: "简单对话", handoff: "请求人工", clarify: "需要澄清"};
+    const sources = {deepseek: "DeepSeek 意图判断", local_guard: "本地规则", rule_fallback: "意图服务不可用，已回退到规则"};
+    const steps = {rewrite: "改写", decompose: "拆题", multi_query: "多路扩展", hyde: "HyDE"};
+    target.append(el("p", "output-summary", `${sources[output.source] || "意图判断"}：${routes[output.route] || output.route}`));
+    if (output.source === "rule_fallback" && output.fallback_reason) {
+      const reasons = {cloud_timeout: "等待意图服务超时", cloud_http_error: "意图服务返回 HTTP 错误",
+        cloud_network_error: "无法连接意图服务", capability_unavailable: "未获得可用的分类结果"};
+      target.append(el("p", "output-summary", `回退原因：${reasons[output.fallback_reason] || "意图判断未完成"}。`));
+    }
+    if (["kb", "exact"].includes(output.route)) {
+      const selected = (output.selected_steps || []).map(step => steps[step] || step);
+      target.append(el("p", "output-summary", selected.length ? `建议：${selected.join("、")}。实际执行仍受个人设置和服务端预算限制。` : "按原问题检索，不调用额外的查询增强。"));
+    }
+  }
   const items = output?.hits || output?.parents || output?.queries;
   if (output?.query) target.append(el("p", "output-query", output.query));
   if (Array.isArray(items)) {

@@ -111,7 +111,7 @@ class Embedder(Protocol):
 
 
 class DecisionPolicy(Protocol):
-    """Future rule/Laya policy; output never grants access or raises budgets."""
+    """Request-local rule or intent policy; output never grants access or raises budgets."""
     async def decide(self, state: dict[str, Any]) -> dict[str, Any]: ...
 
 

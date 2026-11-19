@@ -138,8 +138,7 @@ const noAnswerNotes = {
   evidence_preview: "当前模式返回证据预览，尚未启用答案生成。",
   empty:
     "知识库中没有找到与问题相同或相似的内容，所以没有生成回答。可以换一种说法，或请管理员补充资料。",
-  insufficient:
-    "找到了相关内容，但不足以回答这个问题，所以没有生成回答。可在“证据”中查看最接近的资料。",
+  insufficient: "本轮证据不足，未生成答案。",
 };
 // A figure travels inside the evidence text as one Markdown line that holds its storage key.
 // The page shows the picture itself, so the line is replaced by a short placeholder.
@@ -1243,7 +1242,6 @@ function applyRun(result, trace, { transcript = true } = {}) {
   if (
     [
       "partial",
-      "insufficient",
       "no_index",
       "empty",
       "clarify",
@@ -1426,6 +1424,38 @@ function answerReader(result) {
   return reader;
 }
 
+// Only the final, access-checked result can supply passages. Compact history and
+// intermediate trace candidates are not a substitute for an authorized result.
+function insufficientReply(result) {
+  const section = el("section", "closest-passages");
+  const evidence = result.evidence || [];
+  if (!evidence.length) {
+    section.append(el("p", "history-answer", "本轮证据不足，未生成答案。没有可展示的授权资料。"));
+    return section;
+  }
+  // Older saved results included a UI promise in the status message.
+  const reason = result.message?.replace(/；列出的是最接近的资料。$/, "。");
+  section.append(el("p", "history-answer", reason || noAnswerNotes.insufficient),
+    el("h3", "", `相关资料 · ${evidence.length} 个片段（仅供参考）`));
+  const list = el("ol");
+  for (const item of evidence) {
+    const row = el("li");
+    const title = item.document_id || "未命名文档";
+    row.append(el("strong", "", title));
+    const path = [...(item.heading_path || []), item.locator].filter(Boolean).join(" / ");
+    if (path) row.append(el("p", "evidence-path", path));
+    const text = withoutFigureLines(item.text).trim();
+    if (text) row.append(el("p", "closest-excerpt", text.length > 200 ? text.slice(0, 200) + "…" : text));
+    const open = el("button", "source-button", "查看原文 ↗");
+    open.type = "button";
+    open.setAttribute("aria-label", `查看第 ${list.childElementCount + 1} 个片段的原文：${title}`);
+    open.addEventListener("click", () => showSource(item));
+    row.append(open); list.append(row);
+  }
+  section.append(list);
+  return section;
+}
+
 function renderAnswer() {
   const target = $("#panel-answer");
   target.replaceChildren();
@@ -1437,6 +1467,10 @@ function renderAnswer() {
         ? "本次执行未完成，没有生成核验通过的最终回答。请查看失败步骤；此前完成的检索结果仍可逐步查看。"
         : "此历史 Trace 未记录最终回答，详情请查看步骤和证据。",
     );
+    return;
+  }
+  if (result.status === "insufficient") {
+    target.append(insufficientReply(result));
     return;
   }
   target.append(
@@ -1915,11 +1949,13 @@ function renderChatHistory() {
     const selected = message.trace_id === state.traceId;
     const result = selected && state.result ? state.result : message;
     answer.append(label);
-    if (!result.answer) answer.append(el("p", "history-answer", result.message || noAnswerNotes[result.status] || "本轮没有返回回答。"));
+    if (result.status === "insufficient") {
+      answer.append(selected && state.result ? insufficientReply(result) : el("p", "history-answer", noAnswerNotes.insufficient));
+    } else if (!result.answer) answer.append(el("p", "history-answer", result.message || noAnswerNotes[result.status] || "本轮没有返回回答。"));
     if (result.answer || (selected && result.status === "evidence_preview")) answer.append(answerReader(result));
     const footer = el("div", "history-caption");
     footer.append(el("span", "", statuses[message.status] || message.status));
-    const button = el("button", "", selected ? "正在查看本轮流程" : "查看本轮流程 →");
+    const button = el("button", "", selected ? "正在查看本轮流程" : message.status === "insufficient" ? "查看本轮资料与流程 →" : "查看本轮流程 →");
     button.type = "button";
     button.disabled = state.running;
     button.setAttribute("aria-pressed", String(selected));

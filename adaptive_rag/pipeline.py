@@ -521,7 +521,7 @@ class QueryPipeline:
                 return result("empty", NOT_FOUND if semantic else NOT_FOUND_BY_WORDS, missing=coverage.missing_query_ids)
             semantic_coverage = coverage.basis == "cloud_semantic_sufficiency"
             if semantic_coverage and not coverage.covered_query_ids:
-                return await finish("insufficient", "找到了相关内容，但不足以完整支持这个问题，暂不生成答案；列出的是最接近的资料。",
+                return await finish("insufficient", "找到了相关内容，但不足以完整回答这个问题，未生成答案。",
                                     evidence, coverage.missing_query_ids)
             if await decision("generate", coverage.missing_query_ids) == "stop":
                 return result("policy_stopped", "策略停止生成阶段。", missing=coverage.missing_query_ids)

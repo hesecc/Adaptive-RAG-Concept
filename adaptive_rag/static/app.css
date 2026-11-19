@@ -1217,6 +1217,13 @@ input[type=checkbox]:disabled {
   overflow-wrap: anywhere;
 }
 
+.closest-passages { overflow-wrap: anywhere; }
+.closest-passages h3 { margin: 12px 0 6px; font-size: 14px; }
+.closest-passages ol { margin: 0; padding-inline-start: 1.6em; list-style: decimal; }
+.closest-passages li { padding: 8px 0; }
+.closest-passages li + li { border-top: 1px solid var(--line); }
+.closest-excerpt { margin: 4px 0; line-height: 1.65; white-space: pre-line; }
+
 .history-caption {
   display: flex;
   align-items: center;

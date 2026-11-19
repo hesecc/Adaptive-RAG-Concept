@@ -157,6 +157,7 @@ class QualityPipelineTests(unittest.IsolatedAsyncioTestCase):
         result = await app.query(QueryRequest(self.access, "质保"))
         self.assertEqual(result.status, "insufficient")
         self.assertIsNone(result.answer)
+        self.assertTrue(any(item.document_id == "warranty" for item in result.evidence))
 
     async def test_unsupported_claim_removed_partial_result_has_only_verified_claim(self):
         class Judge:

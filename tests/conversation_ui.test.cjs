@@ -93,6 +93,55 @@ async function citedWorkbench(result, restore = false) {
   }, restore ? {subject: 'alice', tenant: 'home', id: 'group'} : null);
 }
 
+const legacyInsufficient = '找到了相关内容，但不足以完整支持这个问题，暂不生成答案；列出的是最接近的资料。';
+const insufficientResult = {...citedResult, status: 'insufficient', message: legacyInsufficient,
+  answer: null, claims: [], missing_query_ids: ['q1'], evidence: excerpts};
+
+test('insufficient: current reply lists the returned passages and opens the selected original without an answer', async () => {
+  const {get, submit, calls} = await citedWorkbench(insufficientResult);
+  await submit('神经网络是如何工作的');
+  const panel = get('#panel-answer');
+  for (const item of excerpts) {
+    assert.ok(panel.textContent.includes(item.document_id), 'document missing from reply');
+    assert.ok(panel.textContent.includes(item.text), 'excerpt missing from reply');
+  }
+  assert.doesNotMatch(panel.textContent, /列出的是|q1/);
+  assert.equal(get('#notice').hidden, true);
+  await panel.buttons()[1].fire('click'); await flush();
+  assert.equal(calls.at(-1)[0], '/evidence/edition/' + sourceB);
+  assert.match(get('#source-content').textContent, /authorized original: doc-1/);
+});
+
+test('insufficient: compact history makes no list promise; selecting it loads only that turn and respects revoked source access', async () => {
+  const {get, calls} = await workbench(url => {
+    if (url.startsWith('/conversations?')) return page([]);
+    if (url === '/conversations/group') return {conversation_id: 'group', turns: [
+      {...turn('cited'), status: 'insufficient', answer: null, message: legacyInsufficient}, turn('later')]};
+    if (url === '/traces/later') return trace('later');
+    if (url === '/traces/cited') return {...trace('cited'), final_result: insufficientResult};
+    if (url === '/evidence/edition/' + sourceA) return new Response('', {status: 404});
+    throw Error('unexpected request ' + url);
+  }, {subject: 'alice', tenant: 'home', id: 'group'});
+  const history = get('#chat-history');
+  assert.doesNotMatch(history.textContent, /列出的是|excerpt-0/);
+  assert.ok(!calls.some(([url]) => url === '/traces/cited'));
+  await history.buttons().find(b => b.textContent.includes('查看本轮资料')).fire('click');
+  assert.match(history.textContent, /doc-0.*excerpt-0.*doc-1.*excerpt-1/s);
+  assert.equal(get('#notice').hidden, true);
+  await history.buttons().find(b => b.textContent.includes('查看原文')).fire('click'); await flush();
+  assert.equal(calls.filter(([url]) => url === '/query/stream').length, 0);
+  assert.doesNotMatch(history.textContent + get('#source-content').textContent, /excerpt-|doc-0/);
+});
+
+test('insufficient: an older result without final evidence does not pretend to have references', async () => {
+  const {get, submit} = await citedWorkbench({...insufficientResult, evidence: []});
+  await submit('神经网络是如何工作的');
+  const panel = get('#panel-answer');
+  assert.match(panel.textContent, /没有可展示的.*资料/);
+  assert.doesNotMatch(panel.textContent, /找到了相关内容|列出的是|最接近|q1/);
+  assert.equal(panel.buttons().length, 0);
+});
+
 test('claims appear once in answer order and each inline source opens its own authorized original', async () => {
   const {get, submit, calls} = await citedWorkbench(citedResult);
   await submit('两项结论是什么？');
